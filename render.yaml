@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: poke-call
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    autoDeployTrigger: off
+    disk:
+      name: poke-call-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite:////var/data/poke_call.db
+      - key: ALLOWED_COUNTRY_CODES
+        value: +1
+      - key: INPUT_TRANSCRIPTION_MODEL
+        value: gpt-4o-mini-transcribe
+      - key: EXTRACTOR_MODEL
+        value: gpt-5.4-nano-2026-03-17
+      - key: MINI_MODELS_ENABLED
+        value: "false"
+      - key: POKE_PUSH_ENABLED
+        value: "false"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_WEBHOOK_SECRET
+        sync: false
+      - key: OPENAI_PROJECT_ID
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_CALLER_ID
+        sync: false
+      - key: OWNER_PHONE_E164
+        sync: false
+      - key: ALLOWED_POKE_USER_ID
+        sync: false
+      - key: MCP_BEARER_TOKEN
+        sync: false
+      - key: DEBUG_API_TOKEN
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false

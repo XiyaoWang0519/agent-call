@@ -1,0 +1,129 @@
+# Poke Phone-Call Bridge
+
+Single-user FastAPI + FastMCP service that lets Poke prepare, confirm, start, monitor, and end outbound phone calls for Irvin. Twilio originates an OpenAI SIP agent leg into a private conference, the service accepts and prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then dials the callee. SQLite stores plans, state, ordered transcripts, and deterministic final results.
+
+## Safety and operating model
+
+- The MCP endpoint requires both a bearer token and the configured Poke user ID.
+- Every OpenAI and Twilio webhook is signature-verified; OpenAI delivery IDs are replay-protected.
+- A call cannot start without an unexpired prepared plan and explicit confirmation text.
+- Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
+- The agent identifies itself as Poke, Irvin's AI assistant. It may not impersonate Irvin or share/request passwords, auth codes, payment credentials, or government identifiers.
+- Poke push is optional and non-canonical. Polling `get_call_result` is canonical.
+
+Do not deploy or restart while a call is active. Recovery stops stranded billable media and finalizes missing results, but a process restart necessarily ends the live call.
+
+Calls are retained as transcripts. The greeting provides verbal AI disclosure; the owner remains responsible for jurisdiction-specific recording, robocall, consent, and retention compliance. Apply transcript retention independently of extraction success or failure.
+
+## Requirements
+
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
+- A paid/voice-enabled Twilio account, an E.164 caller ID, and outbound SIP/Conference Participant AMD access
+- An OpenAI project with Realtime SIP access, an API key, and a webhook signing secret
+- A stable public HTTPS URL (tunnel for local work; always-on Render instance for deployment)
+
+The locked implementation was developed against OpenAI Python `2.45.0`, Twilio Python `9.10.9`, FastMCP `3.4.4`, FastAPI `0.139.0`, and websockets `16.1`. `uv.lock` is authoritative.
+
+## Local setup
+
+```bash
+test -e .env.local || cp .env.example .env.local
+uv sync --all-groups --frozen
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Fill every required value in `.env.local`; the guarded copy command deliberately preserves a key previously saved by the OpenAI Platform picker. Generate `MCP_BEARER_TOKEN` and `DEBUG_API_TOKEN` with a password generator or `openssl rand -hex 32`. Never commit env files; `.gitignore` excludes them.
+
+Run validation:
+
+```bash
+uv run ruff format --check app tests scripts
+uv run ruff check app tests scripts
+uv run pytest -q
+```
+
+## HTTPS tunnel and webhooks
+
+Start the server, then expose port 8000. Either command works:
+
+```bash
+ngrok http 8000
+# or
+cloudflared tunnel --url http://localhost:8000
+```
+
+Set `PUBLIC_BASE_URL` to the exact HTTPS origin printed by the tunnel, without a trailing slash, and restart the service. This exact value is security-critical because Twilio signs the full public callback URL.
+
+In **OpenAI Platform → Project → Webhooks**, create an endpoint:
+
+```text
+https://YOUR_HOST/webhooks/openai
+```
+
+Subscribe it to `realtime.call.incoming`, copy its signing secret to `OPENAI_WEBHOOK_SECRET`, and restart. The OpenAI project in the SIP URI is `OPENAI_PROJECT_ID`.
+
+No static Twilio webhook needs to be configured: each Conference Participant request supplies its signed status, conference, and AMD callback URL. Confirm that the Twilio account can call the OpenAI SIP URI and can use AMD on `/Participants`. The service supplies `DetectMessageEnd` and an AMD callback on every callee leg.
+
+Configure Poke's MCP connection as:
+
+```text
+URL: https://YOUR_HOST/mcp/
+Authorization: Bearer MCP_BEARER_TOKEN
+X-Poke-User-Id: ALLOWED_POKE_USER_ID
+Transport: Streamable HTTP
+```
+
+The server exposes exactly five tools: `prepare_phone_call`, `start_phone_call`, `get_call_result`, `end_phone_call`, and `get_phone_call`.
+
+## Live SIP canary
+
+Deploy or tunnel the service first. The full canary calls `OWNER_PHONE_E164`, prints a random spoken nonce, asks you to interrupt the assistant once, and checks accept status, echoed transcription configuration, semantic VAD, nonce transcription, function-tool use, interruption, and the terminal result:
+
+```bash
+uv run python scripts/run_sip_canary.py --mode full
+```
+
+Answer the call, say the printed nonce when asked, and speak over the assistant once. After the call, the script asks you to confirm that audible assistant speech stopped promptly; the server-side cancellation event must also be present. Then run the no-advisory-tool variant to prove the deterministic finalizer does not depend on `record_call_outcome`:
+
+```bash
+uv run python scripts/run_sip_canary.py --mode no-outcome-tool
+```
+
+Both commands exit nonzero if any gate fails. The debug evidence endpoint they use requires `DEBUG_API_TOKEN`.
+
+No mini realtime model can be selected by configuration in v1. Do not relax the `realtime_model` literal or `MINI_MODELS_ENABLED=false` gate until that exact model passes both canaries, including SIP tool calling.
+
+## Render deployment
+
+`render.yaml` defines an always-on Starter web service and a persistent SQLite disk. Validate it with Render CLI v2.7.0 or newer:
+
+```bash
+render blueprints validate render.yaml
+```
+
+Commit and push the repository, then use **Render Dashboard → New → Blueprint**, connect this repository, review `render.yaml`, and select **Deploy Blueprint**. The current Render CLI validates Blueprint files but does not create a Blueprint from one. Enter every `sync: false` secret, set `PUBLIC_BASE_URL` to the final `https://SERVICE.onrender.com` origin, and deploy. The container command is already defined. Useful checks:
+
+```bash
+curl -fsS https://SERVICE.onrender.com/healthz
+render services list
+render logs --resources SERVICE_ID --tail
+```
+
+After the first deployment, point the OpenAI project webhook at the Render URL, update `OPENAI_WEBHOOK_SECRET`, redeploy once, and run both canaries. Keep the persistent disk mounted at `/var/data`; ephemeral SQLite loses calls/results on deployment.
+
+## API/schema decisions verified on 2026-07-13
+
+The implementation follows the current [OpenAI Realtime SIP guide](https://developers.openai.com/api/docs/guides/realtime-sip), [server-side controls guide](https://developers.openai.com/api/docs/guides/realtime-server-controls), [Realtime prompting guide](https://developers.openai.com/api/docs/guides/realtime-models-prompting), [webhook guide](https://developers.openai.com/api/docs/guides/webhooks), [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs), [Twilio Conference Participant reference](https://www.twilio.com/docs/voice/api/conference-participant-resource), [Twilio AMD guide](https://www.twilio.com/docs/voice/answering-machine-detection), and [Twilio request validation guide](https://www.twilio.com/docs/usage/security).
+
+Live-schema deviations from the original contract are intentional:
+
+- GA Realtime audio formats are objects such as `{"type":"audio/pcmu"}`, not bare strings.
+- The current Conference Participants API has no `async_amd` parameter. AMD on Participants is asynchronous by design; the installed SDK uses `machine_detection="DetectMessageEnd"` plus `amd_status_callback` and `amd_status_callback_method`.
+- OpenAI call accept is invoked through the installed typed SDK; hangup has no JSON body. REFER's live request field is `target_uri`, but v1 transfer deliberately does not use REFER.
+- The installed transcription schema permits `INPUT_TRANSCRIPTION_DELAY` only for `gpt-realtime-whisper`, with `minimal|low|medium|high|xhigh` values.
+
+## Result semantics
+
+Telephony state and extraction state remain separate. A successful phone call whose extractor fails stays `call_status=completed`, gets `finalization_status=failed`, `outcome=unknown`, retains its raw transcript, and tells the owner to review it. The service saves a telephony-only result and transcript transactionally before making the external Responses API extraction request. Only transient connection, timeout, or rate-limit failures receive one retry.
+
+Optional Poke push remains disabled by default. A push failure is logged and never changes call state or polling availability.

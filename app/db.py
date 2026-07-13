@@ -1,0 +1,423 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Iterable
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import aiosqlite
+
+from app.models import TERMINAL_STATES, CallState, StoredCallResult, TranscriptTurn
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+
+CREATE TABLE IF NOT EXISTS plans (
+    plan_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    authority_basis TEXT,
+    confirmation_text TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    call_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS calls (
+    call_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL UNIQUE REFERENCES plans(plan_id),
+    state TEXT NOT NULL,
+    conference_name TEXT NOT NULL UNIQUE,
+    conference_sid TEXT,
+    twilio_ai_call_sid TEXT,
+    twilio_callee_call_sid TEXT,
+    openai_call_id TEXT UNIQUE,
+    openai_accept_status INTEGER,
+    transcription_verified INTEGER NOT NULL DEFAULT 0,
+    semantic_vad_verified INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    tool_continuation_observed INTEGER NOT NULL DEFAULT 0,
+    interruption_observed INTEGER NOT NULL DEFAULT 0,
+    sideband_open INTEGER NOT NULL DEFAULT 0,
+    callee_joined INTEGER NOT NULL DEFAULT 0,
+    callee_dialed INTEGER NOT NULL DEFAULT 0,
+    amd_result TEXT,
+    answered_by TEXT,
+    answer_handling TEXT,
+    greeting_sent INTEGER NOT NULL DEFAULT 0,
+    voicemail_sent INTEGER NOT NULL DEFAULT 0,
+    termination_claimed INTEGER NOT NULL DEFAULT 0,
+    termination_reason TEXT,
+    advisory_outcome_json TEXT,
+    transfer_outcome TEXT,
+    last_event_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    answered_at TEXT,
+    ended_at TEXT,
+    duration_seconds INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS calls_state_idx ON calls(state);
+CREATE INDEX IF NOT EXISTS calls_twilio_ai_idx ON calls(twilio_ai_call_sid);
+CREATE INDEX IF NOT EXISTS calls_twilio_callee_idx ON calls(twilio_callee_call_sid);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id TEXT NOT NULL REFERENCES calls(call_id),
+    turn_id TEXT NOT NULL,
+    speaker TEXT NOT NULL,
+    text TEXT NOT NULL,
+    source_event_type TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    sequence_number INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(call_id, source_event_id),
+    UNIQUE(call_id, sequence_number)
+);
+
+CREATE TABLE IF NOT EXISTS call_results (
+    call_id TEXT PRIMARY KEY REFERENCES calls(call_id),
+    result_json TEXT NOT NULL,
+    transcript_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    webhook_id TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL
+);
+"""
+
+
+def _iso_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _decode_json_columns(row: dict[str, Any]) -> dict[str, Any]:
+    for key in ("context_json", "advisory_outcome_json", "result_json", "transcript_json"):
+        if row.get(key) is not None:
+            row[key.removesuffix("_json")] = json.loads(row[key])
+    return row
+
+
+class Database:
+    def __init__(self, path: Path):
+        self.path = path
+        self._write_lock = asyncio.Lock()
+
+    async def initialize(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.executescript(SCHEMA)
+            cursor = await conn.execute("PRAGMA table_info(calls)")
+            existing = {row[1] for row in await cursor.fetchall()}
+            migrations = {
+                "openai_accept_status": "INTEGER",
+                "transcription_verified": "INTEGER NOT NULL DEFAULT 0",
+                "semantic_vad_verified": "INTEGER NOT NULL DEFAULT 0",
+                "tool_call_count": "INTEGER NOT NULL DEFAULT 0",
+                "tool_continuation_observed": "INTEGER NOT NULL DEFAULT 0",
+                "interruption_observed": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in migrations.items():
+                if name not in existing:
+                    await conn.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
+            await conn.commit()
+
+    @asynccontextmanager
+    async def connection(self):
+        conn = await aiosqlite.connect(self.path)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys=ON")
+        await conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+    async def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
+        async with self._write_lock, self.connection() as conn:
+            cursor = await conn.execute(sql, tuple(params))
+            await conn.commit()
+            return cursor.rowcount
+
+    async def fetch_one(self, sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
+        async with self.connection() as conn:
+            cursor = await conn.execute(sql, tuple(params))
+            row = await cursor.fetchone()
+        return _decode_json_columns(dict(row)) if row else None
+
+    async def fetch_all(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
+        async with self.connection() as conn:
+            cursor = await conn.execute(sql, tuple(params))
+            rows = await cursor.fetchall()
+        return [_decode_json_columns(dict(row)) for row in rows]
+
+    async def create_plan(
+        self,
+        plan_id: str,
+        context: dict[str, Any],
+        authority_basis: str | None,
+        expires_at: datetime,
+    ) -> None:
+        now = _iso_now()
+        await self.execute(
+            """INSERT INTO plans
+               (plan_id, state, context_json, authority_basis, created_at, expires_at)
+               VALUES (?, 'prepared', ?, ?, ?, ?)""",
+            (plan_id, json.dumps(context), authority_basis, now, expires_at.isoformat()),
+        )
+
+    async def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        return await self.fetch_one("SELECT * FROM plans WHERE plan_id = ?", (plan_id,))
+
+    async def claim_plan_and_create_call(
+        self,
+        *,
+        plan_id: str,
+        call_id: str,
+        conference_name: str,
+        confirmation_text: str,
+    ) -> bool:
+        now = _iso_now()
+        async with self._write_lock, self.connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                """UPDATE plans SET state='started', call_id=?, confirmation_text=?
+                   WHERE plan_id=? AND state='prepared' AND expires_at>?""",
+                (call_id, confirmation_text, plan_id, now),
+            )
+            if cursor.rowcount != 1:
+                await conn.rollback()
+                return False
+            await conn.execute(
+                """INSERT INTO calls
+                   (call_id, plan_id, state, conference_name, last_event_at, created_at, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    call_id,
+                    plan_id,
+                    CallState.PREWARMING.value,
+                    conference_name,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            await conn.commit()
+            return True
+
+    async def get_call(self, call_id: str) -> dict[str, Any] | None:
+        return await self.fetch_one("SELECT * FROM calls WHERE call_id=?", (call_id,))
+
+    async def get_call_by_openai_id(self, openai_call_id: str) -> dict[str, Any] | None:
+        return await self.fetch_one("SELECT * FROM calls WHERE openai_call_id=?", (openai_call_id,))
+
+    async def get_call_by_twilio_sid(self, sid: str) -> dict[str, Any] | None:
+        return await self.fetch_one(
+            """SELECT * FROM calls
+               WHERE twilio_ai_call_sid=? OR twilio_callee_call_sid=?""",
+            (sid, sid),
+        )
+
+    async def list_calls(self, limit: int = 100) -> list[dict[str, Any]]:
+        return await self.fetch_all(
+            "SELECT * FROM calls ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+
+    async def list_nonterminal_calls(self) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
+        return await self.fetch_all(
+            f"SELECT * FROM calls WHERE state NOT IN ({placeholders})",  # noqa: S608
+            tuple(state.value for state in TERMINAL_STATES),
+        )
+
+    async def list_terminal_calls_needing_finalization(self) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
+        return await self.fetch_all(
+            f"""SELECT calls.* FROM calls
+                LEFT JOIN call_results ON call_results.call_id = calls.call_id
+                WHERE calls.state IN ({placeholders})
+                  AND (
+                    call_results.call_id IS NULL
+                    OR json_extract(call_results.result_json, '$.finalization_status') =
+                       'telephony_only'
+                  )""",  # noqa: S608
+            tuple(state.value for state in TERMINAL_STATES),
+        )
+
+    async def touch_call(self, call_id: str) -> None:
+        await self.execute(
+            "UPDATE calls SET last_event_at=? WHERE call_id=?", (_iso_now(), call_id)
+        )
+
+    async def update_call(self, call_id: str, **values: Any) -> bool:
+        if not values:
+            return True
+        values["last_event_at"] = _iso_now()
+        columns = ", ".join(f"{key}=?" for key in values)
+        params = [
+            json.dumps(value) if key == "advisory_outcome_json" and value is not None else value
+            for key, value in values.items()
+        ]
+        params.append(call_id)
+        return await self.execute(f"UPDATE calls SET {columns} WHERE call_id=?", params) == 1
+
+    async def cas_state(self, call_id: str, expected: CallState, replacement: CallState) -> bool:
+        return (
+            await self.execute(
+                """UPDATE calls SET state=?, last_event_at=?
+                   WHERE call_id=? AND state=?""",
+                (replacement.value, _iso_now(), call_id, expected.value),
+            )
+            == 1
+        )
+
+    async def set_flag_once(self, call_id: str, flag: str) -> bool:
+        allowed = {
+            "sideband_open",
+            "callee_joined",
+            "callee_dialed",
+            "greeting_sent",
+            "voicemail_sent",
+            "termination_claimed",
+        }
+        if flag not in allowed:
+            raise ValueError(f"invalid call flag: {flag}")
+        return (
+            await self.execute(
+                f"UPDATE calls SET {flag}=1, last_event_at=? WHERE call_id=? AND {flag}=0",  # noqa: S608
+                (_iso_now(), call_id),
+            )
+            == 1
+        )
+
+    async def set_amd_once(self, call_id: str, answered_by: str, handling: str) -> bool:
+        return (
+            await self.execute(
+                """UPDATE calls
+                   SET amd_result=?, answered_by=?, answer_handling=?, last_event_at=?
+                   WHERE call_id=? AND amd_result IS NULL""",
+                (answered_by, answered_by, handling, _iso_now(), call_id),
+            )
+            == 1
+        )
+
+    async def increment_tool_calls(self, call_id: str) -> None:
+        await self.execute(
+            """UPDATE calls SET tool_call_count=tool_call_count+1, last_event_at=?
+               WHERE call_id=?""",
+            (_iso_now(), call_id),
+        )
+
+    async def reset_termination_claim(self, call_id: str) -> None:
+        await self.execute(
+            """UPDATE calls SET termination_claimed=0
+               WHERE call_id=? AND state NOT IN ('completed','failed','timed_out','transferred')""",
+            (call_id,),
+        )
+
+    async def record_webhook_once(self, webhook_id: str) -> bool:
+        try:
+            return (
+                await self.execute(
+                    "INSERT INTO webhook_deliveries(webhook_id, received_at) VALUES (?, ?)",
+                    (webhook_id, _iso_now()),
+                )
+                == 1
+            )
+        except aiosqlite.IntegrityError:
+            return False
+
+    async def add_transcript_turn(
+        self,
+        *,
+        call_id: str,
+        turn_id: str,
+        speaker: str,
+        text: str,
+        source_event_type: str,
+        source_event_id: str,
+    ) -> TranscriptTurn | None:
+        async with self._write_lock, self.connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM transcripts WHERE call_id=?",
+                (call_id,),
+            )
+            sequence = (await cursor.fetchone())[0]
+            created_at = _iso_now()
+            try:
+                await conn.execute(
+                    """INSERT INTO transcripts
+                       (call_id, turn_id, speaker, text, source_event_type, source_event_id,
+                        sequence_number, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        call_id,
+                        turn_id,
+                        speaker,
+                        text,
+                        source_event_type,
+                        source_event_id,
+                        sequence,
+                        created_at,
+                    ),
+                )
+            except aiosqlite.IntegrityError:
+                await conn.rollback()
+                return None
+            await conn.commit()
+        return TranscriptTurn(
+            call_id=call_id,
+            turn_id=turn_id,
+            speaker=speaker,
+            text=text,
+            source_event_type=source_event_type,
+            source_event_id=source_event_id,
+            sequence_number=sequence,
+            created_at=datetime.fromisoformat(created_at),
+        )
+
+    async def get_transcript(self, call_id: str) -> list[TranscriptTurn]:
+        rows = await self.fetch_all(
+            "SELECT * FROM transcripts WHERE call_id=? ORDER BY sequence_number", (call_id,)
+        )
+        return [TranscriptTurn.model_validate(row) for row in rows]
+
+    async def save_result_with_transcript(
+        self,
+        call_id: str,
+        result: StoredCallResult,
+        transcript: list[TranscriptTurn],
+    ) -> None:
+        now = _iso_now()
+        async with self._write_lock, self.connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute(
+                """INSERT INTO call_results(call_id, result_json, transcript_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(call_id) DO UPDATE SET
+                     result_json=excluded.result_json,
+                     transcript_json=excluded.transcript_json,
+                     updated_at=excluded.updated_at""",
+                (
+                    call_id,
+                    result.model_dump_json(),
+                    json.dumps([turn.model_dump(mode="json") for turn in transcript]),
+                    now,
+                ),
+            )
+            await conn.commit()
+
+    async def get_result(self, call_id: str) -> StoredCallResult | None:
+        row = await self.fetch_one(
+            "SELECT result_json FROM call_results WHERE call_id=?", (call_id,)
+        )
+        return StoredCallResult.model_validate(row["result"]) if row else None
