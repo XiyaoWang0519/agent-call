@@ -507,6 +507,25 @@ class Database:
             "UPDATE calls SET last_event_at=? WHERE call_id=?", (_iso_now(), call_id)
         )
 
+    async def touch_calls(self, activity: Iterable[tuple[str, str]]) -> None:
+        """Persist latest observed activity for several calls in one durable transaction."""
+        terminal_states = tuple(sorted(state.value for state in TERMINAL_STATES))
+        placeholders = ",".join("?" for _ in terminal_states)
+        rows = [
+            (occurred_at, call_id, occurred_at, *terminal_states)
+            for call_id, occurred_at in activity
+        ]
+        if not rows:
+            return
+        async with self._write_connection() as conn:
+            await conn.executemany(
+                f"""UPDATE calls SET last_event_at=?
+                    WHERE call_id=? AND last_event_at<?
+                      AND state NOT IN ({placeholders})""",  # noqa: S608
+                rows,
+            )
+            await conn.commit()
+
     async def record_latency_events(
         self,
         call_id: str,

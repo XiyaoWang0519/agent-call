@@ -88,6 +88,7 @@ async def _start_bridge(
     websocket: QueueWebSocket,
     on_event: Callable[[str, dict[str, Any]], Awaitable[None]],
     on_open: Callable[[str], Awaitable[None]] = _noop,
+    on_activity: Callable[[str], None] | None = None,
 ) -> tuple[
     RealtimeBridge,
     RealtimeRuntime,
@@ -108,6 +109,7 @@ async def _start_bridge(
         on_event=on_event,
         on_open=on_open,
         on_fatal=on_fatal,
+        on_activity=on_activity,
     )
     runtime = RealtimeRuntime(call_id=call_id, openai_call_id=f"rtc_{call_id}")
     bridge._runtime[call_id] = runtime
@@ -128,6 +130,7 @@ async def test_reader_continues_while_first_application_event_is_blocked(setting
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     handled: list[int] = []
+    activity: list[str] = []
 
     async def on_event(call_id: str, event: dict[str, Any]) -> None:
         handled.append(event["sequence"])
@@ -141,6 +144,7 @@ async def test_reader_continues_while_first_application_event_is_blocked(setting
         call_id="call_read_ahead",
         websocket=websocket,
         on_event=on_event,
+        on_activity=activity.append,
     )
 
     await websocket.feed({"type": "test.event", "sequence": 1})
@@ -153,6 +157,7 @@ async def test_reader_continues_while_first_application_event_is_blocked(setting
 
     assert [event["sequence"] for event in websocket.received] == [1, 2]
     assert runtime.event_queue.qsize() == 1
+    assert activity == ["call_read_ahead", "call_read_ahead"]
 
     release_first.set()
     await websocket.close()

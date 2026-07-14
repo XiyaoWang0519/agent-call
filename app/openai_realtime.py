@@ -20,6 +20,7 @@ EventHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 OpenHandler = Callable[[str], Awaitable[None]]
 FatalHandler = Callable[[str, str], Awaitable[None]]
 SendHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
+ActivityHandler = Callable[[str], None]
 
 # Realtime events are normally consumed as quickly as they arrive. A bounded queue protects a
 # call from unbounded memory growth if application handling stalls while still leaving ample room
@@ -65,6 +66,7 @@ class RealtimeBridge:
         on_open: OpenHandler,
         on_fatal: FatalHandler,
         on_send: SendHandler | None = None,
+        on_activity: ActivityHandler | None = None,
     ):
         self.settings = settings
         self.client = client
@@ -72,6 +74,7 @@ class RealtimeBridge:
         self.on_open = on_open
         self.on_fatal = on_fatal
         self.on_send = on_send
+        self.on_activity = on_activity
         self._runtime: dict[str, RealtimeRuntime] = {}
 
     def build_accept_payload(self, packet: ContextPacket) -> AcceptPayload:
@@ -258,6 +261,11 @@ class RealtimeBridge:
     async def _receive_events(self, runtime: RealtimeRuntime, websocket: Any) -> None:
         async for message in websocket:
             event = json.loads(message)
+            # Record liveness on the reader fast path. Application dispatch may be
+            # intentionally backlogged, but a frame already read from the socket is
+            # authoritative evidence that the call is still alive.
+            if self.on_activity is not None:
+                self.on_activity(runtime.call_id)
             if event.get("type") == "session.updated" and runtime.update_waiter:
                 if not runtime.update_waiter.done():
                     runtime.update_waiter.set_result(event)
@@ -304,12 +312,102 @@ class RealtimeBridge:
         await dispatcher
 
     async def send(self, call_id: str, event: dict[str, Any]) -> None:
+        await self._send_batch(call_id, [event])
+
+    async def _send_batch(self, call_id: str, events: list[dict[str, Any]]) -> None:
+        serialized = [(event, json.dumps(event)) for event in events]
+        if not serialized:
+            return
         runtime = self._runtime.get(call_id)
-        if runtime is None or runtime.websocket is None:
+        if runtime is None:
             raise RuntimeError("sideband is not open")
-        async with runtime.send_lock:
-            await runtime.websocket.send(json.dumps(event))
-        if self.on_send is not None:
+
+        # Single control frames retain normal asyncio cancellation semantics. Only
+        # a multi-frame protocol pair needs cancellation shielding after it starts.
+        if len(serialized) == 1:
+            await self._send_locked_batch(call_id, runtime, serialized)
+            return
+
+        # Waiting for ownership is still normally cancellable. Once acquired,
+        # however, the protocol pair must either finish or hit a wire failure.
+        await runtime.send_lock.acquire()
+        try:
+            send_task = asyncio.create_task(
+                self._send_owned_batch(call_id, runtime, serialized),
+                name=f"sideband-send:{call_id}",
+            )
+        except BaseException:
+            runtime.send_lock.release()
+            raise
+        interrupted = False
+        while not send_task.done():
+            try:
+                await asyncio.shield(send_task)
+            except asyncio.CancelledError:
+                # Once a batch is eligible to write, cancellation cannot split its
+                # function output from its continuation. Re-raise only after the
+                # shielded sender has released the per-call lock and recorded every
+                # frame that actually reached the websocket.
+                interrupted = True
+            except BaseException:
+                break
+
+        failure: BaseException | None = None
+        try:
+            send_task.result()
+        except BaseException as exc:
+            failure = exc
+        if interrupted:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
+
+    async def _send_locked_batch(
+        self,
+        call_id: str,
+        runtime: RealtimeRuntime,
+        serialized: list[tuple[dict[str, Any], str]],
+    ) -> None:
+        sent: list[dict[str, Any]] = []
+        try:
+            async with runtime.send_lock:
+                websocket = runtime.websocket
+                if websocket is None:
+                    raise RuntimeError("sideband is not open")
+                for event, payload in serialized:
+                    await websocket.send(payload)
+                    sent.append(event)
+        finally:
+            await self._notify_sent(call_id, sent)
+
+    async def _send_owned_batch(
+        self,
+        call_id: str,
+        runtime: RealtimeRuntime,
+        serialized: list[tuple[dict[str, Any], str]],
+    ) -> None:
+        sent: list[dict[str, Any]] = []
+        failure: BaseException | None = None
+        try:
+            websocket = runtime.websocket
+            if websocket is None:
+                raise RuntimeError("sideband is not open")
+            for event, payload in serialized:
+                await websocket.send(payload)
+                sent.append(event)
+        except BaseException as exc:
+            failure = exc
+        finally:
+            runtime.send_lock.release()
+
+        await self._notify_sent(call_id, sent)
+        if failure is not None:
+            raise failure
+
+    async def _notify_sent(self, call_id: str, events: list[dict[str, Any]]) -> None:
+        if self.on_send is None:
+            return
+        for event in events:
             try:
                 await self.on_send(call_id, event)
             except Exception:
@@ -418,8 +516,7 @@ class RealtimeBridge:
         continue_response: bool = True,
         continuation_instructions: str | None = None,
     ) -> None:
-        await self.send(
-            call_id,
+        events: list[dict[str, Any]] = [
             {
                 "type": "conversation.item.create",
                 "item": {
@@ -427,8 +524,8 @@ class RealtimeBridge:
                     "call_id": tool_call_id,
                     "output": json.dumps(output),
                 },
-            },
-        )
+            }
+        ]
         if continue_response:
             continuation: dict[str, Any] = {"type": "response.create"}
             if continuation_instructions:
@@ -436,7 +533,8 @@ class RealtimeBridge:
                     "output_modalities": ["audio"],
                     "instructions": continuation_instructions,
                 }
-            await self.send(call_id, continuation)
+            events.append(continuation)
+        await self._send_batch(call_id, events)
 
     async def hangup(self, openai_call_id: str | None) -> None:
         if not openai_call_id:

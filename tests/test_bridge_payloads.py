@@ -33,6 +33,26 @@ class FailingSendWebSocket(FakeWebSocket):
         raise RuntimeError("socket send failed")
 
 
+class BlockingFirstSendWebSocket(FakeWebSocket):
+    def __init__(self):
+        super().__init__()
+        self.first_sent = asyncio.Event()
+        self.release_first = asyncio.Event()
+
+    async def send(self, message: str) -> None:
+        await super().send(message)
+        if len(self.messages) == 1:
+            self.first_sent.set()
+            await self.release_first.wait()
+
+
+class SecondSendFailsWebSocket(FakeWebSocket):
+    async def send(self, message: str) -> None:
+        if self.messages:
+            raise RuntimeError("second socket send failed")
+        await super().send(message)
+
+
 class StreamingFakeWebSocket(FakeWebSocket):
     def __init__(self, echo: dict):
         super().__init__()
@@ -365,6 +385,162 @@ async def test_function_output_precedes_manual_continuation(settings):
         },
         {"type": "response.create"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_tool_output_and_continuation_cannot_be_interleaved(settings):
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    websocket = BlockingFirstSendWebSocket()
+    bridge._runtime["call_1"] = RealtimeRuntime(
+        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+    )
+
+    tool_result = asyncio.create_task(
+        bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
+    )
+    await asyncio.wait_for(websocket.first_sent.wait(), timeout=1)
+    competing_send = asyncio.create_task(bridge.send("call_1", {"type": "response.cancel"}))
+    await asyncio.sleep(0)
+
+    assert [message["type"] for message in websocket.messages] == ["conversation.item.create"]
+
+    websocket.release_first.set()
+    await asyncio.gather(tool_result, competing_send)
+    assert [message["type"] for message in websocket.messages] == [
+        "conversation.item.create",
+        "response.create",
+        "response.cancel",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_first_frame_finishes_atomic_tool_pair(settings):
+    observed: list[str] = []
+
+    async def on_send(call_id: str, event: dict) -> None:
+        observed.append(event["type"])
+
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+        on_send=on_send,
+    )
+    websocket = BlockingFirstSendWebSocket()
+    bridge._runtime["call_1"] = RealtimeRuntime(
+        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+    )
+
+    tool_result = asyncio.create_task(
+        bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
+    )
+    await asyncio.wait_for(websocket.first_sent.wait(), timeout=1)
+    competing_send = asyncio.create_task(bridge.send("call_1", {"type": "response.cancel"}))
+    tool_result.cancel()
+    await asyncio.sleep(0)
+
+    assert tool_result.done() is False
+    assert competing_send.done() is False
+    assert [message["type"] for message in websocket.messages] == ["conversation.item.create"]
+
+    websocket.release_first.set()
+    with pytest.raises(asyncio.CancelledError):
+        await tool_result
+    assert observed[:2] == ["conversation.item.create", "response.create"]
+
+    await competing_send
+    assert [message["type"] for message in websocket.messages] == [
+        "conversation.item.create",
+        "response.create",
+        "response.cancel",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_single_frame_waiting_for_lock_is_never_sent(settings):
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    websocket = FakeWebSocket()
+    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
+    bridge._runtime["call_1"] = runtime
+    await runtime.send_lock.acquire()
+
+    pending = asyncio.create_task(bridge.send("call_1", {"type": "response.cancel"}))
+    await asyncio.sleep(0)
+    assert pending.done() is False
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    runtime.send_lock.release()
+    await asyncio.sleep(0)
+    assert websocket.messages == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_pair_waiting_for_lock_is_never_sent(settings):
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    websocket = FakeWebSocket()
+    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
+    bridge._runtime["call_1"] = runtime
+    await runtime.send_lock.acquire()
+
+    pending = asyncio.create_task(bridge.send_tool_result("call_1", "tool_1", {"accepted": True}))
+    await asyncio.sleep(0)
+    assert pending.done() is False
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, timeout=0.1)
+
+    runtime.send_lock.release()
+    await asyncio.sleep(0)
+    assert websocket.messages == []
+
+
+@pytest.mark.asyncio
+async def test_partial_tool_result_send_notifies_only_successful_frames(settings):
+    observed: list[str] = []
+
+    async def on_send(call_id: str, event: dict) -> None:
+        observed.append(event["type"])
+
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+        on_send=on_send,
+    )
+    websocket = SecondSendFailsWebSocket()
+    bridge._runtime["call_1"] = RealtimeRuntime(
+        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+    )
+
+    with pytest.raises(RuntimeError, match="second socket send failed"):
+        await bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
+
+    assert [message["type"] for message in websocket.messages] == ["conversation.item.create"]
+    assert observed == ["conversation.item.create"]
 
 
 @pytest.mark.asyncio

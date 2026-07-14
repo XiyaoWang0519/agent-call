@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import secrets
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
+from time import monotonic_ns
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -30,6 +32,9 @@ from app.twilio_bridge import TwilioBridge
 
 logger = logging.getLogger(__name__)
 
+CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS = 15 * 60
+CALL_ACTIVITY_TOMBSTONE_MAX = 4096
+
 
 class CallService:
     def __init__(
@@ -45,6 +50,10 @@ class CallService:
         self._owns_openai_client = openai is None
         self.openai = openai if openai is not None else create_openai_client(settings)
         self.twilio = twilio or TwilioBridge(settings)
+        self._latest_call_activity: dict[str, LatencyMark] = {}
+        self._dirty_call_activity: dict[str, LatencyMark] = {}
+        self._watchdog_claims: set[str] = set()
+        self._activity_tombstones: OrderedDict[str, int] = OrderedDict()
         self.realtime = RealtimeBridge(
             settings,
             self.openai,
@@ -52,6 +61,7 @@ class CallService:
             on_open=self.handle_sideband_open,
             on_fatal=self._handle_sideband_fatal,
             on_send=self.handle_realtime_send,
+            on_activity=self._note_call_activity,
         )
         self.finalizer = Finalizer(settings, db, self.openai)
         self._background: set[asyncio.Task[Any]] = set()
@@ -70,6 +80,79 @@ class CallService:
 
     def _opening_transition_lock(self, call_id: str) -> asyncio.Lock:
         return self._opening_transition_locks.setdefault(call_id, asyncio.Lock())
+
+    def _note_call_activity(self, call_id: str, mark: LatencyMark | None = None) -> bool:
+        # A watchdog claim is the liveness linearization point. Activity observed
+        # before the claim updates these maps; activity after it cannot resurrect a
+        # call whose timeout teardown has already won.
+        self._prune_activity_tombstones()
+        if call_id in self._watchdog_claims or call_id in self._activity_tombstones:
+            return False
+        observed = mark or LatencyMark.now()
+        latest = self._latest_call_activity.get(call_id)
+        if latest is not None and latest.monotonic_ns >= observed.monotonic_ns:
+            return True
+        self._latest_call_activity[call_id] = observed
+        dirty = self._dirty_call_activity.get(call_id)
+        if dirty is None or dirty.monotonic_ns < observed.monotonic_ns:
+            self._dirty_call_activity[call_id] = observed
+        return True
+
+    def _clear_call_activity(self, call_id: str) -> None:
+        self._latest_call_activity.pop(call_id, None)
+        self._dirty_call_activity.pop(call_id, None)
+        self._watchdog_claims.discard(call_id)
+
+    def _tombstone_call_activity(self, call_id: str) -> None:
+        now_ns = monotonic_ns()
+        self._prune_activity_tombstones(now_ns)
+        self._activity_tombstones.pop(call_id, None)
+        self._activity_tombstones[call_id] = now_ns + (
+            CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS * 1_000_000_000
+        )
+        while len(self._activity_tombstones) > CALL_ACTIVITY_TOMBSTONE_MAX:
+            self._activity_tombstones.popitem(last=False)
+        self._clear_call_activity(call_id)
+
+    def _prune_activity_tombstones(self, now_ns: int | None = None) -> None:
+        cutoff = monotonic_ns() if now_ns is None else now_ns
+        while self._activity_tombstones:
+            _, expires_at = next(iter(self._activity_tombstones.items()))
+            if expires_at > cutoff:
+                break
+            self._activity_tombstones.popitem(last=False)
+
+    @staticmethod
+    def _call_activity_is_closed(call: dict[str, Any]) -> bool:
+        state = CallState(call["state"])
+        return state == CallState.TERMINATING or state in TERMINAL_STATES
+
+    async def _flush_call_activity(self) -> None:
+        if not self._dirty_call_activity:
+            return
+        pending = self._dirty_call_activity
+        self._dirty_call_activity = {}
+        try:
+            await self.db.touch_calls(
+                (call_id, mark.occurred_at) for call_id, mark in pending.items()
+            )
+        except BaseException as exc:
+            # Keep the newest observation if more activity arrived while the write
+            # was in flight. A terminal cleanup removes the latest map entry and
+            # therefore prevents a failed flush from re-adding a dead call.
+            for call_id, failed_mark in pending.items():
+                latest = self._latest_call_activity.get(call_id)
+                if latest is None:
+                    continue
+                candidate = (
+                    latest if latest.monotonic_ns >= failed_mark.monotonic_ns else failed_mark
+                )
+                current = self._dirty_call_activity.get(call_id)
+                if current is None or current.monotonic_ns < candidate.monotonic_ns:
+                    self._dirty_call_activity[call_id] = candidate
+            if not isinstance(exc, Exception):
+                raise
+            logger.warning("failed to persist batched call activity", exc_info=True)
 
     async def _record_latency(
         self,
@@ -369,6 +452,18 @@ class CallService:
         await self._check_activation_gate(call_id)
 
     async def handle_amd(self, call_id: str, answered_by: str) -> None:
+        received = LatencyMark.now()
+        if not self._note_call_activity(call_id, received):
+            return
+        call = await self.db.get_call(call_id)
+        if call is None:
+            self._clear_call_activity(call_id)
+            return
+        if self._call_activity_is_closed(call):
+            self._tombstone_call_activity(call_id)
+            return
+        if not self._note_call_activity(call_id, received):
+            return
         normalized = (answered_by or "unknown").lower()
         if normalized == "fax":
             handling = "fax"
@@ -388,11 +483,19 @@ class CallService:
 
     async def handle_conference_event(self, call_id: str, form: dict[str, str]) -> None:
         received = LatencyMark.now()
+        if not self._note_call_activity(call_id, received):
+            return
         event = (form.get("StatusCallbackEvent") or form.get("ConferenceStatus") or "").lower()
         label = (form.get("ParticipantLabel") or form.get("Label") or "").lower()
         call_sid = form.get("CallSid") or form.get("ParticipantCallSid")
         call = await self.db.get_call(call_id)
         if call is None:
+            self._clear_call_activity(call_id)
+            return
+        if self._call_activity_is_closed(call):
+            self._tombstone_call_activity(call_id)
+            return
+        if not self._note_call_activity(call_id, received):
             return
         if event in {"conference-start", "start"}:
             # Twilio fires conference-start as soon as the agent SIP leg enters the
@@ -427,6 +530,17 @@ class CallService:
 
     async def handle_participant_status(self, call_id: str, leg: str, form: dict[str, str]) -> None:
         received = LatencyMark.now()
+        if not self._note_call_activity(call_id, received):
+            return
+        call = await self.db.get_call(call_id)
+        if call is None:
+            self._clear_call_activity(call_id)
+            return
+        if self._call_activity_is_closed(call):
+            self._tombstone_call_activity(call_id)
+            return
+        if not self._note_call_activity(call_id, received):
+            return
         status = (form.get("CallStatus") or "").lower()
         await self.db.touch_call(call_id)
         if leg == "callee" and status in {"in-progress", "answered"}:
@@ -560,7 +674,6 @@ class CallService:
         received = LatencyMark.now()
         event_type = event.get("type", "")
         event_id = event.get("event_id") or f"evt_{secrets.token_urlsafe(12)}"
-        await self.db.touch_call(call_id)
         if event_type in {
             "response.output_audio_transcript.delta",
             "response.output_audio_transcript.done",
@@ -843,13 +956,21 @@ class CallService:
         await_finalizer: bool = False,
     ) -> bool:
         call = await self.db.get_call(call_id)
-        if call is None or CallState(call["state"]) in TERMINAL_STATES:
+        if call is None:
+            self._clear_call_activity(call_id)
             return False
+        state = CallState(call["state"])
+        if state in TERMINAL_STATES:
+            self._tombstone_call_activity(call_id)
+            return False
+        if state == CallState.TERMINATING:
+            self._tombstone_call_activity(call_id)
         if (call.get("transfer_outcome") or "").startswith(("in_progress:", "completed:")):
             preserve_conference = True
             reason = "transfer_completed"
         if not await self.db.set_flag_once(call_id, "termination_claimed"):
             return False
+        self._tombstone_call_activity(call_id)
         self._voice_end_pending.pop(call_id, None)
         self._active_response_ids.pop(call_id, None)
         await self.db.update_call(
@@ -894,6 +1015,7 @@ class CallService:
             ended_at=ended_at.isoformat(),
             duration_seconds=duration,
         )
+        self._tombstone_call_activity(call_id)
         await self.db.add_transcript_turn(
             call_id=call_id,
             turn_id=f"telephony_{secrets.token_urlsafe(10)}",
@@ -983,6 +1105,7 @@ class CallService:
         for task in list(self._background):
             task.cancel()
         await asyncio.gather(*self._background, return_exceptions=True)
+        await self._flush_call_activity()
         if self._owns_openai_client:
             await self.openai.close()
 
@@ -992,7 +1115,54 @@ class CallService:
             await self._watchdog_once()
 
     async def _watchdog_once(self) -> None:
-        cutoff = datetime.now(UTC) - timedelta(seconds=self.settings.watchdog_stale_seconds)
-        for call in await self.db.list_nonterminal_calls():
-            if datetime.fromisoformat(call["last_event_at"]) < cutoff:
-                await self.terminate_call(call["call_id"], "watchdog_stale")
+        await self._flush_call_activity()
+        now = LatencyMark.now()
+        cutoff = datetime.fromisoformat(now.occurred_at) - timedelta(
+            seconds=self.settings.watchdog_stale_seconds
+        )
+        stale_ns = self.settings.watchdog_stale_seconds * 1_000_000_000
+        calls = await self.db.list_nonterminal_calls()
+        for call in calls:
+            call_id = call["call_id"]
+            if self._call_activity_is_closed(call):
+                self._tombstone_call_activity(call_id)
+                continue
+            if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
+                continue
+            activity_before = self._latest_call_activity.get(call_id)
+            if (
+                activity_before is not None
+                and now.monotonic_ns - activity_before.monotonic_ns <= stale_ns
+            ):
+                continue
+
+            # The initial list can go stale while another callback updates the call.
+            # Re-read both durable and in-memory liveness before claiming timeout.
+            current = await self.db.get_call(call_id)
+            if current is None:
+                self._clear_call_activity(call_id)
+                continue
+            if self._call_activity_is_closed(current):
+                self._tombstone_call_activity(call_id)
+                continue
+            if datetime.fromisoformat(current["last_event_at"]) >= cutoff:
+                continue
+            activity_after = self._latest_call_activity.get(call_id)
+            if activity_after is not None:
+                changed = (
+                    activity_before is None
+                    or activity_after.monotonic_ns > activity_before.monotonic_ns
+                )
+                fresh = now.monotonic_ns - activity_after.monotonic_ns <= stale_ns
+                if changed or fresh:
+                    continue
+
+            # No await is allowed between the final monotonic check and this claim.
+            # That makes all pre-claim activity win and all post-claim activity lose.
+            self._watchdog_claims.add(call_id)
+            terminated = False
+            try:
+                terminated = await self.terminate_call(call_id, "watchdog_stale")
+            finally:
+                if not terminated:
+                    self._watchdog_claims.discard(call_id)
