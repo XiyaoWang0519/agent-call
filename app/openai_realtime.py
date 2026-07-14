@@ -100,6 +100,32 @@ class RealtimeBridge:
                         "additionalProperties": False,
                     },
                 },
+                {
+                    "type": "function",
+                    "name": "end_call",
+                    "description": (
+                        "Request the end of the phone call when the conversation is finished. Call "
+                        "this immediately instead of waiting for the callee or outer client to hang "
+                        "up. After it succeeds, you will be prompted to say the final goodbye."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "enum": [
+                                    "objective_completed",
+                                    "callee_declined",
+                                    "wrong_number",
+                                    "unable_to_complete",
+                                    "out_of_scope",
+                                ],
+                            }
+                        },
+                        "required": ["reason"],
+                        "additionalProperties": False,
+                    },
+                },
             ],
         )
 
@@ -240,7 +266,13 @@ class RealtimeBridge:
         )
 
     async def send_tool_result(
-        self, call_id: str, tool_call_id: str, output: dict[str, Any]
+        self,
+        call_id: str,
+        tool_call_id: str,
+        output: dict[str, Any],
+        *,
+        continue_response: bool = True,
+        continuation_instructions: str | None = None,
     ) -> None:
         await self.send(
             call_id,
@@ -253,7 +285,14 @@ class RealtimeBridge:
                 },
             },
         )
-        await self.send(call_id, {"type": "response.create"})
+        if continue_response:
+            continuation: dict[str, Any] = {"type": "response.create"}
+            if continuation_instructions:
+                continuation["response"] = {
+                    "output_modalities": ["audio"],
+                    "instructions": continuation_instructions,
+                }
+            await self.send(call_id, continuation)
 
     async def hangup(self, openai_call_id: str | None) -> None:
         if not openai_call_id:

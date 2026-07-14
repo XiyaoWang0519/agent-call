@@ -209,7 +209,7 @@ class RealtimeFunctionTool(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["function"] = "function"
-    name: Literal["transfer_to_owner", "record_call_outcome"]
+    name: Literal["transfer_to_owner", "record_call_outcome", "end_call"]
     description: str = Field(min_length=1)
     parameters: dict[str, Any]
 
@@ -245,6 +245,18 @@ class AdvisoryOutcome(BaseModel):
     summary: str
     commitments: list[str] = Field(default_factory=list)
     follow_ups: list[str] = Field(default_factory=list, alias="followUps")
+
+
+class VoiceEndCallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Literal[
+        "objective_completed",
+        "callee_declined",
+        "wrong_number",
+        "unable_to_complete",
+        "out_of_scope",
+    ]
 
 
 class CallSnapshot(BaseModel):

@@ -217,6 +217,87 @@ async def test_tool_output_is_followed_by_observed_continuation(service, packet)
 
 
 @pytest.mark.asyncio
+async def test_voice_model_ends_call_only_after_its_completed_response(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    await service._handle_tool_call(
+        call_id,
+        {
+            "call_id": "tool_end",
+            "response_id": "resp_function",
+            "name": "end_call",
+            "arguments": '{"reason":"objective_completed"}',
+        },
+    )
+    assert (await service.db.get_call(call_id))["state"] == CallState.GREETING_STARTED.value
+    assert service._test_realtime.tool_result_continuations[-1] is True
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {"id": "resp_function", "status": "completed"},
+        },
+    )
+    assert (await service.db.get_call(call_id))["state"] == CallState.GREETING_STARTED.value
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.created",
+            "response": {"id": "resp_closing"},
+        },
+    )
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {"id": "resp_closing", "status": "completed"},
+        },
+    )
+    await wait_background()
+
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.COMPLETED.value
+    assert call["termination_reason"] == "voice_model_end_call"
+    assert service._test_realtime.hangups == ["rtc_test"]
+    assert service._test_twilio.completed == ["CF" + "a" * 32]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_voice_closing_does_not_end_call(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    await service._handle_tool_call(
+        call_id,
+        {
+            "call_id": "tool_end",
+            "response_id": "resp_function",
+            "name": "end_call",
+            "arguments": '{"reason":"objective_completed"}',
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.created",
+            "response": {"id": "resp_closing"},
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {"id": "resp_closing", "status": "cancelled"},
+        },
+    )
+    await wait_background()
+
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.GREETING_STARTED.value
+    assert call["interruption_observed"] == 1
+    assert service._test_realtime.hangups == []
+
+
+@pytest.mark.asyncio
 async def test_transfer_tool_returns_output_before_removing_ai(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
     service._owner_join_events.setdefault(call_id, __import__("asyncio").Event()).set()

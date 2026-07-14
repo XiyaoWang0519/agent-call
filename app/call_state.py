@@ -20,6 +20,7 @@ from app.models import (
     PreparePhoneCallInput,
     PreparePhoneCallOutput,
     StartPhoneCallOutput,
+    VoiceEndCallRequest,
 )
 from app.openai_realtime import RealtimeBridge
 from app.policy import validate_context
@@ -55,6 +56,7 @@ class CallService:
         self.finalizer = Finalizer(settings, db, self.openai)
         self._background: set[asyncio.Task[Any]] = set()
         self._owner_join_events: dict[str, asyncio.Event] = {}
+        self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
 
     def _spawn(self, coroutine, *, name: str) -> asyncio.Task[Any]:
@@ -381,6 +383,12 @@ class CallService:
             call = await self.db.get_call(call_id)
             if call and call.get("tool_call_count", 0) > 0:
                 await self.db.update_call(call_id, tool_continuation_observed=1)
+            pending = self._voice_end_pending.get(call_id)
+            if pending and pending[1] is None:
+                response = event.get("response") or {}
+                response_id = response.get("id") or event.get("response_id")
+                if response_id:
+                    self._voice_end_pending[call_id] = (pending[0], response_id)
         elif event_type in {"response.done", "response.audio.done"}:
             call = await self.db.get_call(call_id)
             response = event.get("response") or {}
@@ -394,6 +402,8 @@ class CallService:
                     response.get("status_details"),
                     event,
                 )
+            if event_type == "response.done":
+                await self._handle_voice_end_response_done(call_id, event)
             if call and call.get("voicemail_sent"):
                 self._spawn(
                     self.terminate_call(call_id, "voicemail_left"),
@@ -428,6 +438,31 @@ class CallService:
             except Exception as exc:
                 output = {"accepted": False, "error": str(exc)}
             await self.realtime.send_tool_result(call_id, tool_call_id, output)
+        elif name == "end_call":
+            try:
+                request = VoiceEndCallRequest.model_validate(arguments)
+            except Exception as exc:
+                await self.realtime.send_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"accepted": False, "error": str(exc)},
+                )
+                return
+            pending = (tool_call_id, None)
+            self._voice_end_pending[call_id] = pending
+            await self.realtime.send_tool_result(
+                call_id,
+                tool_call_id,
+                {"accepted": True, "reason": request.reason},
+                continuation_instructions=(
+                    "The call is now ending. Briefly confirm the outcome or next step if useful, "
+                    "then say one concise, natural goodbye. Do not call any function."
+                ),
+            )
+            self._spawn(
+                self._voice_end_fallback(call_id, tool_call_id),
+                name=f"voice-end-fallback:{call_id}",
+            )
         elif name == "transfer_to_owner":
             reason = arguments.get("reason", "requested")
             output, owner_call_sid = await self._join_owner(call_id)
@@ -448,6 +483,37 @@ class CallService:
             await self.realtime.send_tool_result(
                 call_id, tool_call_id, {"accepted": False, "error": "unknown tool"}
             )
+
+    async def _handle_voice_end_response_done(self, call_id: str, event: dict[str, Any]) -> None:
+        pending = self._voice_end_pending.get(call_id)
+        if pending is None:
+            return
+        _, expected_response_id = pending
+        if expected_response_id is None:
+            return
+        response = event.get("response") or {}
+        response_id = response.get("id") or event.get("response_id")
+        if expected_response_id and response_id and expected_response_id != response_id:
+            return
+        status = response.get("status")
+        if status in {"cancelled", "canceled", "failed", "incomplete"}:
+            self._voice_end_pending.pop(call_id, None)
+            return
+        if status != "completed":
+            return
+        self._voice_end_pending.pop(call_id, None)
+        self._spawn(
+            self.terminate_call(call_id, "voice_model_end_call"),
+            name=f"terminate:{call_id}:voice-end",
+        )
+
+    async def _voice_end_fallback(self, call_id: str, tool_call_id: str) -> None:
+        await asyncio.sleep(15)
+        pending = self._voice_end_pending.get(call_id)
+        if pending is None or pending[0] != tool_call_id:
+            return
+        self._voice_end_pending.pop(call_id, None)
+        await self.terminate_call(call_id, "voice_model_end_call")
 
     async def transfer_to_owner(
         self, call_id: str, reason: str, *, terminate_after: bool = True
@@ -535,6 +601,7 @@ class CallService:
             reason = "transfer_completed"
         if not await self.db.set_flag_once(call_id, "termination_claimed"):
             return False
+        self._voice_end_pending.pop(call_id, None)
         await self.db.update_call(
             call_id, state=CallState.TERMINATING.value, termination_reason=reason
         )
@@ -565,6 +632,7 @@ class CallService:
             "conference_end",
             "voicemail_left",
             "owner_request",
+            "voice_model_end_call",
             "openai_terminal_event",
         }:
             terminal = CallState.COMPLETED

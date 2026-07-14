@@ -44,7 +44,12 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     assert [tool["name"] for tool in payload["tools"]] == [
         "transfer_to_owner",
         "record_call_outcome",
+        "end_call",
     ]
+    end_call = payload["tools"][2]
+    assert end_call["parameters"]["required"] == ["reason"]
+    assert "objective_completed" in end_call["parameters"]["properties"]["reason"]["enum"]
+    assert "final goodbye" in end_call["description"].lower()
 
 
 def test_session_created_echo_requires_transcription_and_full_initial_vad(settings, packet):

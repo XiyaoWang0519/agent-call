@@ -109,6 +109,7 @@ class FakeRealtime:
         self.rejects: list[str] = []
         self.closed: list[str] = []
         self.tool_results: list[tuple[str, str, dict]] = []
+        self.tool_result_continuations: list[bool] = []
         self.accepts: list[tuple[str, str]] = []
         self.update_event = {
             "type": "session.updated",
@@ -154,8 +155,19 @@ class FakeRealtime:
     async def drain_and_close(self, call_id: str) -> None:
         self.closed.append(call_id)
 
-    async def send_tool_result(self, call_id: str, tool_call_id: str, output: dict) -> None:
+    async def send_tool_result(
+        self,
+        call_id: str,
+        tool_call_id: str,
+        output: dict,
+        *,
+        continue_response: bool = True,
+        continuation_instructions: str | None = None,
+    ) -> None:
         self.tool_results.append((call_id, tool_call_id, output))
+        self.tool_result_continuations.append(continue_response)
+        if continuation_instructions:
+            self.events.append(("tool_continuation", call_id))
 
     def expected_transcription_echoed(self, event) -> bool:
         return event.get("transcription_ok", True)

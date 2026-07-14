@@ -107,6 +107,44 @@ async def test_function_output_precedes_manual_continuation(settings):
     ]
 
 
+@pytest.mark.asyncio
+async def test_terminal_function_output_creates_a_dedicated_closing_response(settings):
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    websocket = FakeWebSocket()
+    bridge._runtime["call_1"] = RealtimeRuntime(
+        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+    )
+    await bridge.send_tool_result(
+        "call_1",
+        "tool_1",
+        {"accepted": True},
+        continuation_instructions="Say one concise goodbye. Do not call any function.",
+    )
+    assert websocket.messages == [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": "tool_1",
+                "output": '{"accepted": true}',
+            },
+        },
+        {
+            "type": "response.create",
+            "response": {
+                "output_modalities": ["audio"],
+                "instructions": "Say one concise goodbye. Do not call any function.",
+            },
+        },
+    ]
+
+
 class FakeParticipants:
     def __init__(self):
         self.creates: list[dict] = []
