@@ -119,6 +119,8 @@ class FakeRealtime:
                 "audio": {
                     "input": {
                         "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "high",
                             "create_response": True,
                             "interrupt_response": True,
                         }
@@ -134,7 +136,7 @@ class FakeRealtime:
                         "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "auto",
+                            "eagerness": "high",
                             "create_response": False,
                             "interrupt_response": False,
                         },
@@ -157,10 +159,14 @@ class FakeRealtime:
         self.accepts.append((call_id, openai_call_id))
         return 200
 
-    @staticmethod
-    def activation_update_confirmed(event):
+    def activation_update_confirmed(self, event):
         turn = event["session"]["audio"]["input"]["turn_detection"]
-        return turn["create_response"] is True and turn["interrupt_response"] is True
+        return (
+            turn["type"] == "semantic_vad"
+            and turn["eagerness"] == "high"
+            and turn["create_response"] is True
+            and turn["interrupt_response"] is True
+        )
 
     async def create_opening(self, call_id: str) -> None:
         self.events.append(("opening", call_id))
@@ -205,7 +211,7 @@ class FakeRealtime:
         turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
         return (
             turn.get("type") == "semantic_vad"
-            and turn.get("eagerness") == "auto"
+            and turn.get("eagerness") == "high"
             and turn.get("create_response") is False
             and turn.get("interrupt_response") is False
         )

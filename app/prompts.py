@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import json
-
 from app.models import ContextPacket
+
+REALTIME_INSTRUCTIONS_MAX_BYTES = 20 * 1024
 
 
 def realtime_instructions(packet: ContextPacket) -> str:
-    approved = json.dumps(packet.model_dump(mode="json"), ensure_ascii=False)
-    return f"""# Objective
+    approved = packet.approved_context_json()
+    instructions = f"""# Objective
 Complete only the approved objective in the context below.
 Choose how to open the call from the approved context; the application does not prescribe an opening.
 
@@ -41,6 +41,13 @@ Use end_call when the conversation is finished; the application coordinates the 
 # Approved context
 {approved}
 """
+    size_bytes = len(instructions.encode("utf-8"))
+    if size_bytes > REALTIME_INSTRUCTIONS_MAX_BYTES:
+        raise ValueError(
+            "Realtime instructions exceed "
+            f"{REALTIME_INSTRUCTIONS_MAX_BYTES} UTF-8 bytes (received {size_bytes})"
+        )
+    return instructions
 
 
 EXTRACTOR_INSTRUCTIONS = """Extract a conservative structured call result.

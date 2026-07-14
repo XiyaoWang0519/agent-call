@@ -22,6 +22,7 @@ from app.models import (
     StartPhoneCallOutput,
     VoiceEndCallRequest,
 )
+from app.openai_client import create_openai_client
 from app.openai_realtime import RealtimeBridge
 from app.policy import validate_context
 from app.settings import Settings
@@ -41,10 +42,8 @@ class CallService:
     ):
         self.settings = settings
         self.db = db
-        self.openai = openai or AsyncOpenAI(
-            api_key=Settings.reveal(settings.openai_api_key),
-            webhook_secret=Settings.reveal(settings.openai_webhook_secret),
-        )
+        self._owns_openai_client = openai is None
+        self.openai = openai if openai is not None else create_openai_client(settings)
         self.twilio = twilio or TwilioBridge(settings)
         self.realtime = RealtimeBridge(
             settings,
@@ -57,6 +56,7 @@ class CallService:
         self.finalizer = Finalizer(settings, db, self.openai)
         self._background: set[asyncio.Task[Any]] = set()
         self._owner_join_events: dict[str, asyncio.Event] = {}
+        self._opening_transition_locks: dict[str, asyncio.Lock] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._active_response_ids: dict[str, str | None] = {}
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
@@ -67,6 +67,9 @@ class CallService:
         self._background.add(task)
         task.add_done_callback(self._background.discard)
         return task
+
+    def _opening_transition_lock(self, call_id: str) -> asyncio.Lock:
+        return self._opening_transition_locks.setdefault(call_id, asyncio.Lock())
 
     async def _record_latency(
         self,
@@ -474,29 +477,30 @@ class CallService:
         completes, but ask the model for an opening turn immediately. The application supplies no
         response-specific script; the model chooses the opening from Poke's approved context.
         """
-        call = await self.db.get_call(call_id)
-        if call is None or CallState(call["state"]) in TERMINAL_STATES:
-            return
-        if not (
-            call["sideband_open"]
-            and call["callee_joined"]
-            and call["transcription_verified"]
-            and call["semantic_vad_verified"]
-        ):
-            return
-        if call.get("answer_handling") == "voicemail":
-            return
-        if not await self.db.set_flag_once(call_id, "opening_sent"):
-            return
+        async with self._opening_transition_lock(call_id):
+            call = await self.db.get_call(call_id)
+            if call is None or CallState(call["state"]) in TERMINAL_STATES:
+                return
+            if not (
+                call["sideband_open"]
+                and call["callee_joined"]
+                and call["transcription_verified"]
+                and call["semantic_vad_verified"]
+            ):
+                return
+            if call.get("answer_handling") == "voicemail":
+                return
+            if not await self.db.claim_opening_if_not_voicemail(call_id):
+                return
+
+            # Keep the atomic claim and its WebSocket write ordered against the voicemail
+            # cancel/write pair. The lock is per call and does not cover Twilio network I/O.
+            await self.realtime.create_opening(call_id)
 
         conference = call.get("conference_sid") or call.get("conference_name")
-        # Twilio auto-unmutes the agent leg at conference start; the explicit unmute is a
-        # race-safety net, so run it concurrently instead of letting its REST round-trip
-        # delay the opening turn.
-        await asyncio.gather(
-            self.realtime.create_opening(call_id),
-            self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid")),
-        )
+        # The explicit unmute is a race-safety net. Sending the opening first ensures its
+        # Twilio round-trip can never delay the model's response.create.
+        await self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))
 
     async def _unmute_agent(
         self, call_id: str, conference: str | None, agent_call_sid: str | None
@@ -513,30 +517,42 @@ class CallService:
     async def _activate(self, call_id: str) -> None:
         if not await self.db.cas_state(call_id, CallState.READY_TO_ACTIVATE, CallState.ACTIVATING):
             return
-        try:
-            updated = await self.realtime.enable_automatic_responses(call_id)
-        except Exception:
-            await self.terminate_call(call_id, "session_update_timeout")
+        call = await self.db.get_call(call_id)
+        if call is None:
             return
-        if not self.realtime.activation_update_confirmed(updated):
-            await self.terminate_call(call_id, "session_update_mismatch")
-            return
+        is_voicemail = call["answer_handling"] == "voicemail"
+        if not is_voicemail:
+            try:
+                updated = await self.realtime.enable_automatic_responses(call_id)
+            except Exception:
+                await self.terminate_call(call_id, "session_update_timeout")
+                return
+            if not self.realtime.activation_update_confirmed(updated):
+                await self.terminate_call(call_id, "session_update_mismatch")
+                return
         if not await self.db.cas_state(call_id, CallState.ACTIVATING, CallState.ACTIVE):
             return
-        call = await self.db.get_call(call_id)
-        if call["answer_handling"] == "voicemail":
+        if is_voicemail:
             conference = call.get("conference_sid") or call.get("conference_name")
-            tasks = [self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))]
-            if await self.db.set_flag_once(call_id, "voicemail_sent"):
-                # The opening turn starts on answer, before async AMD can classify the callee.
-                # If AMD then reports a machine, cancel the opening even when its
-                # response.created event has not arrived yet. WebSocket event ordering makes
-                # the following voicemail response.create run after the cancellation request.
-                if call.get("opening_sent"):
-                    response_id = self._active_response_ids.pop(call_id, None)
-                    await self.realtime.cancel_response(call_id, response_id)
-                tasks.append(self.realtime.create_voicemail(call_id))
-            await asyncio.gather(*tasks)
+            unmute = asyncio.create_task(
+                self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid")),
+                name=f"unmute:{call_id}:voicemail",
+            )
+            try:
+                async with self._opening_transition_lock(call_id):
+                    current = await self.db.get_call(call_id)
+                    if current is None:
+                        return
+                    if await self.db.set_flag_once(call_id, "voicemail_sent"):
+                        # If the opening claim won, its response.create completed under this
+                        # same lock. Otherwise AMD was persisted first and the atomic opening
+                        # claim cannot succeed after this voicemail write.
+                        if current.get("opening_sent"):
+                            response_id = self._active_response_ids.pop(call_id, None)
+                            await self.realtime.cancel_response(call_id, response_id)
+                        await self.realtime.create_voicemail(call_id)
+            finally:
+                await unmute
         else:
             await self._start_opening_on_answer(call_id)
 
@@ -967,6 +983,8 @@ class CallService:
         for task in list(self._background):
             task.cancel()
         await asyncio.gather(*self._background, return_exceptions=True)
+        if self._owns_openai_client:
+            await self.openai.close()
 
     async def _watchdog(self) -> None:
         while True:

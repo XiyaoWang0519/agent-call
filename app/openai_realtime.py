@@ -129,9 +129,10 @@ class RealtimeBridge:
     ) -> int:
         payload = self.build_accept_payload(packet)
         try:
-            raw = await self.client.realtime.calls.with_raw_response.accept(
-                openai_call_id, **payload.model_dump(exclude_none=True)
-            )
+            async with asyncio.timeout(self.settings.openai_http_timeout_seconds):
+                raw = await self.client.realtime.calls.with_raw_response.accept(
+                    openai_call_id, **payload.model_dump(exclude_none=True)
+                )
         except APIStatusError as exc:
             logger.error(
                 "OpenAI call accept response call_id=%s status=%s headers=%s body=%r",
@@ -256,7 +257,7 @@ class RealtimeBridge:
             "transcription": self._transcription_config(),
             "turn_detection": {
                 "type": "semantic_vad",
-                "eagerness": "auto",
+                "eagerness": self.settings.semantic_vad_eagerness,
                 "create_response": create_response,
                 "interrupt_response": interrupt_response,
             },
@@ -376,17 +377,20 @@ class RealtimeBridge:
         expected_delay = self.settings.input_transcription_delay
         return expected_delay is None or transcription.get("delay") == expected_delay
 
-    @staticmethod
-    def expected_initial_vad_echoed(event: dict[str, Any]) -> bool:
+    def expected_initial_vad_echoed(self, event: dict[str, Any]) -> bool:
         turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
         return (
             turn.get("type") == "semantic_vad"
-            and turn.get("eagerness") == "auto"
+            and turn.get("eagerness") == self.settings.semantic_vad_eagerness
             and turn.get("create_response") is False
             and turn.get("interrupt_response") is False
         )
 
-    @staticmethod
-    def activation_update_confirmed(event: dict[str, Any]) -> bool:
+    def activation_update_confirmed(self, event: dict[str, Any]) -> bool:
         turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
-        return turn.get("create_response") is True and turn.get("interrupt_response") is True
+        return (
+            turn.get("type") == "semantic_vad"
+            and turn.get("eagerness") == self.settings.semantic_vad_eagerness
+            and turn.get("create_response") is True
+            and turn.get("interrupt_response") is True
+        )

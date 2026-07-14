@@ -35,6 +35,15 @@ uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 Fill every required value in `.env.local`; the guarded copy command deliberately preserves a key previously saved by the OpenAI Platform picker. Generate `MCP_BEARER_TOKEN` and `DEBUG_API_TOKEN` with a password generator or `openssl rand -hex 32`. Never commit env files; `.gitignore` excludes them.
 
+Live-call control requests use `OPENAI_CONNECT_TIMEOUT_SECONDS` and
+`OPENAI_HTTP_TIMEOUT_SECONDS` (3 and 10 seconds by default) with no SDK retries; post-call
+extraction uses `OPENAI_EXTRACTION_TIMEOUT_SECONDS` and retains its single application-level
+retry. Twilio requests use the pooled, no-retry transport bounded by
+`TWILIO_HTTP_TIMEOUT_SECONDS`. `SEMANTIC_VAD_EAGERNESS=high` favors quicker turn completion; set
+it to `auto` to roll back to OpenAI's medium-eagerness behavior. Leave
+`OPENAI_KEEPALIVE_EXPIRY_SECONDS` unset unless production telemetry justifies an explicit pool
+expiry experiment.
+
 Run validation:
 
 ```bash

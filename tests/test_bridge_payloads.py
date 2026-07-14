@@ -188,7 +188,7 @@ async def test_sideband_receives_initial_update_echo_while_open_handler_waits(
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "auto",
+                        "eagerness": "high",
                         "create_response": False,
                         "interrupt_response": False,
                     },
@@ -251,7 +251,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
                 "input": {
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "auto",
+                        "eagerness": "high",
                         "create_response": True,
                         "interrupt_response": True,
                     }
@@ -274,7 +274,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
                         "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "auto",
+                            "eagerness": "high",
                             "create_response": True,
                             "interrupt_response": True,
                         },
@@ -308,7 +308,7 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "auto",
+                        "eagerness": "high",
                         "create_response": False,
                         "interrupt_response": False,
                     },
@@ -329,7 +329,7 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
                         "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "auto",
+                            "eagerness": "high",
                             "create_response": False,
                             "interrupt_response": False,
                         },
@@ -456,6 +456,7 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert agent["wait_url"] == ""
     assert agent["early_media"] is False
     assert agent["muted"] is False
+    assert agent["jitter_buffer_size"] == "small"
     assert agent["to"].startswith("sip:proj_test@sip.api.openai.com;transport=tls?")
     assert "X-Plan-Id=plan_1" in agent["to"]
     assert "X-Bridge-Call-Id=call_1" in agent["to"]
@@ -474,6 +475,7 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert callee["end_conference_on_exit"] is True
     assert callee["time_limit"] == settings.max_call_seconds
     assert callee["machine_detection"] == "DetectMessageEnd"
+    assert callee["jitter_buffer_size"] == "small"
     assert callee["amd_status_callback_method"] == "POST"
     assert "plan_id=plan_1" in callee["amd_status_callback"]
 
@@ -486,6 +488,7 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert owner["label"] == "owner"
     assert owner["end_conference_on_exit"] is False
     assert owner["timeout"] == 30
+    assert owner["jitter_buffer_size"] == "small"
 
     await bridge.unmute_participant("CF1", "CA" + "a" * 32)
     assert client.conferences("CF1").participants.updates == [

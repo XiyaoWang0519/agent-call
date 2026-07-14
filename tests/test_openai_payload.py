@@ -30,7 +30,7 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         "transcription": {"model": "gpt-4o-mini-transcribe"},
         "turn_detection": {
             "type": "semantic_vad",
-            "eagerness": "auto",
+            "eagerness": "high",
             "create_response": False,
             "interrupt_response": False,
         },
@@ -67,7 +67,7 @@ def test_session_created_echo_requires_transcription_and_full_initial_vad(settin
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "auto",
+                        "eagerness": "high",
                         "create_response": False,
                         "interrupt_response": False,
                     },
@@ -77,5 +77,55 @@ def test_session_created_echo_requires_transcription_and_full_initial_vad(settin
     }
     assert bridge.expected_transcription_echoed(event)
     assert bridge.expected_initial_vad_echoed(event)
-    event["session"]["audio"]["input"]["turn_detection"]["eagerness"] = "high"
+    event["session"]["audio"]["input"]["turn_detection"]["eagerness"] = "auto"
     assert not bridge.expected_initial_vad_echoed(event)
+
+
+def test_semantic_vad_auto_setting_is_available_for_rollback(settings, packet):
+    from app.settings import Settings
+
+    values = settings.model_dump()
+    values["semantic_vad_eagerness"] = "auto"
+    rollback_settings = Settings(**values)
+    bridge = RealtimeBridge(
+        rollback_settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+
+    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
+    turn = payload["audio"]["input"]["turn_detection"]
+    assert turn["eagerness"] == "auto"
+    assert bridge.expected_initial_vad_echoed(
+        {"session": {"audio": {"input": {"turn_detection": turn}}}}
+    )
+
+
+def test_activation_echo_must_preserve_configured_semantic_vad(settings):
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    event = {
+        "session": {
+            "audio": {
+                "input": {
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "eagerness": "high",
+                        "create_response": True,
+                        "interrupt_response": True,
+                    }
+                }
+            }
+        }
+    }
+
+    assert bridge.activation_update_confirmed(event)
+    event["session"]["audio"]["input"]["turn_detection"]["eagerness"] = "auto"
+    assert not bridge.activation_update_confirmed(event)

@@ -566,7 +566,101 @@ async def test_machine_waits_for_message_end_and_all_gates(service, packet):
     await service.db.update_call(call_id, callee_joined=1)
     await service._check_activation_gate(call_id)
     assert service._test_realtime.events == [
-        ("session.update", call_id),
+        ("voicemail", call_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_voicemail_activation_never_enables_automatic_responses(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
+
+    async def forbidden_update(_call_id: str):
+        raise AssertionError("voicemail must not enable automatic responses")
+
+    service._test_realtime.enable_automatic_responses = forbidden_update
+
+    await service.handle_amd(call_id, "machine_end_beep")
+
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.events == [("voicemail", call_id)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_amd_wins_before_opening_claim(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1)
+    claim_reached = asyncio.Event()
+    release_claim = asyncio.Event()
+    original_claim = service.db.claim_opening_if_not_voicemail
+
+    async def delayed_claim(candidate_call_id: str) -> bool:
+        claim_reached.set()
+        await release_claim.wait()
+        return await original_claim(candidate_call_id)
+
+    service.db.claim_opening_if_not_voicemail = delayed_claim
+    answered = asyncio.create_task(
+        service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    )
+    await asyncio.wait_for(claim_reached.wait(), timeout=1)
+
+    amd = asyncio.create_task(service.handle_amd(call_id, "machine_end_beep"))
+    for _ in range(100):
+        if (await service.db.get_call(call_id))["answer_handling"] == "voicemail":
+            break
+        await asyncio.sleep(0.001)
+    else:
+        pytest.fail("AMD classification was not persisted")
+    release_claim.set()
+    await asyncio.gather(answered, amd)
+
+    call = await service.db.get_call(call_id)
+    assert call["answer_handling"] == "voicemail"
+    assert call["opening_sent"] == 0
+    assert service._test_realtime.events == [("voicemail", call_id)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_opening_claim_wins_before_amd_cancel(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1)
+    opening_send_reached = asyncio.Event()
+    release_opening_send = asyncio.Event()
+    original_create_opening = service._test_realtime.create_opening
+
+    async def delayed_opening(candidate_call_id: str) -> None:
+        opening_send_reached.set()
+        await release_opening_send.wait()
+        await original_create_opening(candidate_call_id)
+
+    service._test_realtime.create_opening = delayed_opening
+    answered = asyncio.create_task(
+        service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    )
+    await asyncio.wait_for(opening_send_reached.wait(), timeout=1)
+    call = await service.db.get_call(call_id)
+    assert call["opening_sent"] == 1
+
+    amd = asyncio.create_task(service.handle_amd(call_id, "machine_end_beep"))
+    for _ in range(100):
+        if (await service.db.get_call(call_id))["answer_handling"] == "voicemail":
+            break
+        await asyncio.sleep(0.001)
+    else:
+        pytest.fail("AMD classification was not persisted")
+
+    await asyncio.sleep(0)
+    assert not amd.done()
+    assert service._test_realtime.events == []
+
+    release_opening_send.set()
+    await asyncio.gather(answered, amd)
+
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("cancel_response", call_id),
         ("voicemail", call_id),
     ]
 
@@ -583,7 +677,6 @@ async def test_late_voicemail_amd_cancels_opening_before_response_created(servic
 
     assert service._test_realtime.events == [
         ("opening", call_id),
-        ("session.update", call_id),
         ("cancel_response", call_id),
         ("voicemail", call_id),
     ]
@@ -603,7 +696,6 @@ async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
 
     assert service._test_realtime.events == [
         ("opening", call_id),
-        ("session.update", call_id),
         ("cancel_response", call_id),
         ("voicemail", call_id),
     ]

@@ -497,6 +497,17 @@ class Database:
             == 1
         )
 
+    async def claim_opening_if_not_voicemail(self, call_id: str) -> bool:
+        """Atomically claim the opening unless AMD has already classified voicemail."""
+        return (
+            await self.execute(
+                """UPDATE calls SET opening_sent=1, last_event_at=?
+                   WHERE call_id=? AND opening_sent=0 AND answer_handling IS NOT ?""",
+                (_iso_now(), call_id, "voicemail"),
+            )
+            == 1
+        )
+
     async def increment_tool_calls(
         self,
         call_id: str,
