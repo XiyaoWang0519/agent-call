@@ -45,9 +45,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.require_runtime_configuration()
         db = Database(settings.database_path)
         await db.initialize()
-        openai = create_openai_client(settings)
+        openai = None
         service: CallService | None = None
+        primary_error: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
         try:
+            openai = create_openai_client(settings)
             service = CallService(settings, db, openai=openai)
             holder["service"] = service
             app.state.call_service = service
@@ -59,15 +62,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await service.start_watchdog()
             async with mcp_http_app.lifespan(app):
                 yield
+        except BaseException as exc:
+            primary_error = exc
         finally:
-            try:
-                if service is not None:
-                    await service.stop()
-            finally:
+            cleanup_steps = []
+            if service is not None:
+                cleanup_steps.append(service.stop)
+            if openai is not None:
+                cleanup_steps.append(openai.close)
+            cleanup_steps.append(db.close)
+
+            for cleanup in cleanup_steps:
                 try:
-                    await openai.close()
-                finally:
-                    holder.clear()
+                    await cleanup()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            try:
+                holder.clear()
+            except BaseException as exc:  # pragma: no cover - dict.clear is defensive here
+                cleanup_errors.append(exc)
+
+        if primary_error is not None:
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "application lifespan failed and cleanup also failed",
+                    [primary_error, *cleanup_errors],
+                )
+            raise primary_error
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise BaseExceptionGroup("application lifespan cleanup failed", cleanup_errors)
 
     app = FastAPI(title="Poke Phone-Call Bridge", version="1.0.0", lifespan=lifespan)
     app.state.settings = settings

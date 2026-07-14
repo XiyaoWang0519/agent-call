@@ -189,68 +189,172 @@ def _decode_json_columns(row: dict[str, Any]) -> dict[str, Any]:
 class Database:
     def __init__(self, path: Path):
         self.path = path
+        self._lifecycle_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
+        self._writer: aiosqlite.Connection | None = None
+        self._reader: aiosqlite.Connection | None = None
         # Monotonic values are comparable only when this process-local clock ID matches.
         self._latency_clock_id = uuid4().hex
 
     async def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self.path) as conn:
-            await conn.executescript(SCHEMA)
-            cursor = await conn.execute("PRAGMA table_info(calls)")
+        async with self._lifecycle_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if (self._writer is None) != (self._reader is None):
+                raise RuntimeError("database connection state is inconsistent")
+            created_connections = self._writer is None
+            if created_connections:
+                writer: aiosqlite.Connection | None = None
+                reader: aiosqlite.Connection | None = None
+                try:
+                    writer = await self._connect(query_only=False)
+                    reader = await self._connect(query_only=True)
+                except BaseException:
+                    if reader is not None:
+                        await reader.close()
+                    if writer is not None:
+                        await writer.close()
+                    raise
+                self._writer = writer
+                self._reader = reader
+
+            try:
+                async with self._write_connection() as conn:
+                    await self._run_migrations(conn)
+            except BaseException:
+                if created_connections:
+                    await self._close_connections()
+                raise
+
+    async def _connect(self, *, query_only: bool) -> aiosqlite.Connection:
+        conn = await aiosqlite.connect(self.path)
+        try:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA foreign_keys=ON")
+            await conn.execute("PRAGMA busy_timeout=5000")
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=FULL")
+            if query_only:
+                await conn.execute("PRAGMA query_only=ON")
+            return conn
+        except BaseException:
+            await conn.close()
+            raise
+
+    async def _run_migrations(self, conn: aiosqlite.Connection) -> None:
+        await conn.executescript(SCHEMA)
+        async with conn.execute("PRAGMA table_info(calls)") as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
-            if "greeting_sent" in existing and "opening_sent" not in existing:
-                await conn.execute("ALTER TABLE calls RENAME COLUMN greeting_sent TO opening_sent")
-                existing.remove("greeting_sent")
-                existing.add("opening_sent")
-            await conn.execute(
-                "UPDATE calls SET state=? WHERE state=?",
-                (
-                    CallState.ACTIVE.value,
-                    "greeting_started",
-                ),
-            )
-            migrations = {
-                "openai_accept_status": "INTEGER",
-                "transcription_verified": "INTEGER NOT NULL DEFAULT 0",
-                "semantic_vad_verified": "INTEGER NOT NULL DEFAULT 0",
-                "tool_call_count": "INTEGER NOT NULL DEFAULT 0",
-                "tool_continuation_observed": "INTEGER NOT NULL DEFAULT 0",
-                "interruption_observed": "INTEGER NOT NULL DEFAULT 0",
-                "opening_sent": "INTEGER NOT NULL DEFAULT 0",
-            }
-            for name, definition in migrations.items():
-                if name not in existing:
-                    await conn.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
-            await conn.commit()
+        if "greeting_sent" in existing and "opening_sent" not in existing:
+            await conn.execute("ALTER TABLE calls RENAME COLUMN greeting_sent TO opening_sent")
+            existing.remove("greeting_sent")
+            existing.add("opening_sent")
+        await conn.execute(
+            "UPDATE calls SET state=? WHERE state=?",
+            (
+                CallState.ACTIVE.value,
+                "greeting_started",
+            ),
+        )
+        migrations = {
+            "openai_accept_status": "INTEGER",
+            "transcription_verified": "INTEGER NOT NULL DEFAULT 0",
+            "semantic_vad_verified": "INTEGER NOT NULL DEFAULT 0",
+            "tool_call_count": "INTEGER NOT NULL DEFAULT 0",
+            "tool_continuation_observed": "INTEGER NOT NULL DEFAULT 0",
+            "interruption_observed": "INTEGER NOT NULL DEFAULT 0",
+            "opening_sent": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, definition in migrations.items():
+            if name not in existing:
+                await conn.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
+        await conn.commit()
 
     @asynccontextmanager
-    async def connection(self):
-        conn = await aiosqlite.connect(self.path)
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA foreign_keys=ON")
-        await conn.execute("PRAGMA busy_timeout=5000")
-        try:
+    async def _write_connection(self):
+        async with self._write_lock:
+            conn = self._writer
+            if conn is None:
+                raise RuntimeError("database is not initialized")
+            try:
+                yield conn
+            except BaseException:
+                # aiosqlite queues work on a worker thread. Cancellation can arrive after an
+                # operation is queued but before it starts, when in_transaction is still false.
+                # Queue an unconditional rollback behind that work and keep the lock until the
+                # rollback finishes so the next writer never inherits the abandoned transaction.
+                await self._rollback_writer(conn)
+                raise
+            else:
+                # Do not let a missed commit poison the persistent writer for the
+                # next operation. Transactional methods commit explicitly.
+                if conn.in_transaction:
+                    await self._rollback_writer(conn)
+
+    @staticmethod
+    async def _rollback_writer(conn: aiosqlite.Connection) -> None:
+        rollback = asyncio.create_task(conn.rollback(), name="sqlite-writer-rollback")
+        interrupted = False
+        while not rollback.done():
+            try:
+                await asyncio.shield(rollback)
+            except asyncio.CancelledError:
+                # A repeated cancellation must still not release the writer lock ahead of the
+                # queued rollback. Re-raise it once the connection has been restored.
+                interrupted = True
+        rollback.result()
+        if interrupted:
+            raise asyncio.CancelledError
+
+    @asynccontextmanager
+    async def _read_connection(self):
+        async with self._read_lock:
+            conn = self._reader
+            if conn is None:
+                raise RuntimeError("database is not initialized")
             yield conn
-        finally:
-            await conn.close()
+
+    async def close(self) -> None:
+        """Close both persistent connections; safe to call more than once."""
+        async with self._lifecycle_lock:
+            await self._close_connections()
+
+    async def _close_connections(self) -> None:
+        async with self._write_lock, self._read_lock:
+            writer = self._writer
+            reader = self._reader
+            self._writer = None
+            self._reader = None
+
+            first_error: BaseException | None = None
+            for conn in (reader, writer):
+                if conn is None:
+                    continue
+                try:
+                    await conn.close()
+                except BaseException as exc:  # pragma: no cover - defensive cleanup
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
 
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
-        async with self._write_lock, self.connection() as conn:
-            cursor = await conn.execute(sql, tuple(params))
+        async with self._write_connection() as conn:
+            async with conn.execute(sql, tuple(params)) as cursor:
+                rowcount = cursor.rowcount
             await conn.commit()
-            return cursor.rowcount
+            return rowcount
 
     async def fetch_one(self, sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
-        async with self.connection() as conn:
-            cursor = await conn.execute(sql, tuple(params))
-            row = await cursor.fetchone()
+        async with self._read_connection() as conn:
+            async with conn.execute(sql, tuple(params)) as cursor:
+                row = await cursor.fetchone()
         return _decode_json_columns(dict(row)) if row else None
 
     async def fetch_all(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
-        async with self.connection() as conn:
-            cursor = await conn.execute(sql, tuple(params))
-            rows = await cursor.fetchall()
+        async with self._read_connection() as conn:
+            async with conn.execute(sql, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
         return [_decode_json_columns(dict(row)) for row in rows]
 
     async def create_plan(
@@ -280,7 +384,7 @@ class Database:
         confirmation_text: str,
     ) -> bool:
         now = _iso_now()
-        async with self._write_lock, self.connection() as conn:
+        async with self._write_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             cursor = await conn.execute(
                 "SELECT locked, locked_at FROM deployment_control WHERE singleton=1"
@@ -327,7 +431,7 @@ class Database:
         """
 
         placeholders = ",".join("?" for _ in TERMINAL_STATES)
-        async with self._write_lock, self.connection() as conn:
+        async with self._write_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             cursor = await conn.execute(
                 f"SELECT COUNT(*) FROM calls WHERE state NOT IN ({placeholders})",  # noqa: S608
@@ -421,7 +525,7 @@ class Database:
         ]
         if not rows:
             return
-        async with self._write_lock, self.connection() as conn:
+        async with self._write_connection() as conn:
             await conn.executemany(UPSERT_LATENCY_EVENT, rows)
             await conn.commit()
 
@@ -515,7 +619,7 @@ class Database:
         latency_mark: LatencyMark | None = None,
         event_key: str = "",
     ) -> None:
-        async with self._write_lock, self.connection() as conn:
+        async with self._write_connection() as conn:
             await conn.execute(
                 """UPDATE calls SET tool_call_count=tool_call_count+1, last_event_at=?
                    WHERE call_id=?""",
@@ -564,7 +668,7 @@ class Database:
         source_event_type: str,
         source_event_id: str,
     ) -> TranscriptTurn | None:
-        async with self._write_lock, self.connection() as conn:
+        async with self._write_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             cursor = await conn.execute(
                 "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM transcripts WHERE call_id=?",
@@ -617,7 +721,7 @@ class Database:
         transcript: list[TranscriptTurn],
     ) -> None:
         now = _iso_now()
-        async with self._write_lock, self.connection() as conn:
+        async with self._write_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             await conn.execute(
                 """INSERT INTO call_results(call_id, result_json, transcript_json, updated_at)

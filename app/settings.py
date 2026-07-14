@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     semantic_vad_eagerness: Literal["low", "medium", "high", "auto"] = "high"
     openai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
-    openai_keepalive_expiry_seconds: float | None = Field(default=None, ge=5, le=300)
+    openai_keepalive_expiry_seconds: float | None = Field(default=60.0, ge=5, le=300)
     openai_extraction_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     extractor_model: str = "gpt-5.4-nano-2026-03-17"
     database_url: str = "sqlite:///./poke_call.db"

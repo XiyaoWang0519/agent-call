@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 import pytest
 from pydantic import ValidationError
 
@@ -11,10 +14,137 @@ from app.policy import validate_context, validate_destination
 from app.settings import Settings
 
 
+async def _pragma_value(connection: aiosqlite.Connection, name: str):
+    cursor = await connection.execute(f"PRAGMA {name}")
+    row = await cursor.fetchone()
+    return row[0]
+
+
 @pytest.mark.asyncio
-async def test_initialize_migrates_legacy_opening_column_and_state(settings, packet):
+async def test_database_reuses_reader_and_writer_with_durable_pragmas(database):
+    writer = database._writer
+    reader = database._reader
+    assert writer is not None
+    assert reader is not None
+    assert writer is not reader
+
+    for connection in (writer, reader):
+        assert await _pragma_value(connection, "journal_mode") == "wal"
+        assert await _pragma_value(connection, "synchronous") == 2
+        assert await _pragma_value(connection, "foreign_keys") == 1
+        assert await _pragma_value(connection, "busy_timeout") == 5000
+    assert await _pragma_value(writer, "query_only") == 0
+    assert await _pragma_value(reader, "query_only") == 1
+
+    await database.execute("CREATE TABLE connection_reuse (value TEXT NOT NULL)")
+    await database.execute("INSERT INTO connection_reuse(value) VALUES (?)", ("visible",))
+    assert await database.fetch_one("SELECT value FROM connection_reuse") == {"value": "visible"}
+    assert database._writer is writer
+    assert database._reader is reader
+
+    # Re-running migrations is idempotent and does not churn live connections.
+    await database.initialize()
+    assert database._writer is writer
+    assert database._reader is reader
+
+
+@pytest.mark.asyncio
+async def test_database_close_is_idempotent_and_initialize_reopens(settings):
     db = Database(settings.database_path)
     await db.initialize()
+    first_writer = db._writer
+    first_reader = db._reader
+
+    await db.close()
+    await db.close()
+    assert db._writer is None
+    assert db._reader is None
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await db.fetch_one("SELECT 1")
+
+    await db.initialize()
+    try:
+        assert db._writer is not first_writer
+        assert db._reader is not first_reader
+        assert await db.fetch_one("SELECT 1 AS value") == {"value": 1}
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_writer_rolls_back_failed_operation(database):
+    await database.execute("CREATE TABLE unique_values (value TEXT PRIMARY KEY)")
+    await database.execute("INSERT INTO unique_values(value) VALUES (?)", ("first",))
+
+    with pytest.raises(aiosqlite.IntegrityError):
+        await database.execute("INSERT INTO unique_values(value) VALUES (?)", ("first",))
+
+    # The failed transaction cannot poison the next user of the shared writer.
+    await database.execute("INSERT INTO unique_values(value) VALUES (?)", ("second",))
+    rows = await database.fetch_all("SELECT value FROM unique_values ORDER BY value")
+    assert rows == [{"value": "first"}, {"value": "second"}]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_write_rolls_back_before_releasing_writer(database):
+    await database.execute("CREATE TABLE cancelled_writes (value TEXT NOT NULL)")
+    writer = database._writer
+    assert writer is not None
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def block_worker() -> int:
+        worker_started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test worker was not released")
+        return 1
+
+    await writer.create_function("block_worker", 0, block_worker)
+
+    async def occupy_worker() -> None:
+        async with writer.execute("SELECT block_worker()") as cursor:
+            await cursor.fetchone()
+
+    blocker = asyncio.create_task(occupy_worker())
+    write: asyncio.Task[int] | None = None
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        write = asyncio.create_task(
+            database.execute("INSERT INTO cancelled_writes(value) VALUES (?)", ("abandoned",))
+        )
+        for _ in range(100):
+            if writer._tx.qsize() >= 1:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("write was not queued behind the blocked SQLite worker")
+
+        write.cancel()
+        for _ in range(100):
+            if writer._tx.qsize() >= 2:
+                break
+            await asyncio.sleep(0)
+
+        # The cancelled caller stays inside the write lock until its rollback is queued behind
+        # the abandoned INSERT and has actually completed.
+        assert not write.done()
+    finally:
+        release_worker.set()
+        await asyncio.gather(blocker, return_exceptions=True)
+
+    assert write is not None
+    with pytest.raises(asyncio.CancelledError):
+        await write
+    assert await database.fetch_all("SELECT value FROM cancelled_writes") == []
+
+    await database.execute("INSERT INTO cancelled_writes(value) VALUES (?)", ("healthy",))
+    assert await database.fetch_all("SELECT value FROM cancelled_writes") == [{"value": "healthy"}]
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_legacy_opening_column_and_state(database, packet):
+    db = database
     expires_at = datetime.now(UTC) + timedelta(minutes=10)
     await db.create_plan(
         "plan_legacy",
@@ -46,9 +176,8 @@ async def test_initialize_migrates_legacy_opening_column_and_state(settings, pac
 
 
 @pytest.mark.asyncio
-async def test_latency_events_are_migration_safe_idempotent_and_correlated(settings, packet):
-    db = Database(settings.database_path)
-    await db.initialize()
+async def test_latency_events_are_migration_safe_idempotent_and_correlated(database, packet):
+    db = database
     expires_at = datetime.now(UTC) + timedelta(minutes=10)
     await db.create_plan(
         "plan_latency",
@@ -237,9 +366,8 @@ def test_confirmation_number_requires_evidence():
 
 
 @pytest.mark.asyncio
-async def test_transcript_order_and_source_id_are_idempotent(settings):
-    db = Database(settings.database_path)
-    await db.initialize()
+async def test_transcript_order_and_source_id_are_idempotent(database):
+    db = database
     # Minimal rows for the transcript FK.
     await db.create_plan(
         "plan_db",
@@ -283,9 +411,8 @@ async def test_transcript_order_and_source_id_are_idempotent(settings):
 
 
 @pytest.mark.asyncio
-async def test_deployment_lock_atomically_blocks_new_calls(settings):
-    db = Database(settings.database_path)
-    await db.initialize()
+async def test_deployment_lock_atomically_blocks_new_calls(database):
+    db = database
     await db.create_plan(
         "plan_deploy",
         {},

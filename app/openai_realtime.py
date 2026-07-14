@@ -21,6 +21,20 @@ OpenHandler = Callable[[str], Awaitable[None]]
 FatalHandler = Callable[[str, str], Awaitable[None]]
 SendHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 
+# Realtime events are normally consumed as quickly as they arrive. A bounded queue protects a
+# call from unbounded memory growth if application handling stalls while still leaving ample room
+# for short bursts of audio/transcript events.
+REALTIME_EVENT_QUEUE_MAXSIZE = 512
+REALTIME_MEDIA_DRAIN_SECONDS = 1.5
+REALTIME_CLOSE_TIMEOUT_SECONDS = 2.5
+REALTIME_TASK_DRAIN_TIMEOUT_SECONDS = 2.0
+REALTIME_TASK_CANCEL_TIMEOUT_SECONDS = 1.0
+_EVENT_QUEUE_CLOSED = object()
+
+
+class RealtimeEventQueueOverflow(RuntimeError):
+    """Raised when application event handling cannot keep up with the sideband stream."""
+
 
 @dataclass(slots=True)
 class RealtimeRuntime:
@@ -31,7 +45,14 @@ class RealtimeRuntime:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     update_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     update_waiter: asyncio.Future[dict[str, Any]] | None = None
+    event_queue: asyncio.Queue[Any] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=REALTIME_EVENT_QUEUE_MAXSIZE)
+    )
+    open_task: asyncio.Task[None] | None = None
+    receiver_task: asyncio.Task[None] | None = None
+    dispatcher_task: asyncio.Task[None] | None = None
     closing: bool = False
+    stop_after_current: bool = False
 
 
 class RealtimeBridge:
@@ -160,6 +181,8 @@ class RealtimeBridge:
     async def _run(self, runtime: RealtimeRuntime) -> None:
         url = f"wss://api.openai.com/v1/realtime?call_id={runtime.openai_call_id}"
         receiver: asyncio.Task[None] | None = None
+        dispatcher: asyncio.Task[None] | None = None
+        open_task: asyncio.Task[None] | None = None
         try:
             async with websockets.connect(
                 url,
@@ -170,6 +193,9 @@ class RealtimeBridge:
                 close_timeout=2,
             ) as websocket:
                 runtime.websocket = websocket
+                # A runtime is single-use today, but resetting here makes the lifecycle explicit
+                # and prevents stale queued events if that ever changes.
+                runtime.event_queue = asyncio.Queue(maxsize=REALTIME_EVENT_QUEUE_MAXSIZE)
                 # The SIP session already exists by the time this sideband attaches, so its
                 # session.created event may not be replayed. Start receiving before on_open so
                 # that the readiness handshake can send session.update and await session.updated.
@@ -177,8 +203,41 @@ class RealtimeBridge:
                     self._receive_events(runtime, websocket),
                     name=f"sideband-receiver:{runtime.call_id}",
                 )
-                await self.on_open(runtime.call_id)
-                await receiver
+                dispatcher = asyncio.create_task(
+                    self._dispatch_events(runtime),
+                    name=f"sideband-dispatcher:{runtime.call_id}",
+                )
+                runtime.receiver_task = receiver
+                runtime.dispatcher_task = dispatcher
+
+                # Supervise on_open as well: it may be awaiting the session.updated readiness
+                # echo, while either event task may fail independently.
+                open_task = asyncio.create_task(
+                    self.on_open(runtime.call_id),
+                    name=f"sideband-open:{runtime.call_id}",
+                )
+                runtime.open_task = open_task
+                done, _ = await asyncio.wait(
+                    {open_task, receiver, dispatcher},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if open_task not in done:
+                    # on_open may intentionally terminate the call. Its teardown closes the
+                    # websocket from this child task; let that child finish instead of treating
+                    # the resulting receiver close as a readiness failure and canceling it.
+                    if runtime.closing:
+                        await open_task
+                        if runtime.stop_after_current:
+                            return
+                        await self._supervise_event_tasks(receiver, dispatcher)
+                        return
+                    failed = receiver if receiver in done else dispatcher
+                    await failed
+                    raise RuntimeError("Realtime sideband closed before readiness completed")
+                await open_task
+                if runtime.stop_after_current:
+                    return
+                await self._supervise_event_tasks(receiver, dispatcher)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -186,10 +245,15 @@ class RealtimeBridge:
                 logger.exception("Realtime sideband failed for %s", runtime.call_id)
                 await self.on_fatal(runtime.call_id, f"sideband_error:{type(exc).__name__}")
         finally:
-            if receiver is not None and not receiver.done():
-                receiver.cancel()
-                await asyncio.gather(receiver, return_exceptions=True)
+            tasks = [task for task in (open_task, receiver, dispatcher) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             runtime.websocket = None
+            if runtime.closing and self._runtime.get(runtime.call_id) is runtime:
+                self._runtime.pop(runtime.call_id, None)
 
     async def _receive_events(self, runtime: RealtimeRuntime, websocket: Any) -> None:
         async for message in websocket:
@@ -197,7 +261,47 @@ class RealtimeBridge:
             if event.get("type") == "session.updated" and runtime.update_waiter:
                 if not runtime.update_waiter.done():
                     runtime.update_waiter.set_result(event)
-            await self.on_event(runtime.call_id, event)
+            try:
+                runtime.event_queue.put_nowait(event)
+            except asyncio.QueueFull as exc:
+                raise RealtimeEventQueueOverflow(
+                    f"Realtime event queue exceeded {REALTIME_EVENT_QUEUE_MAXSIZE} events"
+                ) from exc
+
+        # A normal websocket close drains events already accepted by the reader before stopping
+        # the dispatcher. This control marker is not an incoming event, so waiting for capacity is
+        # safe and must not be treated as an overflow.
+        await runtime.event_queue.put(_EVENT_QUEUE_CLOSED)
+
+    async def _dispatch_events(self, runtime: RealtimeRuntime) -> None:
+        while True:
+            event = await runtime.event_queue.get()
+            try:
+                if event is _EVENT_QUEUE_CLOSED:
+                    return
+                await self.on_event(runtime.call_id, event)
+                if runtime.stop_after_current:
+                    return
+            finally:
+                runtime.event_queue.task_done()
+
+    @staticmethod
+    async def _supervise_event_tasks(
+        receiver: asyncio.Task[None], dispatcher: asyncio.Task[None]
+    ) -> None:
+        done, _ = await asyncio.wait(
+            {receiver, dispatcher},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if dispatcher in done:
+            # A dispatcher failure must immediately stop the reader. A successful dispatcher can
+            # only consume its close marker after the reader has reached a clean websocket close.
+            await dispatcher
+            if not receiver.done():
+                raise RuntimeError("Realtime dispatcher stopped before the receiver")
+
+        await receiver
+        await dispatcher
 
     async def send(self, call_id: str, event: dict[str, Any]) -> None:
         runtime = self._runtime.get(call_id)
@@ -360,14 +464,61 @@ class RealtimeBridge:
         if runtime is None:
             return
         runtime.closing = True
-        await asyncio.sleep(1.5)
-        if runtime.websocket is not None:
-            await runtime.websocket.close()
+        await asyncio.sleep(REALTIME_MEDIA_DRAIN_SECONDS)
         current = asyncio.current_task()
-        if runtime.task and runtime.task is not current and not runtime.task.done():
-            runtime.task.cancel()
-            await asyncio.gather(runtime.task, return_exceptions=True)
-        self._runtime.pop(call_id, None)
+        runtime_tasks = {
+            task
+            for task in (
+                runtime.task,
+                runtime.open_task,
+                runtime.receiver_task,
+                runtime.dispatcher_task,
+            )
+            if task is not None
+        }
+        close_error: BaseException | None = None
+        if runtime.websocket is not None:
+            try:
+                await asyncio.wait_for(
+                    runtime.websocket.close(), timeout=REALTIME_CLOSE_TIMEOUT_SECONDS
+                )
+            except TimeoutError as exc:
+                close_error = exc
+                logger.warning("timed out closing Realtime websocket call_id=%s", call_id)
+            except Exception as exc:
+                close_error = exc
+                logger.warning(
+                    "failed to close Realtime websocket call_id=%s", call_id, exc_info=True
+                )
+
+        if current in runtime_tasks:
+            # The supervisor owns child cancellation. Awaiting or canceling it from one of its
+            # own children creates a parent/child cancellation cycle; normal websocket close will
+            # instead let the reader and FIFO dispatcher finish under _run's supervision.
+            if close_error is not None:
+                # The current callback may still need to persist terminal state and schedule its
+                # finalizer after drain_and_close returns. Let it finish, then have on_open/_run or
+                # the dispatcher stop at the callback boundary so the supervisor can clean up.
+                runtime.stop_after_current = True
+            return
+
+        task = runtime.task
+        if task is not None and not task.done():
+            done, _ = await asyncio.wait({task}, timeout=REALTIME_TASK_DRAIN_TIMEOUT_SECONDS)
+            if not done:
+                task.cancel()
+                done, _ = await asyncio.wait({task}, timeout=REALTIME_TASK_CANCEL_TIMEOUT_SECONDS)
+                if not done:
+                    # asyncio cannot forcibly destroy a cancellation-resistant task. Keep the
+                    # runtime registered so a later teardown can retry rather than hiding a leak.
+                    logger.error(
+                        "Realtime sideband did not stop after cancellation call_id=%s", call_id
+                    )
+                    return
+            await asyncio.gather(task, return_exceptions=True)
+
+        if self._runtime.get(call_id) is runtime:
+            self._runtime.pop(call_id, None)
 
     def expected_transcription_echoed(self, event: dict[str, Any]) -> bool:
         session = event.get("session", {})

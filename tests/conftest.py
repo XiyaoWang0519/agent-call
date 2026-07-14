@@ -72,6 +72,16 @@ def packet() -> ContextPacket:
     )
 
 
+@pytest.fixture
+async def database(settings: Settings):
+    db = Database(settings.database_path)
+    await db.initialize()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
 class FakeTwilio:
     def __init__(self):
         self.completed: list[str | None] = []
@@ -297,7 +307,10 @@ async def service(settings: Settings):
     svc._test_realtime = realtime
     svc._test_finalizer = finalizer
     yield svc
-    await svc.stop()
+    try:
+        await svc.stop()
+    finally:
+        await db.close()
 
 
 async def wait_background() -> None:

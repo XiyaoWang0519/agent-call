@@ -40,9 +40,9 @@ Live-call control requests use `OPENAI_CONNECT_TIMEOUT_SECONDS` and
 extraction uses `OPENAI_EXTRACTION_TIMEOUT_SECONDS` and retains its single application-level
 retry. Twilio requests use the pooled, no-retry transport bounded by
 `TWILIO_HTTP_TIMEOUT_SECONDS`. `SEMANTIC_VAD_EAGERNESS=high` favors quicker turn completion; set
-it to `auto` to roll back to OpenAI's medium-eagerness behavior. Leave
-`OPENAI_KEEPALIVE_EXPIRY_SECONDS` unset unless production telemetry justifies an explicit pool
-expiry experiment.
+it to `auto` to roll back to OpenAI's medium-eagerness behavior.
+`OPENAI_KEEPALIVE_EXPIRY_SECONDS=60` keeps the control-plane TLS connection reusable between
+sporadic calls; set it only to a bounded 5-300 second value.
 
 Run validation:
 

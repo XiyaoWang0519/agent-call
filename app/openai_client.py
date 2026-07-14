@@ -10,8 +10,8 @@ def create_openai_client(settings: Settings) -> AsyncOpenAI:
     """Build the shared OpenAI client with bounded control-plane requests.
 
     The SDK owns and closes a custom HTTPX client passed through ``http_client``.
-    Keep the SDK's normal connection-pool policy unless an explicit keepalive
-    expiry is configured for a measured deployment experiment.
+    Use the configured keepalive expiry (60 seconds by default) so sporadic calls
+    can reuse a measured-warm TLS connection. ``None`` retains the SDK pool policy.
     """
     timeout = httpx.Timeout(
         settings.openai_http_timeout_seconds,
