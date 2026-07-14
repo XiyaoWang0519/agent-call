@@ -57,6 +57,7 @@ class CallService:
         self._background: set[asyncio.Task[Any]] = set()
         self._owner_join_events: dict[str, asyncio.Event] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
+        self._active_response_ids: dict[str, str | None] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
 
     def _spawn(self, coroutine, *, name: str) -> asyncio.Task[Any]:
@@ -404,6 +405,12 @@ class CallService:
             conference = call.get("conference_sid") or call.get("conference_name")
             tasks = [self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))]
             if await self.db.set_flag_once(call_id, "voicemail_sent"):
+                # The opening turn starts on answer, before async AMD can classify the callee.
+                # If AMD then reports a machine, cancel the still-active opening so the
+                # voicemail response.create is not rejected for an already-active response.
+                if call_id in self._active_response_ids:
+                    response_id = self._active_response_ids.pop(call_id)
+                    await self.realtime.cancel_response(call_id, response_id)
                 tasks.append(self.realtime.create_voicemail(call_id))
             await asyncio.gather(*tasks)
         else:
@@ -447,16 +454,18 @@ class CallService:
             call = await self.db.get_call(call_id)
             if call and call.get("tool_call_count", 0) > 0:
                 await self.db.update_call(call_id, tool_continuation_observed=1)
+            response = event.get("response") or {}
+            response_id = response.get("id") or event.get("response_id")
+            self._active_response_ids[call_id] = response_id
             pending = self._voice_end_pending.get(call_id)
-            if pending and pending[1] is None:
-                response = event.get("response") or {}
-                response_id = response.get("id") or event.get("response_id")
-                if response_id:
-                    self._voice_end_pending[call_id] = (pending[0], response_id)
+            if pending and pending[1] is None and response_id:
+                self._voice_end_pending[call_id] = (pending[0], response_id)
         elif event_type in {"response.done", "response.audio.done"}:
             call = await self.db.get_call(call_id)
             response = event.get("response") or {}
             status = response.get("status")
+            if event_type == "response.done":
+                self._active_response_ids.pop(call_id, None)
             if status in {"cancelled", "canceled"}:
                 await self.db.update_call(call_id, interruption_observed=1)
             elif status == "failed":
@@ -468,7 +477,9 @@ class CallService:
                 )
             if event_type == "response.done":
                 await self._handle_voice_end_response_done(call_id, event)
-            if call and call.get("voicemail_sent"):
+            # A cancelled response.done here is the opening turn we cancelled when AMD
+            # reported voicemail; the voicemail response itself is still in flight.
+            if call and call.get("voicemail_sent") and status not in {"cancelled", "canceled"}:
                 self._spawn(
                     self.terminate_call(call_id, "voicemail_left"),
                     name=f"terminate:{call_id}:voicemail",
@@ -479,6 +490,11 @@ class CallService:
                 name=f"terminate:{call_id}:openai-terminal",
             )
         elif event_type == "error":
+            error = event.get("error") or {}
+            if error.get("code") == "response_cancel_not_active":
+                # Benign race: the response we tried to cancel finished on its own.
+                logger.info("stale response.cancel ignored call_id=%s event=%s", call_id, event)
+                return
             logger.error("realtime error event call_id=%s event=%s", call_id, event)
             self._spawn(
                 self.terminate_call(call_id, "openai_fatal_error"),
@@ -666,6 +682,7 @@ class CallService:
         if not await self.db.set_flag_once(call_id, "termination_claimed"):
             return False
         self._voice_end_pending.pop(call_id, None)
+        self._active_response_ids.pop(call_id, None)
         await self.db.update_call(
             call_id, state=CallState.TERMINATING.value, termination_reason=reason
         )

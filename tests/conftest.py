@@ -165,6 +165,9 @@ class FakeRealtime:
     async def create_opening(self, call_id: str) -> None:
         self.events.append(("opening", call_id))
 
+    async def cancel_response(self, call_id: str, response_id: str | None = None) -> None:
+        self.events.append(("cancel_response", call_id))
+
     async def create_voicemail(self, call_id: str) -> None:
         self.events.append(("voicemail", call_id))
 

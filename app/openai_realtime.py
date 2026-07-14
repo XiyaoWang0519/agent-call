@@ -278,6 +278,12 @@ class RealtimeBridge:
             },
         )
 
+    async def cancel_response(self, call_id: str, response_id: str | None = None) -> None:
+        event: dict[str, Any] = {"type": "response.cancel"}
+        if response_id:
+            event["response_id"] = response_id
+        await self.send(call_id, event)
+
     async def create_voicemail(self, call_id: str) -> None:
         await self.send(
             call_id,

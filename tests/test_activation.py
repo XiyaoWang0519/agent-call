@@ -411,6 +411,59 @@ async def test_machine_waits_for_message_end_and_all_gates(service, packet):
 
 
 @pytest.mark.asyncio
+async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    await service.handle_realtime_event(
+        call_id, {"type": "response.created", "response": {"id": "resp_opening"}}
+    )
+    await service.handle_amd(call_id, "machine_end_beep")
+
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("session.update", call_id),
+        ("cancel_response", call_id),
+        ("voicemail", call_id),
+    ]
+
+    # The cancelled opening's response.done must not count as the voicemail finishing.
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.done", "response": {"id": "resp_opening", "status": "cancelled"}},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.done", "response": {"id": "resp_vm", "status": "completed"}},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.COMPLETED.value
+    assert call["termination_reason"] == "voicemail_left"
+
+
+@pytest.mark.asyncio
+async def test_stale_response_cancel_error_is_not_fatal(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
+    await service.handle_amd(call_id, "human")
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "error", "error": {"code": "response_cancel_not_active"}},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+
+
+@pytest.mark.asyncio
 async def test_fax_terminates(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_amd(call_id, "fax")
