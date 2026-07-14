@@ -36,6 +36,7 @@ async def test_callee_is_not_dialed_until_accept_and_sideband_open(service, pack
 
     await service.handle_sideband_open(started.call_id)
     assert service._test_twilio.callee_creates == 1
+    assert service._test_realtime.initial_updates == [started.call_id]
 
 
 @pytest.mark.asyncio
@@ -52,27 +53,25 @@ async def test_unmapped_incoming_sip_call_is_explicitly_rejected(service):
 
 
 @pytest.mark.asyncio
-async def test_session_created_config_mismatch_terminates_before_activation(service, packet):
+async def test_initial_session_update_mismatch_terminates_before_dialing(service, packet):
     call_id = await seed_call(service.db, packet)
-    await service.handle_realtime_event(
-        call_id,
-        {
-            "type": "session.created",
-            "event_id": "evt_session_bad",
-            "transcription_ok": False,
-            "vad_ok": True,
-        },
+    await service.db.update_call(
+        call_id, transcription_verified=0, semantic_vad_verified=0, callee_dialed=0
     )
-    await wait_background()
+    service._test_realtime.initial_update_event["session"]["audio"]["input"]["transcription"][
+        "model"
+    ] = "unexpected-model"
+    await service.handle_sideband_open(call_id)
     call = await service.db.get_call(call_id)
     assert call["transcription_verified"] == 0
     assert call["semantic_vad_verified"] == 1
     assert call["state"] == CallState.FAILED.value
     assert call["termination_reason"] == "transcription_config_mismatch"
+    assert service._test_twilio.callee_creates == 0
 
 
 @pytest.mark.asyncio
-async def test_telephony_gates_wait_for_verified_session_created(service, packet):
+async def test_missing_session_created_activates_from_explicit_session_update(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.db.update_call(
         call_id,
@@ -85,36 +84,93 @@ async def test_telephony_gates_wait_for_verified_session_created(service, packet
     assert (await service.db.get_call(call_id))["state"] == CallState.PREWARMING.value
     assert service._test_realtime.events == []
 
-    await service.handle_realtime_event(
-        call_id,
-        {
-            "type": "session.created",
-            "event_id": "evt_session_good",
-            "transcription_ok": True,
-            "vad_ok": True,
-        },
-    )
-    assert (await service.db.get_call(call_id))["state"] == CallState.GREETING_STARTED.value
+    await service.handle_sideband_open(call_id)
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.initial_updates == [call_id]
     assert service._test_realtime.events == [
         ("session.update", call_id),
-        ("greeting", call_id),
+        ("opening", call_id),
     ]
 
 
 @pytest.mark.asyncio
-async def test_greeting_unmutes_agent_before_speech(service, packet):
+async def test_opening_unmutes_agent_before_speech(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
     await service.handle_amd(call_id, "human")
     assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
     assert service._test_realtime.events == [
         ("session.update", call_id),
-        ("greeting", call_id),
+        ("opening", call_id),
     ]
 
 
 @pytest.mark.asyncio
-async def test_greeting_exactly_once_after_confirmed_session_update(service, packet):
+async def test_callee_join_starts_opening_before_amd_completes(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+
+    await service.handle_conference_event(
+        call_id,
+        {
+            "StatusCallbackEvent": "participant-join",
+            "ParticipantLabel": "callee",
+            "CallSid": "CA" + "b" * 32,
+        },
+    )
+
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.PREWARMING.value
+    assert call["amd_result"] is None
+    assert call["opening_sent"] == 1
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    await service.handle_amd(call_id, "human")
+
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("session.update", call_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_callee_answered_status_starts_opening_before_conference_join(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+
+    call = await service.db.get_call(call_id)
+    assert call["callee_joined"] == 1
+    assert call["answered_at"] is not None
+    assert call["opening_sent"] == 1
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    await service.handle_conference_event(
+        call_id,
+        {
+            "StatusCallbackEvent": "participant-join",
+            "ParticipantLabel": "callee",
+            "CallSid": "CA" + "b" * 32,
+        },
+    )
+    await service.handle_amd(call_id, "human")
+
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+    assert call["opening_sent"] == 1
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("session.update", call_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_opening_exactly_once_after_confirmed_session_update(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_conference_event(
@@ -137,12 +193,12 @@ async def test_greeting_exactly_once_after_confirmed_session_update(service, pac
     )
 
     assert service._test_realtime.events == [
+        ("opening", call_id),
         ("session.update", call_id),
-        ("greeting", call_id),
     ]
     call = await service.db.get_call(call_id)
-    assert call["state"] == CallState.GREETING_STARTED.value
-    assert call["greeting_sent"] == 1
+    assert call["state"] == CallState.ACTIVE.value
+    assert call["opening_sent"] == 1
 
 
 @pytest.mark.asyncio
@@ -153,7 +209,7 @@ async def test_conference_start_can_satisfy_callee_ready_gate(service, packet):
     await service.handle_conference_event(call_id, {"StatusCallbackEvent": "conference-start"})
     call = await service.db.get_call(call_id)
     assert call["callee_joined"] == 1
-    assert call["state"] == CallState.GREETING_STARTED.value
+    assert call["state"] == CallState.ACTIVE.value
 
 
 @pytest.mark.asyncio
@@ -165,7 +221,7 @@ async def test_session_update_must_echo_both_flags(service, packet):
     await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
     await service.handle_amd(call_id, "human")
     assert (await service.db.get_call(call_id))["state"] == CallState.FAILED.value
-    assert not [event for event in service._test_realtime.events if event[0] == "greeting"]
+    assert not [event for event in service._test_realtime.events if event[0] == "opening"]
 
 
 @pytest.mark.asyncio
@@ -194,7 +250,7 @@ async def test_caller_speech_uses_auto_response_without_manual_create(service, p
 
 @pytest.mark.asyncio
 async def test_tool_output_is_followed_by_observed_continuation(service, packet):
-    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await service.handle_realtime_event(
         call_id,
         {
@@ -218,7 +274,7 @@ async def test_tool_output_is_followed_by_observed_continuation(service, packet)
 
 @pytest.mark.asyncio
 async def test_voice_model_ends_call_only_after_its_completed_response(service, packet):
-    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await service._handle_tool_call(
         call_id,
         {
@@ -228,7 +284,7 @@ async def test_voice_model_ends_call_only_after_its_completed_response(service, 
             "arguments": '{"reason":"objective_completed"}',
         },
     )
-    assert (await service.db.get_call(call_id))["state"] == CallState.GREETING_STARTED.value
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
     assert service._test_realtime.tool_result_continuations[-1] is True
 
     await service.handle_realtime_event(
@@ -238,7 +294,7 @@ async def test_voice_model_ends_call_only_after_its_completed_response(service, 
             "response": {"id": "resp_function", "status": "completed"},
         },
     )
-    assert (await service.db.get_call(call_id))["state"] == CallState.GREETING_STARTED.value
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
     await service.handle_realtime_event(
         call_id,
         {
@@ -265,7 +321,7 @@ async def test_voice_model_ends_call_only_after_its_completed_response(service, 
 
 @pytest.mark.asyncio
 async def test_interrupted_voice_closing_does_not_end_call(service, packet):
-    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await service._handle_tool_call(
         call_id,
         {
@@ -292,14 +348,14 @@ async def test_interrupted_voice_closing_does_not_end_call(service, packet):
     await wait_background()
 
     call = await service.db.get_call(call_id)
-    assert call["state"] == CallState.GREETING_STARTED.value
+    assert call["state"] == CallState.ACTIVE.value
     assert call["interruption_observed"] == 1
     assert service._test_realtime.hangups == []
 
 
 @pytest.mark.asyncio
 async def test_transfer_tool_returns_output_before_removing_ai(service, packet):
-    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._owner_join_events.setdefault(call_id, __import__("asyncio").Event()).set()
     order: list[str] = []
     original_send = service._test_realtime.send_tool_result
@@ -334,7 +390,7 @@ async def test_unknown_amd_assumes_human_and_never_hangs_up(service, packet, ans
     await service.handle_amd(call_id, answered_by)
     call = await service.db.get_call(call_id)
     assert call["answer_handling"] == "assumed_human"
-    assert call["state"] == CallState.GREETING_STARTED.value
+    assert call["state"] == CallState.ACTIVE.value
     assert service._test_realtime.hangups == []
 
 
@@ -355,6 +411,77 @@ async def test_machine_waits_for_message_end_and_all_gates(service, packet):
 
 
 @pytest.mark.asyncio
+async def test_late_voicemail_amd_cancels_opening_before_response_created(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    # AMD can classify the callee before OpenAI acknowledges the opening response.create.
+    await service.handle_amd(call_id, "machine_end_beep")
+
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("session.update", call_id),
+        ("cancel_response", call_id),
+        ("voicemail", call_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    await service.handle_realtime_event(
+        call_id, {"type": "response.created", "response": {"id": "resp_opening"}}
+    )
+    await service.handle_amd(call_id, "machine_end_beep")
+
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("session.update", call_id),
+        ("cancel_response", call_id),
+        ("voicemail", call_id),
+    ]
+
+    # The cancelled opening's response.done must not count as the voicemail finishing.
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.done", "response": {"id": "resp_opening", "status": "cancelled"}},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.done", "response": {"id": "resp_vm", "status": "completed"}},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.COMPLETED.value
+    assert call["termination_reason"] == "voicemail_left"
+
+
+@pytest.mark.asyncio
+async def test_stale_response_cancel_error_is_not_fatal(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
+    await service.handle_amd(call_id, "human")
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "error", "error": {"code": "response_cancel_not_active"}},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+
+
+@pytest.mark.asyncio
 async def test_fax_terminates(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_amd(call_id, "fax")
@@ -372,5 +499,5 @@ async def test_conflicting_duplicate_amd_cannot_override_first_result(service, p
     call = await service.db.get_call(call_id)
     assert call["answered_by"] == "human"
     assert call["answer_handling"] == "human"
-    assert call["state"] == CallState.GREETING_STARTED.value
+    assert call["state"] == CallState.ACTIVE.value
     assert service._test_realtime.hangups == []

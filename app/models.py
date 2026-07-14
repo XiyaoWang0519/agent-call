@@ -19,7 +19,6 @@ class CallState(StrEnum):
     READY_TO_ACTIVATE = "ready_to_activate"
     ACTIVATING = "activating"
     ACTIVE = "active"
-    GREETING_STARTED = "greeting_started"
     TERMINATING = "terminating"
     COMPLETED = "completed"
     FAILED = "failed"
