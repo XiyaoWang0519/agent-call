@@ -36,7 +36,7 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         },
     }
     assert payload["audio"]["output"] == {
-        "voice": "marin",
+        "voice": "echo",
         "speed": 1.0,
     }
     assert "format" not in payload["audio"]["input"]
