@@ -27,7 +27,6 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     assert payload["parallel_tool_calls"] is False
     assert payload["tool_choice"] == "auto"
     assert payload["audio"]["input"] == {
-        "format": {"type": "audio/pcmu"},
         "transcription": {"model": "gpt-4o-mini-transcribe"},
         "turn_detection": {
             "type": "semantic_vad",
@@ -37,10 +36,11 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         },
     }
     assert payload["audio"]["output"] == {
-        "format": {"type": "audio/pcmu"},
         "voice": "marin",
         "speed": 1.0,
     }
+    assert "format" not in payload["audio"]["input"]
+    assert "format" not in payload["audio"]["output"]
     assert [tool["name"] for tool in payload["tools"]] == [
         "transfer_to_owner",
         "record_call_outcome",

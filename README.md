@@ -118,10 +118,11 @@ The implementation follows the current [OpenAI Realtime SIP guide](https://devel
 
 Live-schema deviations from the original contract are intentional:
 
-- GA Realtime audio formats are objects such as `{"type":"audio/pcmu"}`, not bare strings.
+- GA Realtime audio formats are objects such as `{"type":"audio/pcmu"}` when used, but SIP accept/session.update payloads must omit `audio.*.format`. OpenAI negotiates G.711 with the carrier; forcing a format has been observed to clobber PCMU into PCM and leave the callee with silence or static while WebSocket transcripts still advance.
 - The current Conference Participants API has no `async_amd` parameter. AMD on Participants is asynchronous by design; the installed SDK uses `machine_detection="DetectMessageEnd"` plus `amd_status_callback` and `amd_status_callback_method`.
 - OpenAI call accept is invoked through the installed typed SDK; hangup has no JSON body. REFER's live request field is `target_uri`, but v1 transfer deliberately does not use REFER.
 - The installed transcription schema permits `INPUT_TRANSCRIPTION_DELAY` only for `gpt-realtime-whisper`, with `minimal|low|medium|high|xhigh` values.
+- The OpenAI SIP agent participant is created with `early_media=false` and is explicitly unmuted before the greeting, because Twilio mutes legs that join with `start_conference_on_enter=false` until the conference starts.
 
 ## Result semantics
 
