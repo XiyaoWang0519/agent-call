@@ -411,6 +411,24 @@ async def test_machine_waits_for_message_end_and_all_gates(service, packet):
 
 
 @pytest.mark.asyncio
+async def test_late_voicemail_amd_cancels_opening_before_response_created(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    # AMD can classify the callee before OpenAI acknowledges the opening response.create.
+    await service.handle_amd(call_id, "machine_end_beep")
+
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("session.update", call_id),
+        ("cancel_response", call_id),
+        ("voicemail", call_id),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)

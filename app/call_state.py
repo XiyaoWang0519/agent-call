@@ -406,10 +406,11 @@ class CallService:
             tasks = [self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))]
             if await self.db.set_flag_once(call_id, "voicemail_sent"):
                 # The opening turn starts on answer, before async AMD can classify the callee.
-                # If AMD then reports a machine, cancel the still-active opening so the
-                # voicemail response.create is not rejected for an already-active response.
-                if call_id in self._active_response_ids:
-                    response_id = self._active_response_ids.pop(call_id)
+                # If AMD then reports a machine, cancel the opening even when its
+                # response.created event has not arrived yet. WebSocket event ordering makes
+                # the following voicemail response.create run after the cancellation request.
+                if call.get("opening_sent"):
+                    response_id = self._active_response_ids.pop(call_id, None)
                     await self.realtime.cancel_response(call_id, response_id)
                 tasks.append(self.realtime.create_voicemail(call_id))
             await asyncio.gather(*tasks)
