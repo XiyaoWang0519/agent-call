@@ -223,12 +223,16 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
                 "type": "realtime",
                 "audio": {
                     "input": {
+                        # Transcription must be re-asserted: session.update replaces the
+                        # nested audio.input object, so omitting it would drop callee
+                        # transcription for the rest of the call.
+                        "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {
                             "type": "semantic_vad",
                             "eagerness": "auto",
                             "create_response": True,
                             "interrupt_response": True,
-                        }
+                        },
                     }
                 },
             },
