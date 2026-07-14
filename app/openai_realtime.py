@@ -59,7 +59,6 @@ class RealtimeBridge:
             instructions=realtime_instructions(packet),
             audio={
                 "input": {
-                    "format": {"type": "audio/pcmu"},
                     "transcription": transcription,
                     "turn_detection": {
                         "type": "semantic_vad",
@@ -69,7 +68,6 @@ class RealtimeBridge:
                     },
                 },
                 "output": {
-                    "format": {"type": "audio/pcmu"},
                     "voice": "marin",
                     "speed": 1.0,
                 },
@@ -183,6 +181,8 @@ class RealtimeBridge:
         async with runtime.update_lock:
             loop = asyncio.get_running_loop()
             runtime.update_waiter = loop.create_future()
+            # Patch only turn_detection. Do not re-specify audio.format: SIP media
+            # negotiates G.711 with Twilio, and an explicit format can silence RTP.
             await self.send(
                 call_id,
                 {

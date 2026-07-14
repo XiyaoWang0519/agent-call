@@ -45,6 +45,10 @@ class TwilioBridge:
                 time_limit=720,
                 wait_url="",
                 beep="false",
+                # Match Twilio's OpenAI SIP conference pattern: avoid early media
+                # while the agent is alone on hold before the callee joins.
+                early_media=False,
+                muted=False,
                 status_callback=self._callback(
                     "/webhooks/twilio/participant-status",
                     call_id=call_id,
@@ -57,7 +61,7 @@ class TwilioBridge:
                     call_id=call_id,
                     plan_id=plan_id,
                 ),
-                conference_status_callback_event=["start", "end", "join", "leave"],
+                conference_status_callback_event=["start", "end", "join", "leave", "mute"],
             )
 
         participant = await asyncio.to_thread(create)
@@ -150,3 +154,22 @@ class TwilioBridge:
             ).delete()
 
         await asyncio.to_thread(remove)
+
+    async def unmute_participant(
+        self, conference_sid_or_name: str | None, participant_call_sid: str | None
+    ) -> None:
+        """Force-unmute a participant after conference start.
+
+        Twilio mutes participants that join with start_conference_on_enter=False
+        until the conference starts. Explicit unmute ensures the OpenAI SIP leg
+        can inject TTS into the mix even if the automatic unmute races activation.
+        """
+        if not conference_sid_or_name or not participant_call_sid:
+            return
+
+        def unmute() -> None:
+            self.client.conferences(conference_sid_or_name).participants(
+                participant_call_sid
+            ).update(muted=False)
+
+        await asyncio.to_thread(unmute)

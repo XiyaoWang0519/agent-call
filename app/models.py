@@ -166,12 +166,6 @@ class TranscriptTurn(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class AudioFormat(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["audio/pcmu"] = "audio/pcmu"
-
-
 class InputTranscription(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -191,7 +185,8 @@ class SemanticVad(BaseModel):
 class RealtimeAudioInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    format: AudioFormat
+    # Do not set audio format for SIP: OpenAI negotiates G.711 with the carrier.
+    # Explicit format values have been observed to clobber PCMU into PCM and silence the leg.
     transcription: InputTranscription
     turn_detection: SemanticVad
 
@@ -199,7 +194,6 @@ class RealtimeAudioInput(BaseModel):
 class RealtimeAudioOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    format: AudioFormat
     voice: Literal["marin"] = "marin"
     speed: float = Field(default=1.0, ge=0.25, le=1.5)
 

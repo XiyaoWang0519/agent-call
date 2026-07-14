@@ -102,6 +102,18 @@ async def test_telephony_gates_wait_for_verified_session_created(service, packet
 
 
 @pytest.mark.asyncio
+async def test_greeting_unmutes_agent_before_speech(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
+    await service.handle_amd(call_id, "human")
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
+    assert service._test_realtime.events == [
+        ("session.update", call_id),
+        ("greeting", call_id),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_greeting_exactly_once_after_confirmed_session_update(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
