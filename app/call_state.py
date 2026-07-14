@@ -218,8 +218,27 @@ class CallService:
 
     async def handle_sideband_open(self, call_id: str) -> None:
         await self.db.set_flag_once(call_id, "sideband_open")
+        try:
+            updated = await self.realtime.verify_initial_session(call_id)
+        except Exception:
+            await self.terminate_call(call_id, "initial_session_update_timeout")
+            return
+        transcription_ok = self.realtime.expected_transcription_echoed(updated)
+        vad_ok = self.realtime.expected_initial_vad_echoed(updated)
+        await self.db.update_call(
+            call_id,
+            transcription_verified=int(transcription_ok),
+            semantic_vad_verified=int(vad_ok),
+        )
+        if not transcription_ok or not vad_ok:
+            await self.terminate_call(call_id, "transcription_config_mismatch")
+            return
         call = await self.db.get_call(call_id)
-        if call and await self.db.set_flag_once(call_id, "callee_dialed"):
+        if (
+            call
+            and CallState(call["state"]) not in TERMINAL_STATES
+            and await self.db.set_flag_once(call_id, "callee_dialed")
+        ):
             plan = await self.db.get_plan(call["plan_id"])
             packet = ContextPacket.model_validate(plan["context"])
             try:
@@ -268,12 +287,14 @@ class CallService:
             await self.db.set_flag_once(call_id, "callee_joined")
             if not call.get("answered_at"):
                 await self.db.update_call(call_id, answered_at=datetime.now(UTC).isoformat())
+            await self._start_opening_on_answer(call_id)
             await self._check_activation_gate(call_id)
         elif event in {"participant-join", "join"}:
             if label == "callee" or (call_sid and call_sid == call.get("twilio_callee_call_sid")):
                 await self.db.set_flag_once(call_id, "callee_joined")
                 if not call.get("answered_at"):
                     await self.db.update_call(call_id, answered_at=datetime.now(UTC).isoformat())
+                await self._start_opening_on_answer(call_id)
                 await self._check_activation_gate(call_id)
             elif label == "owner":
                 self._owner_join_events.setdefault(call_id, asyncio.Event()).set()
@@ -288,7 +309,15 @@ class CallService:
     async def handle_participant_status(self, call_id: str, leg: str, form: dict[str, str]) -> None:
         status = (form.get("CallStatus") or "").lower()
         await self.db.touch_call(call_id)
-        if leg == "callee" and status in {"completed", "failed", "busy", "no-answer", "canceled"}:
+        if leg == "callee" and status in {"in-progress", "answered"}:
+            # The callee's answered status callback usually reaches us before the
+            # conference participant-join event; whichever arrives first starts the
+            # opening turn so the callee hears the model sooner.
+            if await self.db.set_flag_once(call_id, "callee_joined"):
+                await self.db.update_call(call_id, answered_at=datetime.now(UTC).isoformat())
+            await self._start_opening_on_answer(call_id)
+            await self._check_activation_gate(call_id)
+        elif leg == "callee" and status in {"completed", "failed", "busy", "no-answer", "canceled"}:
             duration = int(form.get("CallDuration") or 0)
             reason = "callee_call_completed" if status == "completed" else f"callee_{status}"
             if status == "completed" and duration >= self.settings.max_call_seconds:
@@ -313,6 +342,50 @@ class CallService:
             return
         await self._activate(call_id)
 
+    async def _start_opening_on_answer(self, call_id: str) -> None:
+        """Let the model open the call as soon as the callee joins.
+
+        Conference Participant AMD runs asynchronously, so waiting for its callback leaves a
+        human callee in several seconds of silence. Keep automatic responses disabled until AMD
+        completes, but ask the model for an opening turn immediately. The application supplies no
+        response-specific script; the model chooses the opening from Poke's approved context.
+        """
+        call = await self.db.get_call(call_id)
+        if call is None or CallState(call["state"]) in TERMINAL_STATES:
+            return
+        if not (
+            call["sideband_open"]
+            and call["callee_joined"]
+            and call["transcription_verified"]
+            and call["semantic_vad_verified"]
+        ):
+            return
+        if call.get("answer_handling") == "voicemail":
+            return
+        if not await self.db.set_flag_once(call_id, "opening_sent"):
+            return
+
+        conference = call.get("conference_sid") or call.get("conference_name")
+        # Twilio auto-unmutes the agent leg at conference start; the explicit unmute is a
+        # race-safety net, so run it concurrently instead of letting its REST round-trip
+        # delay the opening turn.
+        await asyncio.gather(
+            self.realtime.create_opening(call_id),
+            self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid")),
+        )
+
+    async def _unmute_agent(
+        self, call_id: str, conference: str | None, agent_call_sid: str | None
+    ) -> None:
+        try:
+            await self.twilio.unmute_participant(conference, agent_call_sid)
+        except Exception:
+            logger.warning(
+                "failed to unmute agent participant call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+
     async def _activate(self, call_id: str) -> None:
         if not await self.db.cas_state(call_id, CallState.READY_TO_ACTIVATE, CallState.ACTIVATING):
             return
@@ -327,43 +400,24 @@ class CallService:
         if not await self.db.cas_state(call_id, CallState.ACTIVATING, CallState.ACTIVE):
             return
         call = await self.db.get_call(call_id)
-        plan = await self.db.get_plan(call["plan_id"])
-        packet = ContextPacket.model_validate(plan["context"])
-        conference = call.get("conference_sid") or call.get("conference_name")
-        try:
-            await self.twilio.unmute_participant(conference, call.get("twilio_ai_call_sid"))
-        except Exception:
-            logger.warning(
-                "failed to unmute agent participant before greeting call_id=%s",
-                call_id,
-                exc_info=True,
-            )
         if call["answer_handling"] == "voicemail":
+            conference = call.get("conference_sid") or call.get("conference_name")
+            tasks = [self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))]
             if await self.db.set_flag_once(call_id, "voicemail_sent"):
-                await self.realtime.create_voicemail(call_id, packet)
-        elif await self.db.set_flag_once(call_id, "greeting_sent"):
-            await self.realtime.create_greeting(call_id, packet.target.name)
-        await self.db.cas_state(call_id, CallState.ACTIVE, CallState.GREETING_STARTED)
+                tasks.append(self.realtime.create_voicemail(call_id))
+            await asyncio.gather(*tasks)
+        else:
+            await self._start_opening_on_answer(call_id)
 
     async def handle_realtime_event(self, call_id: str, event: dict[str, Any]) -> None:
         event_type = event.get("type", "")
         event_id = event.get("event_id") or f"evt_{secrets.token_urlsafe(12)}"
         await self.db.touch_call(call_id)
         if event_type == "session.created":
-            transcription_ok = self.realtime.expected_transcription_echoed(event)
-            vad_ok = self.realtime.expected_initial_vad_echoed(event)
-            await self.db.update_call(
-                call_id,
-                transcription_verified=int(transcription_ok),
-                semantic_vad_verified=int(vad_ok),
-            )
-            if not transcription_ok or not vad_ok:
-                self._spawn(
-                    self.terminate_call(call_id, "transcription_config_mismatch"),
-                    name=f"terminate:{call_id}:transcription",
-                )
-            else:
-                await self._check_activation_gate(call_id)
+            # Observational only. A SIP sideband attaches to an existing session and may
+            # miss this startup event, so readiness is established by the explicit
+            # session.update/session.updated handshake in handle_sideband_open.
+            logger.debug("observed session.created call_id=%s", call_id)
         elif event_type == "conversation.item.input_audio_transcription.completed":
             text = event.get("transcript", "").strip()
             if text:

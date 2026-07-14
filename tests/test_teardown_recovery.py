@@ -28,7 +28,7 @@ async def test_callee_exit_completes_conference_and_hangup_exactly_once(service,
 
 @pytest.mark.asyncio
 async def test_transfer_removes_ai_without_completing_owner_callee_conference(service, packet):
-    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     event = service._owner_join_events.setdefault(call_id, __import__("asyncio").Event())
     event.set()
     result = await service.transfer_to_owner(call_id, "owner needed")
@@ -41,7 +41,7 @@ async def test_transfer_removes_ai_without_completing_owner_callee_conference(se
 
 @pytest.mark.asyncio
 async def test_agent_completed_race_during_transfer_preserves_conference(service, packet):
-    call_id = await seed_call(service.db, packet, state=CallState.GREETING_STARTED)
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._owner_join_events.setdefault(call_id, __import__("asyncio").Event()).set()
     original_remove = service._test_twilio.remove_participant
 
@@ -144,10 +144,10 @@ async def test_setup_deadline_times_out_only_unactivated_calls(service, packet):
         service.db,
         packet,
         call_id="call_voicemail",
-        state=CallState.GREETING_STARTED,
+        state=CallState.ACTIVE,
         openai_call_id="rtc_voicemail",
     )
-    await service.db.update_call(active_voicemail, voicemail_sent=1, greeting_sent=0)
+    await service.db.update_call(active_voicemail, voicemail_sent=1, opening_sent=0)
     service.settings.setup_deadline_seconds = 0
 
     await service._setup_deadline(waiting_call)
@@ -155,9 +155,7 @@ async def test_setup_deadline_times_out_only_unactivated_calls(service, packet):
     await wait_background()
 
     assert (await service.db.get_call(waiting_call))["state"] == CallState.TIMED_OUT.value
-    assert (await service.db.get_call(active_voicemail))[
-        "state"
-    ] == CallState.GREETING_STARTED.value
+    assert (await service.db.get_call(active_voicemail))["state"] == CallState.ACTIVE.value
 
 
 @pytest.mark.asyncio

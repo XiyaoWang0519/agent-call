@@ -167,6 +167,7 @@ class RealtimeBridge:
 
     async def _run(self, runtime: RealtimeRuntime) -> None:
         url = f"wss://api.openai.com/v1/realtime?call_id={runtime.openai_call_id}"
+        receiver: asyncio.Task[None] | None = None
         try:
             async with websockets.connect(
                 url,
@@ -177,13 +178,15 @@ class RealtimeBridge:
                 close_timeout=2,
             ) as websocket:
                 runtime.websocket = websocket
+                # The SIP session already exists by the time this sideband attaches, so its
+                # session.created event may not be replayed. Start receiving before on_open so
+                # that the readiness handshake can send session.update and await session.updated.
+                receiver = asyncio.create_task(
+                    self._receive_events(runtime, websocket),
+                    name=f"sideband-receiver:{runtime.call_id}",
+                )
                 await self.on_open(runtime.call_id)
-                async for message in websocket:
-                    event = json.loads(message)
-                    if event.get("type") == "session.updated" and runtime.update_waiter:
-                        if not runtime.update_waiter.done():
-                            runtime.update_waiter.set_result(event)
-                    await self.on_event(runtime.call_id, event)
+                await receiver
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -191,7 +194,18 @@ class RealtimeBridge:
                 logger.exception("Realtime sideband failed for %s", runtime.call_id)
                 await self.on_fatal(runtime.call_id, f"sideband_error:{type(exc).__name__}")
         finally:
+            if receiver is not None and not receiver.done():
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
             runtime.websocket = None
+
+    async def _receive_events(self, runtime: RealtimeRuntime, websocket: Any) -> None:
+        async for message in websocket:
+            event = json.loads(message)
+            if event.get("type") == "session.updated" and runtime.update_waiter:
+                if not runtime.update_waiter.done():
+                    runtime.update_waiter.set_result(event)
+            await self.on_event(runtime.call_id, event)
 
     async def send(self, call_id: str, event: dict[str, Any]) -> None:
         runtime = self._runtime.get(call_id)
@@ -200,31 +214,20 @@ class RealtimeBridge:
         async with runtime.send_lock:
             await runtime.websocket.send(json.dumps(event))
 
-    async def enable_automatic_responses(self, call_id: str) -> dict[str, Any]:
+    async def _update_session(self, call_id: str, audio_input: dict[str, Any]) -> dict[str, Any]:
         runtime = self._runtime.get(call_id)
         if runtime is None:
             raise RuntimeError("sideband runtime missing")
         async with runtime.update_lock:
             loop = asyncio.get_running_loop()
             runtime.update_waiter = loop.create_future()
-            # Patch only turn_detection. Do not re-specify audio.format: SIP media
-            # negotiates G.711 with Twilio, and an explicit format can silence RTP.
             await self.send(
                 call_id,
                 {
                     "type": "session.update",
                     "session": {
                         "type": "realtime",
-                        "audio": {
-                            "input": {
-                                "turn_detection": {
-                                    "type": "semantic_vad",
-                                    "eagerness": "auto",
-                                    "create_response": True,
-                                    "interrupt_response": True,
-                                }
-                            }
-                        },
+                        "audio": {"input": audio_input},
                     },
                 },
             )
@@ -233,23 +236,49 @@ class RealtimeBridge:
             finally:
                 runtime.update_waiter = None
 
-    async def create_greeting(self, call_id: str, target: str) -> None:
-        greeting = (
-            f"Hi, this is Poke, Irvin's AI assistant calling on his behalf. "
-            f"Am I speaking with {target}?"
-        )
-        await self.send(
+    async def verify_initial_session(self, call_id: str) -> dict[str, Any]:
+        transcription: dict[str, Any] = {"model": self.settings.input_transcription_model}
+        if self.settings.input_transcription_model == "gpt-realtime-whisper":
+            if self.settings.input_transcription_delay:
+                transcription["delay"] = self.settings.input_transcription_delay
+        # Do not specify audio.format: SIP media negotiates G.711 with Twilio, and
+        # explicitly overriding it can silence RTP.
+        return await self._update_session(
             call_id,
             {
-                "type": "response.create",
-                "response": {
-                    "output_modalities": ["audio"],
-                    "instructions": f'Say exactly: "{greeting}" Do not add any other words.',
+                "transcription": transcription,
+                "turn_detection": {
+                    "type": "semantic_vad",
+                    "eagerness": "auto",
+                    "create_response": False,
+                    "interrupt_response": False,
                 },
             },
         )
 
-    async def create_voicemail(self, call_id: str, packet: ContextPacket) -> None:
+    async def enable_automatic_responses(self, call_id: str) -> dict[str, Any]:
+        return await self._update_session(
+            call_id,
+            {
+                "turn_detection": {
+                    "type": "semantic_vad",
+                    "eagerness": "auto",
+                    "create_response": True,
+                    "interrupt_response": True,
+                }
+            },
+        )
+
+    async def create_opening(self, call_id: str) -> None:
+        await self.send(
+            call_id,
+            {
+                "type": "response.create",
+                "response": {"output_modalities": ["audio"]},
+            },
+        )
+
+    async def create_voicemail(self, call_id: str) -> None:
         await self.send(
             call_id,
             {
@@ -257,9 +286,8 @@ class RealtimeBridge:
                 "response": {
                     "output_modalities": ["audio"],
                     "instructions": (
-                        "Leave exactly one concise voicemail. Identify yourself as Poke, "
-                        f"{packet.owner.display_name}'s AI assistant, state the approved purpose, "
-                        f"and give callback number {packet.owner.callback_number}. Do not ask questions."
+                        "Leave one concise voicemail that advances the approved objective using only "
+                        "the approved context. Do not ask questions."
                     ),
                 },
             },

@@ -25,7 +25,7 @@ async def get_call(call_id: str, request: Request):
         "amd_result",
         "answered_by",
         "answer_handling",
-        "greeting_sent",
+        "opening_sent",
         "voicemail_sent",
         "tool_call_count",
         "tool_continuation_observed",

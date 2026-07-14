@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS calls (
     amd_result TEXT,
     answered_by TEXT,
     answer_handling TEXT,
-    greeting_sent INTEGER NOT NULL DEFAULT 0,
+    opening_sent INTEGER NOT NULL DEFAULT 0,
     voicemail_sent INTEGER NOT NULL DEFAULT 0,
     termination_claimed INTEGER NOT NULL DEFAULT 0,
     termination_reason TEXT,
@@ -132,6 +132,17 @@ class Database:
             await conn.executescript(SCHEMA)
             cursor = await conn.execute("PRAGMA table_info(calls)")
             existing = {row[1] for row in await cursor.fetchall()}
+            if "greeting_sent" in existing and "opening_sent" not in existing:
+                await conn.execute("ALTER TABLE calls RENAME COLUMN greeting_sent TO opening_sent")
+                existing.remove("greeting_sent")
+                existing.add("opening_sent")
+            await conn.execute(
+                "UPDATE calls SET state=? WHERE state=?",
+                (
+                    CallState.ACTIVE.value,
+                    "greeting_started",
+                ),
+            )
             migrations = {
                 "openai_accept_status": "INTEGER",
                 "transcription_verified": "INTEGER NOT NULL DEFAULT 0",
@@ -139,6 +150,7 @@ class Database:
                 "tool_call_count": "INTEGER NOT NULL DEFAULT 0",
                 "tool_continuation_observed": "INTEGER NOT NULL DEFAULT 0",
                 "interruption_observed": "INTEGER NOT NULL DEFAULT 0",
+                "opening_sent": "INTEGER NOT NULL DEFAULT 0",
             }
             for name, definition in migrations.items():
                 if name not in existing:
@@ -351,7 +363,7 @@ class Database:
             "sideband_open",
             "callee_joined",
             "callee_dialed",
-            "greeting_sent",
+            "opening_sent",
             "voicemail_sent",
             "termination_claimed",
         }

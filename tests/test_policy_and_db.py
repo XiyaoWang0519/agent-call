@@ -6,9 +6,43 @@ import pytest
 from pydantic import ValidationError
 
 from app.db import Database, DeploymentLockedError
-from app.models import EvidenceValue, PreparePhoneCallInput
+from app.models import CallState, EvidenceValue, PreparePhoneCallInput
 from app.policy import validate_context, validate_destination
 from app.settings import Settings
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_legacy_opening_column_and_state(settings, packet):
+    db = Database(settings.database_path)
+    await db.initialize()
+    expires_at = datetime.now(UTC) + timedelta(minutes=10)
+    await db.create_plan(
+        "plan_legacy",
+        packet.model_dump(mode="json"),
+        "Owner explicitly requested the call",
+        expires_at,
+    )
+    assert await db.claim_plan_and_create_call(
+        plan_id="plan_legacy",
+        call_id="call_legacy",
+        conference_name="conference_legacy",
+        confirmation_text="Confirmed",
+    )
+    await db.update_call(
+        "call_legacy",
+        state="greeting_started",
+        opening_sent=1,
+    )
+    await db.execute("ALTER TABLE calls RENAME COLUMN opening_sent TO greeting_sent")
+
+    await db.initialize()
+
+    columns = {row["name"] for row in await db.fetch_all("PRAGMA table_info(calls)")}
+    call = await db.get_call("call_legacy")
+    assert "opening_sent" in columns
+    assert "greeting_sent" not in columns
+    assert call["opening_sent"] == 1
+    assert call["state"] == CallState.ACTIVE.value
 
 
 @pytest.mark.parametrize(

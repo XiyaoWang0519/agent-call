@@ -106,6 +106,7 @@ class FakeTwilio:
 class FakeRealtime:
     def __init__(self):
         self.events: list[tuple[str, str]] = []
+        self.initial_updates: list[str] = []
         self.hangups: list[str | None] = []
         self.rejects: list[str] = []
         self.closed: list[str] = []
@@ -125,6 +126,26 @@ class FakeRealtime:
                 }
             },
         }
+        self.initial_update_event = {
+            "type": "session.updated",
+            "session": {
+                "audio": {
+                    "input": {
+                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "auto",
+                            "create_response": False,
+                            "interrupt_response": False,
+                        },
+                    }
+                }
+            },
+        }
+
+    async def verify_initial_session(self, call_id: str):
+        self.initial_updates.append(call_id)
+        return self.initial_update_event
 
     async def enable_automatic_responses(self, call_id: str):
         self.events.append(("session.update", call_id))
@@ -141,10 +162,10 @@ class FakeRealtime:
         turn = event["session"]["audio"]["input"]["turn_detection"]
         return turn["create_response"] is True and turn["interrupt_response"] is True
 
-    async def create_greeting(self, call_id: str, target: str) -> None:
-        self.events.append(("greeting", call_id))
+    async def create_opening(self, call_id: str) -> None:
+        self.events.append(("opening", call_id))
 
-    async def create_voicemail(self, call_id: str, packet: ContextPacket) -> None:
+    async def create_voicemail(self, call_id: str) -> None:
         self.events.append(("voicemail", call_id))
 
     async def hangup(self, openai_call_id: str | None) -> None:
@@ -171,11 +192,20 @@ class FakeRealtime:
             self.events.append(("tool_continuation", call_id))
 
     def expected_transcription_echoed(self, event) -> bool:
-        return event.get("transcription_ok", True)
+        transcription = (
+            event.get("session", {}).get("audio", {}).get("input", {}).get("transcription", {})
+        )
+        return transcription.get("model") == "gpt-4o-mini-transcribe"
 
     @staticmethod
     def expected_initial_vad_echoed(event) -> bool:
-        return event.get("vad_ok", True)
+        turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
+        return (
+            turn.get("type") == "semantic_vad"
+            and turn.get("eagerness") == "auto"
+            and turn.get("create_response") is False
+            and turn.get("interrupt_response") is False
+        )
 
 
 class FakeFinalizer:

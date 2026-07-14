@@ -8,13 +8,13 @@ Single-user FastAPI + FastMCP service that lets Poke prepare, confirm, start, mo
 - Every OpenAI and Twilio webhook is signature-verified; OpenAI delivery IDs are replay-protected.
 - A call cannot start without an unexpired prepared plan and explicit confirmation text.
 - Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
-- The agent identifies itself as Poke, Irvin's AI assistant. It may not impersonate Irvin or share/request passwords, auth codes, payment credentials, or government identifiers.
+- The voice model chooses how to open from Poke's approved call context; the bridge does not impose identity, disclosure, or recipient-confirmation wording. It may not share or request passwords, auth codes, payment credentials, or government identifiers.
 - The in-call voice model decides when the conversation is finished and invokes its private `end_call` function. The bridge asks it for one final spoken goodbye, waits for that closing response to complete, and then tears down OpenAI and Twilio. The public `end_phone_call` MCP tool remains a manual stop.
 - Poke push is optional and non-canonical. Polling `get_call_result` is canonical.
 
 Do not deploy or restart while a call is active. Recovery stops stranded billable media and finalizes missing results, but a process restart necessarily ends the live call.
 
-Calls are retained as transcripts. The greeting provides verbal AI disclosure; the owner remains responsible for jurisdiction-specific recording, robocall, consent, and retention compliance. Apply transcript retention independently of extraction success or failure.
+Calls are retained as transcripts. The application does not force a verbal identity or AI-disclosure script; the owner remains responsible for jurisdiction-specific disclosure, recording, robocall, consent, and retention compliance. Apply transcript retention independently of extraction success or failure.
 
 ## Requirements
 
@@ -135,7 +135,7 @@ Live-schema deviations from the original contract are intentional:
 - The current Conference Participants API has no `async_amd` parameter. AMD on Participants is asynchronous by design; the installed SDK uses `machine_detection="DetectMessageEnd"` plus `amd_status_callback` and `amd_status_callback_method`.
 - OpenAI call accept is invoked through the installed typed SDK; hangup has no JSON body. REFER's live request field is `target_uri`, but v1 transfer deliberately does not use REFER.
 - The installed transcription schema permits `INPUT_TRANSCRIPTION_DELAY` only for `gpt-realtime-whisper`, with `minimal|low|medium|high|xhigh` values.
-- The OpenAI SIP agent participant is created with `early_media=false` and is explicitly unmuted before the greeting, because Twilio mutes legs that join with `start_conference_on_enter=false` until the conference starts.
+- The OpenAI SIP agent participant is created with `early_media=false` and is explicitly unmuted before the model's opening turn, because Twilio mutes legs that join with `start_conference_on_enter=false` until the conference starts.
 
 ## Result semantics
 
