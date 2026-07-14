@@ -285,11 +285,12 @@ class CallService:
         if call is None:
             return
         if event in {"conference-start", "start"}:
-            await self.db.set_flag_once(call_id, "callee_joined")
-            if not call.get("answered_at"):
-                await self.db.update_call(call_id, answered_at=datetime.now(UTC).isoformat())
-            await self._start_opening_on_answer(call_id)
-            await self._check_activation_gate(call_id)
+            # Twilio fires conference-start as soon as the agent SIP leg enters the
+            # REST-created conference, while the callee is still ringing. It is not
+            # evidence the callee answered, so it must not mark the callee joined or
+            # trigger the opening turn; the callee's own participant-join event and
+            # answered status callback do that instead.
+            await self.db.touch_call(call_id)
         elif event in {"participant-join", "join"}:
             if label == "callee" or (call_sid and call_sid == call.get("twilio_callee_call_sid")):
                 await self.db.set_flag_once(call_id, "callee_joined")
