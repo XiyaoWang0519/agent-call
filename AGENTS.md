@@ -29,3 +29,13 @@ Recent history uses short, imperative, sentence-case subjects such as `Add call-
 ## Security & Operations
 
 Copy `.env.example` to `.env.local`; never commit secrets, transcripts, or database files. Preserve webhook signature checks, replay protection, destination policy, and explicit call confirmation. Do not deploy or restart while a call is active, and keep production to one Fly Machine because SQLite state is volume-local.
+
+## Cursor Cloud specific instructions
+
+Standard install/lint/test/run commands are in "Build, Test, and Development Commands" above. Notes below cover only non-obvious cloud gotchas.
+
+- `uv` is installed under `~/.local/bin` and added to the agent's `~/.bashrc` PATH. The startup update script keeps dependencies synced (`uv sync --all-groups --frozen`). If `uv` is ever missing in a fresh shell, use `~/.local/bin/uv` or re-run the installer from `https://astral.sh/uv/install.sh`.
+- Booting the app requires every variable in `Settings.require_runtime_configuration` (`app/settings.py`) or the lifespan aborts at startup. For local/cloud dev, copy `.env.example` to `.env.local` and fill dummy values (`.env.local` is gitignored); real Twilio/OpenAI credentials + a public HTTPS tunnel are only needed for live calls.
+- Startup gotcha: do NOT put `ALLOWED_COUNTRY_CODES` in `.env.local`. pydantic-settings JSON-decodes list-typed fields from dotenv files, so `ALLOWED_COUNTRY_CODES=+1` crashes boot with a `SettingsError`. Omit it and rely on the `+1` default (setting it via a real process env var has the same issue).
+- The full end-to-end SIP canary (`scripts/run_sip_canary.py`) places a real billable call and needs real credentials, a public tunnel, and a human with a phone; it cannot run in cloud. Practical verification here is: `ruff format --check` + `ruff check`, `pytest -q` (all externals are mocked in `tests/conftest.py`, temp SQLite), boot the server, and drive the MCP tools.
+- MCP smoke test: the endpoint is `/mcp/` (Streamable HTTP) and requires both `Authorization: Bearer <MCP_BEARER_TOKEN>` and `X-Poke-User-Id: <ALLOWED_POKE_USER_ID>`. `prepare_phone_call` runs without any external service (validates destination policy + persists a plan to SQLite); its `context.owner.callback_number` and `escalation.owner_phone` must equal `OWNER_PHONE_E164`, and a persisted `plan_id` is only returned once `authority_basis` (or `requested_by_owner`) is supplied.
