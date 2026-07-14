@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +92,22 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     webhook_id TEXT PRIMARY KEY,
     received_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS deployment_control (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    locked INTEGER NOT NULL DEFAULT 0,
+    locked_at TEXT
+);
+
+INSERT OR IGNORE INTO deployment_control (singleton, locked) VALUES (1, 0);
 """
+
+
+DEPLOYMENT_LOCK_TTL = timedelta(minutes=15)
+
+
+class DeploymentLockedError(RuntimeError):
+    """Raised when a deployment lease temporarily blocks new phone calls."""
 
 
 def _iso_now() -> str:
@@ -189,6 +204,18 @@ class Database:
         async with self._write_lock, self.connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             cursor = await conn.execute(
+                "SELECT locked, locked_at FROM deployment_control WHERE singleton=1"
+            )
+            lock = await cursor.fetchone()
+            if lock and lock["locked"]:
+                locked_at = datetime.fromisoformat(lock["locked_at"])
+                if datetime.now(UTC) - locked_at < DEPLOYMENT_LOCK_TTL:
+                    await conn.rollback()
+                    raise DeploymentLockedError("deployment is in progress")
+                await conn.execute(
+                    "UPDATE deployment_control SET locked=0, locked_at=NULL WHERE singleton=1"
+                )
+            cursor = await conn.execute(
                 """UPDATE plans SET state='started', call_id=?, confirmation_text=?
                    WHERE plan_id=? AND state='prepared' AND expires_at>?""",
                 (call_id, confirmation_text, plan_id, now),
@@ -212,6 +239,46 @@ class Database:
             )
             await conn.commit()
             return True
+
+    async def acquire_deployment_lock(self) -> int:
+        """Atomically block new calls if no call is currently nonterminal.
+
+        Returns the number of active calls that prevented acquisition. Zero means
+        the deployment lock was acquired.
+        """
+
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
+        async with self._write_lock, self.connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                f"SELECT COUNT(*) FROM calls WHERE state NOT IN ({placeholders})",  # noqa: S608
+                tuple(state.value for state in TERMINAL_STATES),
+            )
+            active_calls = int((await cursor.fetchone())[0])
+            if active_calls:
+                await conn.rollback()
+                return active_calls
+            await conn.execute(
+                """UPDATE deployment_control
+                   SET locked=1, locked_at=?
+                   WHERE singleton=1""",
+                (_iso_now(),),
+            )
+            await conn.commit()
+            return 0
+
+    async def release_deployment_lock(self) -> None:
+        await self.execute(
+            "UPDATE deployment_control SET locked=0, locked_at=NULL WHERE singleton=1"
+        )
+
+    async def deployment_lock_is_active(self) -> bool:
+        row = await self.fetch_one(
+            "SELECT locked, locked_at FROM deployment_control WHERE singleton=1"
+        )
+        if not row or not row["locked"] or not row["locked_at"]:
+            return False
+        return datetime.now(UTC) - datetime.fromisoformat(row["locked_at"]) < DEPLOYMENT_LOCK_TTL
 
     async def get_call(self, call_id: str) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM calls WHERE call_id=?", (call_id,))

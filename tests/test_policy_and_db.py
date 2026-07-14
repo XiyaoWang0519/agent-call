@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from app.db import Database
+from app.db import Database, DeploymentLockedError
 from app.models import EvidenceValue, PreparePhoneCallInput
 from app.policy import validate_context, validate_destination
 from app.settings import Settings
@@ -190,3 +190,36 @@ async def test_transcript_order_and_source_id_are_idempotent(settings):
     assert first.sequence_number == 1
     assert duplicate is None
     assert second.sequence_number == 2
+
+
+@pytest.mark.asyncio
+async def test_deployment_lock_atomically_blocks_new_calls(settings):
+    db = Database(settings.database_path)
+    await db.initialize()
+    await db.create_plan(
+        "plan_deploy",
+        {},
+        "authority",
+        datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    assert await db.acquire_deployment_lock() == 0
+    assert await db.deployment_lock_is_active()
+    with pytest.raises(DeploymentLockedError):
+        await db.claim_plan_and_create_call(
+            plan_id="plan_deploy",
+            call_id="call_deploy",
+            conference_name="conference_deploy",
+            confirmation_text="confirmed",
+        )
+    assert (await db.get_plan("plan_deploy"))["state"] == "prepared"
+
+    await db.release_deployment_lock()
+    assert not await db.deployment_lock_is_active()
+    assert await db.claim_plan_and_create_call(
+        plan_id="plan_deploy",
+        call_id="call_deploy",
+        conference_name="conference_deploy",
+        confirmation_text="confirmed",
+    )
+    assert await db.acquire_deployment_lock() == 1

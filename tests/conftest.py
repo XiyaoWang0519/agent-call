@@ -38,6 +38,7 @@ def settings(tmp_path: Path) -> Settings:
         allowed_poke_user_id="poke-user-1",
         mcp_bearer_token=SecretStr("mcp-test"),
         debug_api_token=SecretStr("debug-test"),
+        deploy_guard_token=SecretStr("deploy-guard-test"),
         public_base_url="https://example.test",
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         setup_deadline_seconds=60,

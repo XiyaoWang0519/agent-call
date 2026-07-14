@@ -127,6 +127,31 @@ def test_debug_routes_require_token(settings):
         )
 
 
+def test_deployment_lock_requires_its_narrow_token(settings):
+    app = create_app(settings)
+    with TestClient(app) as client:
+        unauthorized = client.post("/internal/deployment-lock")
+        wrong_token = client.post(
+            "/internal/deployment-lock",
+            headers={"Authorization": "Bearer debug-test"},
+        )
+        acquired = client.post(
+            "/internal/deployment-lock",
+            headers={"Authorization": "Bearer deploy-guard-test"},
+        )
+        released = client.delete(
+            "/internal/deployment-lock",
+            headers={"Authorization": "Bearer deploy-guard-test"},
+        )
+
+    assert unauthorized.status_code == 401
+    assert wrong_token.status_code == 401
+    assert acquired.status_code == 200
+    assert acquired.json() == {"ready": True, "active_calls": 0}
+    assert released.status_code == 200
+    assert released.json() == {"released": True}
+
+
 def test_unsigned_and_invalid_openai_webhooks_rejected(settings):
     app = create_app(settings)
     body = json.dumps(

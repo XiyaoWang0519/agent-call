@@ -42,5 +42,7 @@ services:
         sync: false
       - key: DEBUG_API_TOKEN
         sync: false
+      - key: DEPLOY_GUARD_TOKEN
+        sync: false
       - key: PUBLIC_BASE_URL
         sync: false
