@@ -119,6 +119,12 @@ the deployment starts, expires after 15 minutes if a deployment is canceled, and
 successful application restart. Store `DEPLOY_GUARD_TOKEN` independently from the MCP and debug
 tokens; it can only access this deployment lease.
 
+`.github/workflows/fly-deploy.yml` runs the locked test suite and deploys every push to `main`,
+including every merged pull request. It serializes production deployments, waits up to 10 minutes
+for active calls to finish, preserves the single-Machine volume topology with `--ha=false`, and
+checks `/healthz` before reporting success. GitHub Actions requires the repository secrets
+`FLY_API_TOKEN` (an app-scoped Fly deploy token) and `DEPLOY_GUARD_TOKEN`.
+
 ## API/schema decisions verified on 2026-07-13
 
 The implementation follows the current [OpenAI Realtime SIP guide](https://developers.openai.com/api/docs/guides/realtime-sip), [server-side controls guide](https://developers.openai.com/api/docs/guides/realtime-server-controls), [Realtime prompting guide](https://developers.openai.com/api/docs/guides/realtime-models-prompting), [webhook guide](https://developers.openai.com/api/docs/guides/webhooks), [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs), [Twilio Conference Participant reference](https://www.twilio.com/docs/voice/api/conference-participant-resource), [Twilio AMD guide](https://www.twilio.com/docs/voice/answering-machine-detection), and [Twilio request validation guide](https://www.twilio.com/docs/usage/security).

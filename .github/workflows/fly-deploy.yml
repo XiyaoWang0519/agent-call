@@ -1,0 +1,100 @@
+name: Deploy production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Test and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    steps:
+      - name: Check out merged main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.9.27"
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Verify application
+        run: |
+          uv run ruff format --check app tests
+          uv run ruff check app tests
+          uv run pytest -q
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+
+      - name: Wait for calls and acquire deployment lease
+        id: deployment_lock
+        env:
+          DEPLOY_GUARD_TOKEN: ${{ secrets.DEPLOY_GUARD_TOKEN }}
+        run: |
+          response_file="${RUNNER_TEMP}/deployment-lock.json"
+          for attempt in $(seq 1 60); do
+            if ! status=$(curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer ${DEPLOY_GUARD_TOKEN}" \
+              https://poke-call.fly.dev/internal/deployment-lock); then
+              echo "Deployment lease endpoint was temporarily unreachable; retrying."
+              sleep 10
+              continue
+            fi
+            if [ "$status" = "200" ]; then
+              echo "acquired=true" >> "$GITHUB_OUTPUT"
+              echo "Deployment lease acquired."
+              exit 0
+            fi
+            if [ "$status" = "409" ]; then
+              active_calls=$(jq -r '.detail.active_calls // "unknown"' "$response_file")
+              echo "${active_calls} call(s) still active; waiting before deployment."
+              sleep 10
+              continue
+            fi
+            echo "Deployment lease failed with HTTP ${status}."
+            cat "$response_file"
+            exit 1
+          done
+          echo "Timed out waiting for active calls to finish."
+          exit 1
+
+      - name: Deploy merged main to Fly.io
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --app poke-call --ha=false --remote-only
+
+      - name: Verify production health
+        run: |
+          curl --fail --silent --show-error \
+            --retry 10 --retry-delay 3 --retry-all-errors \
+            https://poke-call.fly.dev/healthz
+
+      - name: Release deployment lease after failure
+        if: ${{ failure() && steps.deployment_lock.outputs.acquired == 'true' }}
+        env:
+          DEPLOY_GUARD_TOKEN: ${{ secrets.DEPLOY_GUARD_TOKEN }}
+        run: |
+          curl --fail --silent --show-error \
+            --retry 5 --retry-delay 3 --retry-all-errors \
+            --request DELETE \
+            --header "Authorization: Bearer ${DEPLOY_GUARD_TOKEN}" \
+            https://poke-call.fly.dev/internal/deployment-lock || true
