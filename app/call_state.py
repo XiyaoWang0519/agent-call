@@ -9,7 +9,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from app.db import Database
+from app.db import Database, DeploymentLockedError
 from app.finalizer import Finalizer
 from app.models import (
     TERMINAL_STATES,
@@ -140,12 +140,22 @@ class CallService:
             )
         call_id = f"call_{secrets.token_urlsafe(18)}"
         conference_name = f"poke-{secrets.token_hex(16)}"
-        claimed = await self.db.claim_plan_and_create_call(
-            plan_id=plan_id,
-            call_id=call_id,
-            conference_name=conference_name,
-            confirmation_text=confirmation_text,
-        )
+        try:
+            claimed = await self.db.claim_plan_and_create_call(
+                plan_id=plan_id,
+                call_id=call_id,
+                conference_name=conference_name,
+                confirmation_text=confirmation_text,
+            )
+        except DeploymentLockedError as exc:
+            raise ValueError(
+                json.dumps(
+                    {
+                        "code": "deployment_in_progress",
+                        "message": "A deployment is starting; retry the confirmed call shortly",
+                    }
+                )
+            ) from exc
         if not claimed:
             raise ValueError(
                 json.dumps(

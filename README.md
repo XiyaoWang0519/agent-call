@@ -112,6 +112,12 @@ flyctl status -a poke-call
 
 Keep exactly one Machine for this SQLite deployment. A second Machine would need its own local volume and would not share call state. `render.yaml` remains available as a paid Render alternative.
 
+Automated deployments use the authenticated `/internal/deployment-lock` lease before replacing
+the Machine. The lease is acquired atomically only when no call is active, blocks new calls while
+the deployment starts, expires after 15 minutes if a deployment is canceled, and is cleared by a
+successful application restart. Store `DEPLOY_GUARD_TOKEN` independently from the MCP and debug
+tokens; it can only access this deployment lease.
+
 ## API/schema decisions verified on 2026-07-13
 
 The implementation follows the current [OpenAI Realtime SIP guide](https://developers.openai.com/api/docs/guides/realtime-sip), [server-side controls guide](https://developers.openai.com/api/docs/guides/realtime-server-controls), [Realtime prompting guide](https://developers.openai.com/api/docs/guides/realtime-models-prompting), [webhook guide](https://developers.openai.com/api/docs/guides/webhooks), [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs), [Twilio Conference Participant reference](https://www.twilio.com/docs/voice/api/conference-participant-resource), [Twilio AMD guide](https://www.twilio.com/docs/voice/answering-machine-detection), and [Twilio request validation guide](https://www.twilio.com/docs/usage/security).

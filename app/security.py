@@ -58,6 +58,14 @@ async def require_debug_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+async def require_deploy_guard_token(request: Request) -> None:
+    settings: Settings = request.app.state.settings
+    token = request.headers.get("authorization")
+    expected = f"Bearer {Settings.reveal(settings.deploy_guard_token)}"
+    if not constant_time_equal(token, expected):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
 def exact_public_url(request: Request, settings: Settings) -> str:
     base = (settings.public_base_url or "").rstrip("/")
     url = f"{base}{request.url.path}"

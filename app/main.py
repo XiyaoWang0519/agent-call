@@ -11,7 +11,7 @@ from openai import AsyncOpenAI
 from app.call_state import CallService
 from app.db import Database
 from app.mcp_tools import register_tools
-from app.routes import debug, openai_webhooks, twilio_webhooks
+from app.routes import debug, deployment, openai_webhooks, twilio_webhooks
 from app.security import MCPAuthMiddleware
 from app.settings import Settings
 
@@ -54,6 +54,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.call_service = service
         # Recovery happens before the server accepts traffic.
         await service.recover_startup()
+        # A successful restart completes the deployment lease. Failed or canceled
+        # deployments are also bounded by the database lock's TTL.
+        await db.release_deployment_lock()
         await service.start_watchdog()
         async with mcp_http_app.lifespan(app):
             yield
@@ -67,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(openai_webhooks.router)
     app.include_router(twilio_webhooks.router)
     app.include_router(debug.router)
+    app.include_router(deployment.router)
     app.mount("/mcp", protected_mcp)
 
     @app.get("/healthz", include_in_schema=False)

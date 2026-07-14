@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     allowed_poke_user_id: str | None = None
     mcp_bearer_token: SecretStr | None = None
     debug_api_token: SecretStr | None = None
+    deploy_guard_token: SecretStr | None = None
     poke_api_key: SecretStr | None = None
     poke_push_enabled: bool = False
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])
@@ -135,6 +136,7 @@ class Settings(BaseSettings):
             "ALLOWED_POKE_USER_ID": self.allowed_poke_user_id,
             "MCP_BEARER_TOKEN": self.mcp_bearer_token,
             "DEBUG_API_TOKEN": self.debug_api_token,
+            "DEPLOY_GUARD_TOKEN": self.deploy_guard_token,
             "PUBLIC_BASE_URL": self.public_base_url,
         }
 
