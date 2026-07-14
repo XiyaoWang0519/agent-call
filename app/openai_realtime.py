@@ -51,22 +51,10 @@ class RealtimeBridge:
         self._runtime: dict[str, RealtimeRuntime] = {}
 
     def build_accept_payload(self, packet: ContextPacket) -> AcceptPayload:
-        transcription: dict[str, Any] = {"model": self.settings.input_transcription_model}
-        if self.settings.input_transcription_model == "gpt-realtime-whisper":
-            if self.settings.input_transcription_delay:
-                transcription["delay"] = self.settings.input_transcription_delay
         return AcceptPayload(
             instructions=realtime_instructions(packet),
             audio={
-                "input": {
-                    "transcription": transcription,
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": False,
-                        "interrupt_response": False,
-                    },
-                },
+                "input": self._input_audio_config(create_response=False, interrupt_response=False),
                 "output": {
                     "voice": "marin",
                     "speed": 1.0,
@@ -236,37 +224,40 @@ class RealtimeBridge:
             finally:
                 runtime.update_waiter = None
 
-    async def verify_initial_session(self, call_id: str) -> dict[str, Any]:
+    def _transcription_config(self) -> dict[str, Any]:
         transcription: dict[str, Any] = {"model": self.settings.input_transcription_model}
         if self.settings.input_transcription_model == "gpt-realtime-whisper":
             if self.settings.input_transcription_delay:
                 transcription["delay"] = self.settings.input_transcription_delay
+        return transcription
+
+    def _input_audio_config(
+        self, *, create_response: bool, interrupt_response: bool
+    ) -> dict[str, Any]:
         # Do not specify audio.format: SIP media negotiates G.711 with Twilio, and
-        # explicitly overriding it can silence RTP.
+        # explicitly overriding it can silence RTP. Always re-assert transcription
+        # alongside turn_detection: session.update replaces the nested audio.input
+        # object, so a turn_detection-only update would drop input transcription.
+        return {
+            "transcription": self._transcription_config(),
+            "turn_detection": {
+                "type": "semantic_vad",
+                "eagerness": "auto",
+                "create_response": create_response,
+                "interrupt_response": interrupt_response,
+            },
+        }
+
+    async def verify_initial_session(self, call_id: str) -> dict[str, Any]:
         return await self._update_session(
             call_id,
-            {
-                "transcription": transcription,
-                "turn_detection": {
-                    "type": "semantic_vad",
-                    "eagerness": "auto",
-                    "create_response": False,
-                    "interrupt_response": False,
-                },
-            },
+            self._input_audio_config(create_response=False, interrupt_response=False),
         )
 
     async def enable_automatic_responses(self, call_id: str) -> dict[str, Any]:
         return await self._update_session(
             call_id,
-            {
-                "turn_detection": {
-                    "type": "semantic_vad",
-                    "eagerness": "auto",
-                    "create_response": True,
-                    "interrupt_response": True,
-                }
-            },
+            self._input_audio_config(create_response=True, interrupt_response=True),
         )
 
     async def create_opening(self, call_id: str) -> None:

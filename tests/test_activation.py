@@ -202,14 +202,40 @@ async def test_opening_exactly_once_after_confirmed_session_update(service, pack
 
 
 @pytest.mark.asyncio
-async def test_conference_start_can_satisfy_callee_ready_gate(service, packet):
+async def test_conference_start_alone_does_not_mark_callee_joined(service, packet):
+    """conference-start fires when the agent SIP leg connects, before the callee answers.
+
+    Regression: treating it as callee join used to send the opening turn into an empty
+    conference while the callee's phone was still ringing, so the callee heard only the
+    tail of the opening followed by silence until the watchdog hung up.
+    """
     call_id = await seed_call(service.db, packet)
-    await service.db.update_call(call_id, sideband_open=1)
-    await service.handle_amd(call_id, "human")
+    await service.handle_sideband_open(call_id)
+
     await service.handle_conference_event(call_id, {"StatusCallbackEvent": "conference-start"})
+
+    call = await service.db.get_call(call_id)
+    assert call["callee_joined"] == 0
+    assert call["answered_at"] is None
+    assert call["opening_sent"] == 0
+    assert call["state"] == CallState.PREWARMING.value
+    assert service._test_realtime.events == []
+
+    # The opening starts only once the callee actually answers.
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     call = await service.db.get_call(call_id)
     assert call["callee_joined"] == 1
+    assert call["answered_at"] is not None
+    assert call["opening_sent"] == 1
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    await service.handle_amd(call_id, "human")
+    call = await service.db.get_call(call_id)
     assert call["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("session.update", call_id),
+    ]
 
 
 @pytest.mark.asyncio
