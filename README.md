@@ -4,7 +4,7 @@ Single-user FastAPI + FastMCP service that lets Poke prepare, confirm, start, mo
 
 ## Safety and operating model
 
-- The MCP endpoint requires both a bearer token and the configured Poke user ID.
+- The MCP endpoint always requires its bearer token. It also validates the configured Poke user ID whenever Poke supplies the header; Poke's refresh follow-up currently omits it.
 - Every OpenAI and Twilio webhook is signature-verified; OpenAI delivery IDs are replay-protected.
 - A call cannot start without an unexpired prepared plan and explicit confirmation text.
 - Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
@@ -93,23 +93,24 @@ Both commands exit nonzero if any gate fails. The debug evidence endpoint they u
 
 No mini realtime model can be selected by configuration in v1. Do not relax the `realtime_model` literal or `MINI_MODELS_ENABLED=false` gate until that exact model passes both canaries, including SIP tool calling.
 
-## Render deployment
+## Fly.io deployment
 
-`render.yaml` defines an always-on Starter web service and a persistent SQLite disk. Validate it with Render CLI v2.7.0 or newer:
-
-```bash
-render blueprints validate render.yaml
-```
-
-Commit and push the repository, then use **Render Dashboard → New → Blueprint**, connect this repository, review `render.yaml`, and select **Deploy Blueprint**. The current Render CLI validates Blueprint files but does not create a Blueprint from one. Enter every `sync: false` secret, set `PUBLIC_BASE_URL` to the final `https://SERVICE.onrender.com` origin, and deploy. The container command is already defined. Useful checks:
+`fly.toml` defines the production deployment at `https://poke-call.fly.dev`: one always-on shared CPU machine with 512 MB RAM and a 1 GB persistent volume mounted at `/data`. SQLite uses `sqlite:////data/poke_call.db`. Validate and deploy it with:
 
 ```bash
-curl -fsS https://SERVICE.onrender.com/healthz
-render services list
-render logs --resources SERVICE_ID --tail
+flyctl config validate
+flyctl deploy --ha=false --remote-only
+curl -fsS https://poke-call.fly.dev/healthz
 ```
 
-After the first deployment, point the OpenAI project webhook at the Render URL, update `OPENAI_WEBHOOK_SECRET`, redeploy once, and run both canaries. Keep the persistent disk mounted at `/var/data`; ephemeral SQLite loses calls/results on deployment.
+Set every required value from `.env.example` with `flyctl secrets set` or `flyctl secrets import`; never commit secret values. The OpenAI project webhook must point to `https://poke-call.fly.dev/webhooks/openai` and subscribe to `realtime.call.incoming`. After rotating its signing secret, activate staged values with:
+
+```bash
+flyctl secrets deploy -a poke-call
+flyctl status -a poke-call
+```
+
+Keep exactly one Machine for this SQLite deployment. A second Machine would need its own local volume and would not share call state. `render.yaml` remains available as a paid Render alternative.
 
 ## API/schema decisions verified on 2026-07-13
 

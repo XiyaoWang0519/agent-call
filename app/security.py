@@ -27,9 +27,11 @@ class MCPAuthMiddleware:
         authorization = headers.get(b"authorization", b"").decode("latin-1")
         poke_user_id = headers.get(b"x-poke-user-id", b"").decode("latin-1")
         expected_auth = f"Bearer {Settings.reveal(self.settings.mcp_bearer_token)}"
-        authorized = constant_time_equal(authorization, expected_auth) and constant_time_equal(
+        auth_matches = constant_time_equal(authorization, expected_auth)
+        user_matches = not poke_user_id or constant_time_equal(
             poke_user_id, self.settings.allowed_poke_user_id or ""
         )
+        authorized = auth_matches and user_matches
         if authorized:
             await self.app(scope, receive, send)
             return

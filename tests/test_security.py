@@ -69,6 +69,20 @@ def test_authorized_mcp_endpoint_exposes_exact_tool_set(settings):
     }
 
 
+def test_mcp_allows_poke_followup_without_user_header(settings):
+    app = create_app(settings)
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp/",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={
+                "Authorization": "Bearer mcp-test",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+    assert response.status_code == 200
+
+
 def test_blocked_destination_is_structured_mcp_error_without_call(settings, packet):
     app = create_app(settings)
     context = packet.model_dump(mode="json")
