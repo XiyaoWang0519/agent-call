@@ -317,6 +317,15 @@ class CallService:
         call = await self.db.get_call(call_id)
         plan = await self.db.get_plan(call["plan_id"])
         packet = ContextPacket.model_validate(plan["context"])
+        conference = call.get("conference_sid") or call.get("conference_name")
+        try:
+            await self.twilio.unmute_participant(conference, call.get("twilio_ai_call_sid"))
+        except Exception:
+            logger.warning(
+                "failed to unmute agent participant before greeting call_id=%s",
+                call_id,
+                exc_info=True,
+            )
         if call["answer_handling"] == "voicemail":
             if await self.db.set_flag_once(call_id, "voicemail_sent"):
                 await self.realtime.create_voicemail(call_id, packet)
@@ -375,8 +384,16 @@ class CallService:
         elif event_type in {"response.done", "response.audio.done"}:
             call = await self.db.get_call(call_id)
             response = event.get("response") or {}
-            if response.get("status") in {"cancelled", "canceled"}:
+            status = response.get("status")
+            if status in {"cancelled", "canceled"}:
                 await self.db.update_call(call_id, interruption_observed=1)
+            elif status == "failed":
+                logger.error(
+                    "realtime response failed call_id=%s status_details=%s event=%s",
+                    call_id,
+                    response.get("status_details"),
+                    event,
+                )
             if call and call.get("voicemail_sent"):
                 self._spawn(
                     self.terminate_call(call_id, "voicemail_left"),
@@ -388,6 +405,7 @@ class CallService:
                 name=f"terminate:{call_id}:openai-terminal",
             )
         elif event_type == "error":
+            logger.error("realtime error event call_id=%s event=%s", call_id, event)
             self._spawn(
                 self.terminate_call(call_id, "openai_fatal_error"),
                 name=f"terminate:{call_id}:openai-error",

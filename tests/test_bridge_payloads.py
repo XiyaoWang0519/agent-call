@@ -110,10 +110,24 @@ async def test_function_output_precedes_manual_continuation(settings):
 class FakeParticipants:
     def __init__(self):
         self.creates: list[dict] = []
+        self.updates: list[dict] = []
 
     def create(self, **kwargs):
         self.creates.append(kwargs)
         return SimpleNamespace(call_sid=f"CA{len(self.creates):032d}", conference_sid="CF1")
+
+    def __call__(self, call_sid: str):
+        parent = self
+
+        class _Participant:
+            def update(self, **kwargs):
+                parent.updates.append({"call_sid": call_sid, **kwargs})
+                return SimpleNamespace(call_sid=call_sid, muted=kwargs.get("muted", False))
+
+            def delete(self):
+                return None
+
+        return _Participant()
 
 
 class FakeConference:
@@ -142,9 +156,18 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert agent["end_conference_on_exit"] is False
     assert agent["time_limit"] == 720
     assert agent["wait_url"] == ""
+    assert agent["early_media"] is False
+    assert agent["muted"] is False
     assert agent["to"].startswith("sip:proj_test@sip.api.openai.com;transport=tls?")
     assert "X-Plan-Id=plan_1" in agent["to"]
     assert "X-Bridge-Call-Id=call_1" in agent["to"]
+    assert agent["conference_status_callback_event"] == [
+        "start",
+        "end",
+        "join",
+        "leave",
+        "mute",
+    ]
 
     await bridge.create_callee_participant(**common, conference_sid_or_name="CF1", packet=packet)
     callee = client.conferences("CF1").participants.creates[0]
@@ -165,3 +188,8 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert owner["label"] == "owner"
     assert owner["end_conference_on_exit"] is False
     assert owner["timeout"] == 30
+
+    await bridge.unmute_participant("CF1", "CA" + "a" * 32)
+    assert client.conferences("CF1").participants.updates == [
+        {"call_sid": "CA" + "a" * 32, "muted": False}
+    ]

@@ -75,6 +75,7 @@ class FakeTwilio:
     def __init__(self):
         self.completed: list[str | None] = []
         self.removed: list[tuple[str | None, str | None]] = []
+        self.unmuted: list[tuple[str | None, str | None]] = []
         self.agent_creates = 0
         self.callee_creates = 0
         self.owner_creates = 0
@@ -96,6 +97,9 @@ class FakeTwilio:
 
     async def remove_participant(self, conference_sid_or_name, participant_call_sid) -> None:
         self.removed.append((conference_sid_or_name, participant_call_sid))
+
+    async def unmute_participant(self, conference_sid_or_name, participant_call_sid) -> None:
+        self.unmuted.append((conference_sid_or_name, participant_call_sid))
 
 
 class FakeRealtime:
