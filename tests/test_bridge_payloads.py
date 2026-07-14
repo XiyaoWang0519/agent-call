@@ -28,6 +28,11 @@ class FakeWebSocket:
         self.closed = True
 
 
+class FailingSendWebSocket(FakeWebSocket):
+    async def send(self, message: str) -> None:
+        raise RuntimeError("socket send failed")
+
+
 class StreamingFakeWebSocket(FakeWebSocket):
     def __init__(self, echo: dict):
         super().__init__()
@@ -86,6 +91,46 @@ async def test_opening_response_uses_session_context_without_a_script(settings):
             "response": {"output_modalities": ["audio"]},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_hook_runs_after_success_and_cannot_change_send_outcome(settings):
+    observed: list[tuple[str, str, int]] = []
+    websocket = FakeWebSocket()
+
+    async def hook(call_id: str, event: dict) -> None:
+        # The underlying socket write must already have completed before this callback.
+        observed.append((call_id, event["type"], len(websocket.messages)))
+        if event["type"] == "response.cancel":
+            raise RuntimeError("telemetry failed")
+
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+        on_send=hook,
+    )
+    bridge._runtime["call_1"] = RealtimeRuntime(
+        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+    )
+
+    await bridge.send("call_1", {"type": "response.create"})
+    await bridge.send("call_1", {"type": "response.cancel"})
+
+    assert observed == [
+        ("call_1", "response.create", 1),
+        ("call_1", "response.cancel", 2),
+    ]
+    assert len(websocket.messages) == 2
+
+    bridge._runtime["call_2"] = RealtimeRuntime(
+        call_id="call_2", openai_call_id="rtc_2", websocket=FailingSendWebSocket()
+    )
+    with pytest.raises(RuntimeError, match="socket send failed"):
+        await bridge.send("call_2", {"type": "response.create"})
+    assert all(call_id == "call_1" for call_id, _, _ in observed)
 
 
 @pytest.mark.asyncio

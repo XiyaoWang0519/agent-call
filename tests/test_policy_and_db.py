@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from app.db import Database, DeploymentLockedError
+from app.db import Database, DeploymentLockedError, LatencyMark, LatencyStage
 from app.models import CallState, EvidenceValue, PreparePhoneCallInput
 from app.policy import validate_context, validate_destination
 from app.settings import Settings
@@ -43,6 +43,62 @@ async def test_initialize_migrates_legacy_opening_column_and_state(settings, pac
     assert "greeting_sent" not in columns
     assert call["opening_sent"] == 1
     assert call["state"] == CallState.ACTIVE.value
+
+
+@pytest.mark.asyncio
+async def test_latency_events_are_migration_safe_idempotent_and_correlated(settings, packet):
+    db = Database(settings.database_path)
+    await db.initialize()
+    expires_at = datetime.now(UTC) + timedelta(minutes=10)
+    await db.create_plan(
+        "plan_latency",
+        packet.model_dump(mode="json"),
+        "Owner explicitly requested the call",
+        expires_at,
+    )
+    assert await db.claim_plan_and_create_call(
+        plan_id="plan_latency",
+        call_id="call_latency",
+        conference_name="conference_latency",
+        confirmation_text="Confirmed",
+    )
+
+    first = LatencyMark("2026-07-14T12:00:00+00:00", 100)
+    later = LatencyMark("2026-07-14T12:00:01+00:00", 200)
+    earliest = LatencyMark("2026-07-14T11:59:59+00:00", 50)
+    await db.record_latency_events(
+        "call_latency",
+        [
+            (LatencyStage.SIDEBAND_OPEN, first, ""),
+            (LatencyStage.TOOL_CALL_RECEIVED, first, "tool_1"),
+            (LatencyStage.TOOL_CALL_RECEIVED, later, "tool_2"),
+        ],
+    )
+    await db.record_latency_event(
+        "call_latency",
+        LatencyStage.SIDEBAND_OPEN,
+        later,
+    )
+    await db.record_latency_event(
+        "call_latency",
+        LatencyStage.SIDEBAND_OPEN,
+        earliest,
+    )
+
+    events = await db.get_latency_events("call_latency")
+    assert [(event["stage"], event["event_key"]) for event in events] == [
+        ("sideband_open", ""),
+        ("tool_call_received", "tool_1"),
+        ("tool_call_received", "tool_2"),
+    ]
+    assert events[0]["occurred_at"] == earliest.occurred_at
+    assert events[0]["monotonic_ns"] == earliest.monotonic_ns
+    assert len({event["clock_id"] for event in events}) == 1
+
+    # Existing databases receive this table through CREATE TABLE IF NOT EXISTS.
+    await db.initialize()
+    tables = {row["name"] for row in await db.fetch_all("SELECT name FROM sqlite_master")}
+    assert "call_latency_events" in tables
 
 
 @pytest.mark.parametrize(

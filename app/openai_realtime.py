@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 EventHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 OpenHandler = Callable[[str], Awaitable[None]]
 FatalHandler = Callable[[str, str], Awaitable[None]]
+SendHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -42,12 +43,14 @@ class RealtimeBridge:
         on_event: EventHandler,
         on_open: OpenHandler,
         on_fatal: FatalHandler,
+        on_send: SendHandler | None = None,
     ):
         self.settings = settings
         self.client = client
         self.on_event = on_event
         self.on_open = on_open
         self.on_fatal = on_fatal
+        self.on_send = on_send
         self._runtime: dict[str, RealtimeRuntime] = {}
 
     def build_accept_payload(self, packet: ContextPacket) -> AcceptPayload:
@@ -201,6 +204,17 @@ class RealtimeBridge:
             raise RuntimeError("sideband is not open")
         async with runtime.send_lock:
             await runtime.websocket.send(json.dumps(event))
+        if self.on_send is not None:
+            try:
+                await self.on_send(call_id, event)
+            except Exception:
+                # Telemetry must never turn a successfully sent Realtime event into a call failure.
+                logger.warning(
+                    "failed to record outbound Realtime event call_id=%s type=%s",
+                    call_id,
+                    event.get("type"),
+                    exc_info=True,
+                )
 
     async def _update_session(self, call_id: str, audio_input: dict[str, Any]) -> dict[str, Any]:
         runtime = self._runtime.get(call_id)

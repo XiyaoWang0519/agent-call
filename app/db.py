@@ -4,9 +4,13 @@ import asyncio
 import json
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
+from time import monotonic_ns
 from typing import Any
+from uuid import uuid4
 
 import aiosqlite
 
@@ -67,6 +71,20 @@ CREATE INDEX IF NOT EXISTS calls_state_idx ON calls(state);
 CREATE INDEX IF NOT EXISTS calls_twilio_ai_idx ON calls(twilio_ai_call_sid);
 CREATE INDEX IF NOT EXISTS calls_twilio_callee_idx ON calls(twilio_callee_call_sid);
 
+CREATE TABLE IF NOT EXISTS call_latency_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id TEXT NOT NULL REFERENCES calls(call_id),
+    stage TEXT NOT NULL,
+    event_key TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT NOT NULL,
+    monotonic_ns INTEGER NOT NULL,
+    clock_id TEXT NOT NULL,
+    UNIQUE(call_id, stage, event_key)
+);
+
+CREATE INDEX IF NOT EXISTS call_latency_events_call_idx
+    ON call_latency_events(call_id, id);
+
 CREATE TABLE IF NOT EXISTS transcripts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     call_id TEXT NOT NULL REFERENCES calls(call_id),
@@ -102,8 +120,55 @@ CREATE TABLE IF NOT EXISTS deployment_control (
 INSERT OR IGNORE INTO deployment_control (singleton, locked) VALUES (1, 0);
 """
 
+UPSERT_LATENCY_EVENT = """
+INSERT INTO call_latency_events
+    (call_id, stage, event_key, occurred_at, monotonic_ns, clock_id)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(call_id, stage, event_key) DO UPDATE SET
+    occurred_at=excluded.occurred_at,
+    monotonic_ns=excluded.monotonic_ns,
+    clock_id=excluded.clock_id
+WHERE
+    (
+        call_latency_events.clock_id=excluded.clock_id
+        AND excluded.monotonic_ns < call_latency_events.monotonic_ns
+    )
+    OR
+    (
+        call_latency_events.clock_id<>excluded.clock_id
+        AND excluded.occurred_at < call_latency_events.occurred_at
+    )
+"""
+
 
 DEPLOYMENT_LOCK_TTL = timedelta(minutes=15)
+
+
+class LatencyStage(StrEnum):
+    TWILIO_AGENT_REQUEST = "twilio_agent_request"
+    TWILIO_AGENT_CREATED = "twilio_agent_created"
+    OPENAI_ACCEPT_REQUEST = "openai_accept_request"
+    OPENAI_ACCEPT_COMPLETED = "openai_accept_completed"
+    SIDEBAND_OPEN = "sideband_open"
+    INITIAL_SESSION_ACK = "initial_session_ack"
+    TWILIO_CALLEE_REQUEST = "twilio_callee_request"
+    TWILIO_CALLEE_CREATED = "twilio_callee_created"
+    CALLEE_ANSWERED = "callee_answered"
+    FIRST_RESPONSE_CREATE = "first_response_create"
+    FIRST_ASSISTANT_TRANSCRIPT = "first_assistant_transcript"
+    FIRST_OPENAI_AUDIO_DELTA = "first_openai_audio_delta"
+    TOOL_CALL_RECEIVED = "tool_call_received"
+    TOOL_RESULT_SENT = "tool_result_sent"
+
+
+@dataclass(frozen=True, slots=True)
+class LatencyMark:
+    occurred_at: str
+    monotonic_ns: int
+
+    @classmethod
+    def now(cls) -> LatencyMark:
+        return cls(datetime.now(UTC).isoformat(), monotonic_ns())
 
 
 class DeploymentLockedError(RuntimeError):
@@ -125,6 +190,8 @@ class Database:
     def __init__(self, path: Path):
         self.path = path
         self._write_lock = asyncio.Lock()
+        # Monotonic values are comparable only when this process-local clock ID matches.
+        self._latency_clock_id = uuid4().hex
 
     async def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +403,48 @@ class Database:
             "UPDATE calls SET last_event_at=? WHERE call_id=?", (_iso_now(), call_id)
         )
 
+    async def record_latency_events(
+        self,
+        call_id: str,
+        events: Iterable[tuple[LatencyStage, LatencyMark, str]],
+    ) -> None:
+        rows = [
+            (
+                call_id,
+                stage.value,
+                event_key,
+                mark.occurred_at,
+                mark.monotonic_ns,
+                self._latency_clock_id,
+            )
+            for stage, mark, event_key in events
+        ]
+        if not rows:
+            return
+        async with self._write_lock, self.connection() as conn:
+            await conn.executemany(UPSERT_LATENCY_EVENT, rows)
+            await conn.commit()
+
+    async def record_latency_event(
+        self,
+        call_id: str,
+        stage: LatencyStage,
+        mark: LatencyMark | None = None,
+        *,
+        event_key: str = "",
+    ) -> None:
+        await self.record_latency_events(
+            call_id,
+            [(stage, mark or LatencyMark.now(), event_key)],
+        )
+
+    async def get_latency_events(self, call_id: str) -> list[dict[str, Any]]:
+        return await self.fetch_all(
+            """SELECT stage, event_key, occurred_at, monotonic_ns, clock_id
+               FROM call_latency_events WHERE call_id=? ORDER BY occurred_at, id""",
+            (call_id,),
+        )
+
     async def update_call(self, call_id: str, **values: Any) -> bool:
         if not values:
             return True
@@ -388,12 +497,32 @@ class Database:
             == 1
         )
 
-    async def increment_tool_calls(self, call_id: str) -> None:
-        await self.execute(
-            """UPDATE calls SET tool_call_count=tool_call_count+1, last_event_at=?
-               WHERE call_id=?""",
-            (_iso_now(), call_id),
-        )
+    async def increment_tool_calls(
+        self,
+        call_id: str,
+        *,
+        latency_mark: LatencyMark | None = None,
+        event_key: str = "",
+    ) -> None:
+        async with self._write_lock, self.connection() as conn:
+            await conn.execute(
+                """UPDATE calls SET tool_call_count=tool_call_count+1, last_event_at=?
+                   WHERE call_id=?""",
+                (_iso_now(), call_id),
+            )
+            if latency_mark is not None:
+                await conn.execute(
+                    UPSERT_LATENCY_EVENT,
+                    (
+                        call_id,
+                        LatencyStage.TOOL_CALL_RECEIVED.value,
+                        event_key,
+                        latency_mark.occurred_at,
+                        latency_mark.monotonic_ns,
+                        self._latency_clock_id,
+                    ),
+                )
+            await conn.commit()
 
     async def reset_termination_claim(self, call_id: str) -> None:
         await self.execute(

@@ -15,6 +15,7 @@ async def get_call(call_id: str, request: Request):
         raise HTTPException(status_code=404, detail="call not found") from exc
     row = await request.app.state.call_service.db.get_call(call_id)
     transcript = await request.app.state.call_service.db.get_transcript(call_id)
+    latency_events = await request.app.state.call_service.db.get_latency_events(call_id)
     audit_keys = {
         "openai_accept_status",
         "transcription_verified",
@@ -40,6 +41,7 @@ async def get_call(call_id: str, request: Request):
     return {
         **snapshot.model_dump(mode="json"),
         "canary_evidence": {key: row.get(key) for key in audit_keys},
+        "latency_events": latency_events,
         "transcript": [turn.model_dump(mode="json") for turn in transcript],
     }
 

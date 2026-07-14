@@ -9,7 +9,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from app.db import Database, DeploymentLockedError
+from app.db import Database, DeploymentLockedError, LatencyMark, LatencyStage
 from app.finalizer import Finalizer
 from app.models import (
     TERMINAL_STATES,
@@ -52,12 +52,14 @@ class CallService:
             on_event=self.handle_realtime_event,
             on_open=self.handle_sideband_open,
             on_fatal=self._handle_sideband_fatal,
+            on_send=self.handle_realtime_send,
         )
         self.finalizer = Finalizer(settings, db, self.openai)
         self._background: set[asyncio.Task[Any]] = set()
         self._owner_join_events: dict[str, asyncio.Event] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._active_response_ids: dict[str, str | None] = {}
+        self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
 
     def _spawn(self, coroutine, *, name: str) -> asyncio.Task[Any]:
@@ -65,6 +67,49 @@ class CallService:
         self._background.add(task)
         task.add_done_callback(self._background.discard)
         return task
+
+    async def _record_latency(
+        self,
+        call_id: str,
+        *events: tuple[LatencyStage, LatencyMark, str],
+    ) -> None:
+        try:
+            await self.db.record_latency_events(call_id, events)
+        except Exception:
+            # Losing telemetry is preferable to changing the outcome of a live call.
+            logger.warning(
+                "failed to persist call latency event call_id=%s", call_id, exc_info=True
+            )
+
+    def _queue_latency_batch(
+        self,
+        call_id: str,
+        *events: tuple[LatencyStage, LatencyMark, str],
+    ) -> None:
+        pending: list[tuple[LatencyStage, LatencyMark, str]] = []
+        for stage, mark, event_key in events:
+            key = (call_id, stage, event_key)
+            previous = self._queued_latency_events.get(key)
+            if previous is not None and previous.monotonic_ns <= mark.monotonic_ns:
+                continue
+            self._queued_latency_events[key] = mark
+            pending.append((stage, mark, event_key))
+        if not pending:
+            return
+        self._spawn(
+            self._record_latency(call_id, *pending),
+            name=f"latency:{call_id}:{pending[0][0].value}",
+        )
+
+    def _queue_latency(
+        self,
+        call_id: str,
+        stage: LatencyStage,
+        mark: LatencyMark,
+        *,
+        event_key: str = "",
+    ) -> None:
+        self._queue_latency_batch(call_id, (stage, mark, event_key))
 
     @staticmethod
     def _confirmation_summary(packet: ContextPacket) -> str:
@@ -165,19 +210,35 @@ class CallService:
                     {"code": "plan_unavailable", "message": "Plan is expired or already started"}
                 )
             )
+        agent_request = LatencyMark.now()
         try:
             participant = await self.twilio.create_agent_participant(
                 call_id=call_id,
                 plan_id=plan_id,
                 conference_name=conference_name,
             )
+        except Exception:
+            self._queue_latency_batch(
+                call_id,
+                (LatencyStage.TWILIO_AGENT_REQUEST, agent_request, ""),
+            )
+            logger.exception("failed to originate agent leg")
+            await self.terminate_call(call_id, "agent_leg_setup_failed")
+            raise
+        agent_created = LatencyMark.now()
+        self._queue_latency_batch(
+            call_id,
+            (LatencyStage.TWILIO_AGENT_REQUEST, agent_request, ""),
+            (LatencyStage.TWILIO_AGENT_CREATED, agent_created, ""),
+        )
+        try:
             await self.db.update_call(
                 call_id,
                 twilio_ai_call_sid=participant.call_sid,
                 conference_sid=participant.conference_sid,
             )
         except Exception:
-            logger.exception("failed to originate agent leg")
+            logger.exception("failed to persist originated agent leg")
             await self.terminate_call(call_id, "agent_leg_setup_failed")
             raise
         self._spawn(self._setup_deadline(call_id), name=f"setup-deadline:{call_id}")
@@ -205,25 +266,53 @@ class CallService:
         await self.db.update_call(call_id, openai_call_id=openai_call_id)
         plan = await self.db.get_plan(call["plan_id"])
         packet = ContextPacket.model_validate(plan["context"])
+        accept_request = LatencyMark.now()
         try:
             accept_status = await self.realtime.accept_and_connect(
                 call_id=call_id,
                 openai_call_id=openai_call_id,
                 packet=packet,
             )
+        except Exception:
+            self._queue_latency_batch(
+                call_id,
+                (LatencyStage.OPENAI_ACCEPT_REQUEST, accept_request, ""),
+            )
+            logger.exception("failed to accept OpenAI call")
+            await self.terminate_call(call_id, "openai_accept_failed")
+            raise
+        accept_completed = LatencyMark.now()
+        self._queue_latency_batch(
+            call_id,
+            (LatencyStage.OPENAI_ACCEPT_REQUEST, accept_request, ""),
+            (LatencyStage.OPENAI_ACCEPT_COMPLETED, accept_completed, ""),
+        )
+        try:
             await self.db.update_call(call_id, openai_accept_status=accept_status)
         except Exception:
+            logger.exception("failed to persist OpenAI accept status")
             await self.terminate_call(call_id, "openai_accept_failed")
             raise
         return call_id
 
     async def handle_sideband_open(self, call_id: str) -> None:
+        sideband_open = LatencyMark.now()
         await self.db.set_flag_once(call_id, "sideband_open")
         try:
             updated = await self.realtime.verify_initial_session(call_id)
         except Exception:
+            self._queue_latency_batch(
+                call_id,
+                (LatencyStage.SIDEBAND_OPEN, sideband_open, ""),
+            )
             await self.terminate_call(call_id, "initial_session_update_timeout")
             return
+        initial_session_ack = LatencyMark.now()
+        self._queue_latency_batch(
+            call_id,
+            (LatencyStage.SIDEBAND_OPEN, sideband_open, ""),
+            (LatencyStage.INITIAL_SESSION_ACK, initial_session_ack, ""),
+        )
         transcription_ok = self.realtime.expected_transcription_echoed(updated)
         vad_ok = self.realtime.expected_initial_vad_echoed(updated)
         await self.db.update_call(
@@ -242,6 +331,7 @@ class CallService:
         ):
             plan = await self.db.get_plan(call["plan_id"])
             packet = ContextPacket.model_validate(plan["context"])
+            callee_request = LatencyMark.now()
             try:
                 participant = await self.twilio.create_callee_participant(
                     call_id=call_id,
@@ -249,12 +339,28 @@ class CallService:
                     conference_sid_or_name=call.get("conference_sid") or call["conference_name"],
                     packet=packet,
                 )
+            except Exception:
+                self._queue_latency_batch(
+                    call_id,
+                    (LatencyStage.TWILIO_CALLEE_REQUEST, callee_request, ""),
+                )
+                logger.exception("failed to originate callee leg")
+                await self.terminate_call(call_id, "callee_leg_setup_failed")
+                return
+            callee_created = LatencyMark.now()
+            self._queue_latency_batch(
+                call_id,
+                (LatencyStage.TWILIO_CALLEE_REQUEST, callee_request, ""),
+                (LatencyStage.TWILIO_CALLEE_CREATED, callee_created, ""),
+            )
+            try:
                 await self.db.update_call(
                     call_id,
                     twilio_callee_call_sid=participant.call_sid,
                     conference_sid=participant.conference_sid or call.get("conference_sid"),
                 )
             except Exception:
+                logger.exception("failed to persist originated callee leg")
                 await self.terminate_call(call_id, "callee_leg_setup_failed")
                 return
         await self._check_activation_gate(call_id)
@@ -278,6 +384,7 @@ class CallService:
         await self._check_activation_gate(call_id)
 
     async def handle_conference_event(self, call_id: str, form: dict[str, str]) -> None:
+        received = LatencyMark.now()
         event = (form.get("StatusCallbackEvent") or form.get("ConferenceStatus") or "").lower()
         label = (form.get("ParticipantLabel") or form.get("Label") or "").lower()
         call_sid = form.get("CallSid") or form.get("ParticipantCallSid")
@@ -293,11 +400,18 @@ class CallService:
             await self.db.touch_call(call_id)
         elif event in {"participant-join", "join"}:
             if label == "callee" or (call_sid and call_sid == call.get("twilio_callee_call_sid")):
-                await self.db.set_flag_once(call_id, "callee_joined")
-                if not call.get("answered_at"):
-                    await self.db.update_call(call_id, answered_at=datetime.now(UTC).isoformat())
-                await self._start_opening_on_answer(call_id)
-                await self._check_activation_gate(call_id)
+                answered = received
+                try:
+                    await self.db.set_flag_once(call_id, "callee_joined")
+                    if not call.get("answered_at"):
+                        await self.db.update_call(call_id, answered_at=answered.occurred_at)
+                    await self._start_opening_on_answer(call_id)
+                    await self._check_activation_gate(call_id)
+                finally:
+                    self._queue_latency_batch(
+                        call_id,
+                        (LatencyStage.CALLEE_ANSWERED, answered, ""),
+                    )
             elif label == "owner":
                 self._owner_join_events.setdefault(call_id, asyncio.Event()).set()
         elif event in {"participant-leave", "leave"}:
@@ -309,16 +423,24 @@ class CallService:
             await self.db.touch_call(call_id)
 
     async def handle_participant_status(self, call_id: str, leg: str, form: dict[str, str]) -> None:
+        received = LatencyMark.now()
         status = (form.get("CallStatus") or "").lower()
         await self.db.touch_call(call_id)
         if leg == "callee" and status in {"in-progress", "answered"}:
             # The callee's answered status callback usually reaches us before the
             # conference participant-join event; whichever arrives first starts the
             # opening turn so the callee hears the model sooner.
-            if await self.db.set_flag_once(call_id, "callee_joined"):
-                await self.db.update_call(call_id, answered_at=datetime.now(UTC).isoformat())
-            await self._start_opening_on_answer(call_id)
-            await self._check_activation_gate(call_id)
+            answered = received
+            try:
+                if await self.db.set_flag_once(call_id, "callee_joined"):
+                    await self.db.update_call(call_id, answered_at=answered.occurred_at)
+                await self._start_opening_on_answer(call_id)
+                await self._check_activation_gate(call_id)
+            finally:
+                self._queue_latency_batch(
+                    call_id,
+                    (LatencyStage.CALLEE_ANSWERED, answered, ""),
+                )
         elif leg == "callee" and status in {"completed", "failed", "busy", "no-answer", "canceled"}:
             duration = int(form.get("CallDuration") or 0)
             reason = "callee_call_completed" if status == "completed" else f"callee_{status}"
@@ -419,9 +541,19 @@ class CallService:
             await self._start_opening_on_answer(call_id)
 
     async def handle_realtime_event(self, call_id: str, event: dict[str, Any]) -> None:
+        received = LatencyMark.now()
         event_type = event.get("type", "")
         event_id = event.get("event_id") or f"evt_{secrets.token_urlsafe(12)}"
         await self.db.touch_call(call_id)
+        if event_type in {
+            "response.output_audio_transcript.delta",
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.delta",
+            "response.audio_transcript.done",
+        }:
+            self._queue_latency(call_id, LatencyStage.FIRST_ASSISTANT_TRANSCRIPT, received)
+        elif event_type in {"response.output_audio.delta", "response.audio.delta"}:
+            self._queue_latency(call_id, LatencyStage.FIRST_OPENAI_AUDIO_DELTA, received)
         if event_type == "session.created":
             # Observational only. A SIP sideband attaches to an existing session and may
             # miss this startup event, so readiness is established by the explicit
@@ -450,7 +582,11 @@ class CallService:
                     source_event_id=event_id,
                 )
         elif event_type == "response.function_call_arguments.done":
-            await self.db.increment_tool_calls(call_id)
+            await self.db.increment_tool_calls(
+                call_id,
+                latency_mark=received,
+                event_key=str(event.get("call_id") or event_id),
+            )
             await self._handle_tool_call(call_id, event)
         elif event_type == "response.created":
             call = await self.db.get_call(call_id)
@@ -501,6 +637,21 @@ class CallService:
             self._spawn(
                 self.terminate_call(call_id, "openai_fatal_error"),
                 name=f"terminate:{call_id}:openai-error",
+            )
+
+    async def handle_realtime_send(self, call_id: str, event: dict[str, Any]) -> None:
+        sent = LatencyMark.now()
+        event_type = event.get("type")
+        if event_type == "response.create":
+            self._queue_latency(call_id, LatencyStage.FIRST_RESPONSE_CREATE, sent)
+            return
+        item = event.get("item") or {}
+        if event_type == "conversation.item.create" and item.get("type") == "function_call_output":
+            self._queue_latency(
+                call_id,
+                LatencyStage.TOOL_RESULT_SENT,
+                sent,
+                event_key=str(item.get("call_id") or "unknown"),
             )
 
     async def _handle_tool_call(self, call_id: str, event: dict[str, Any]) -> None:
@@ -739,6 +890,9 @@ class CallService:
             await self.finalizer.finalize(call_id)
         else:
             self._spawn(self.finalizer.finalize(call_id), name=f"finalize:{call_id}")
+        self._queued_latency_events = {
+            key: mark for key, mark in self._queued_latency_events.items() if key[0] != call_id
+        }
         return True
 
     async def get_snapshot(self, call_id: str) -> CallSnapshot:
