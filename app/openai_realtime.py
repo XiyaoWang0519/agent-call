@@ -83,7 +83,7 @@ class RealtimeBridge:
             audio={
                 "input": self._input_audio_config(create_response=False, interrupt_response=False),
                 "output": {
-                    "voice": "marin",
+                    "voice": "echo",
                     "speed": 1.0,
                 },
             },
