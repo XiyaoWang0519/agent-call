@@ -176,6 +176,49 @@ async def test_initialize_migrates_legacy_opening_column_and_state(database, pac
 
 
 @pytest.mark.asyncio
+async def test_initialize_migrates_xai_provider_columns_after_openai_rollback(database, packet):
+    db = database
+    await db.create_plan(
+        "plan_provider_rollback",
+        packet.model_dump(mode="json"),
+        "Owner explicitly requested the call",
+        datetime.now(UTC) + timedelta(minutes=10),
+    )
+    assert await db.claim_plan_and_create_call(
+        plan_id="plan_provider_rollback",
+        call_id="call_provider_rollback",
+        conference_name="conference_provider_rollback",
+        confirmation_text="Confirmed",
+    )
+    await db.update_call(
+        "call_provider_rollback",
+        openai_call_id="rtc_provider_rollback",
+        openai_accept_status=200,
+        semantic_vad_verified=1,
+    )
+
+    await db.execute("ALTER TABLE calls RENAME COLUMN openai_call_id TO xai_call_id")
+    await db.execute("ALTER TABLE calls RENAME COLUMN openai_accept_status TO xai_connect_status")
+    await db.execute("ALTER TABLE calls RENAME COLUMN semantic_vad_verified TO vad_verified")
+    # Match production after the first rolled-back startup partially recreated OpenAI columns.
+    await db.execute("ALTER TABLE calls ADD COLUMN openai_accept_status INTEGER")
+    await db.execute(
+        "ALTER TABLE calls ADD COLUMN semantic_vad_verified INTEGER NOT NULL DEFAULT 0"
+    )
+
+    await db.initialize()
+    await db.initialize()
+
+    columns = {row["name"] for row in await db.fetch_all("PRAGMA table_info(calls)")}
+    call = await db.get_call("call_provider_rollback")
+    assert "openai_call_id" in columns
+    assert "xai_call_id" not in columns
+    assert call["openai_call_id"] == "rtc_provider_rollback"
+    assert call["openai_accept_status"] == 200
+    assert call["semantic_vad_verified"] == 1
+
+
+@pytest.mark.asyncio
 async def test_latency_events_are_migration_safe_idempotent_and_correlated(database, packet):
     db = database
     expires_at = datetime.now(UTC) + timedelta(minutes=10)

@@ -252,6 +252,17 @@ class Database:
         await conn.executescript(SCHEMA)
         async with conn.execute("PRAGMA table_info(calls)") as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
+        for legacy_name, current_name in (
+            ("xai_call_id", "openai_call_id"),
+            ("xai_connect_status", "openai_accept_status"),
+            ("vad_verified", "semantic_vad_verified"),
+        ):
+            if legacy_name in existing and current_name not in existing:
+                await conn.execute(
+                    f"ALTER TABLE calls RENAME COLUMN {legacy_name} TO {current_name}"
+                )
+                existing.remove(legacy_name)
+                existing.add(current_name)
         if "greeting_sent" in existing and "opening_sent" not in existing:
             await conn.execute("ALTER TABLE calls RENAME COLUMN greeting_sent TO opening_sent")
             existing.remove("greeting_sent")
@@ -277,6 +288,21 @@ class Database:
         for name, definition in migrations.items():
             if name not in existing:
                 await conn.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
+                existing.add(name)
+        if "xai_call_id" in existing:
+            await conn.execute(
+                "UPDATE calls SET openai_call_id=COALESCE(openai_call_id, xai_call_id)"
+            )
+        if "xai_connect_status" in existing:
+            await conn.execute(
+                """UPDATE calls
+                   SET openai_accept_status=COALESCE(openai_accept_status, xai_connect_status)"""
+            )
+        if "vad_verified" in existing:
+            await conn.execute(
+                """UPDATE calls
+                   SET semantic_vad_verified=MAX(semantic_vad_verified, vad_verified)"""
+            )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS calls_twilio_owner_idx ON calls(twilio_owner_call_sid)"
         )
