@@ -145,7 +145,7 @@ async def test_setup_deadline_times_out_only_unactivated_calls(service, packet):
         packet,
         call_id="call_voicemail",
         state=CallState.ACTIVE,
-        openai_call_id="rtc_voicemail",
+        xai_call_id="rtc_voicemail",
     )
     await service.db.update_call(active_voicemail, voicemail_sent=1, opening_sent=0)
     service.settings.setup_deadline_seconds = 0

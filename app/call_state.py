@@ -30,11 +30,11 @@ from app.models import (
     StartPhoneCallOutput,
     VoiceEndCallRequest,
 )
-from app.openai_client import create_openai_client
-from app.openai_realtime import RealtimeBridge
 from app.policy import validate_context
 from app.settings import Settings
 from app.twilio_bridge import TwilioBridge
+from app.xai_client import create_xai_client
+from app.xai_realtime import RealtimeBridge
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS = 15 * 60
 CALL_ACTIVITY_TOMBSTONE_MAX = 4096
 OWNER_JOIN_TIMEOUT_SECONDS = 30
 # Over SIP, response.done marks the end of audio *generation*; playback to the phone lags
-# behind because OpenAI drains a server-side output buffer in real time. Termination after a
+# behind because xAI drains a server-side output buffer in real time. Termination after a
 # final spoken turn (voice-initiated end_call goodbye, voicemail) must wait for
 # output_audio_buffer.stopped or the callee hears the closing words cut off. The fallback
 # below bounds that wait in case the event is never delivered; it stays under the 15s
@@ -64,12 +64,12 @@ class CallService:
         db: Database,
         *,
         twilio: TwilioBridge | None = None,
-        openai: AsyncOpenAI | None = None,
+        xai: AsyncOpenAI | None = None,
     ):
         self.settings = settings
         self.db = db
-        self._owns_openai_client = openai is None
-        self.openai = openai if openai is not None else create_openai_client(settings)
+        self._owns_xai_client = xai is None
+        self.xai = xai if xai is not None else create_xai_client(settings)
         self.twilio = twilio or TwilioBridge(settings)
         self._latest_call_activity: dict[str, LatencyMark] = {}
         self._dirty_call_activity: dict[str, LatencyMark] = {}
@@ -77,14 +77,13 @@ class CallService:
         self._activity_tombstones: OrderedDict[str, int] = OrderedDict()
         self.realtime = RealtimeBridge(
             settings,
-            self.openai,
             on_event=self.handle_realtime_event,
             on_open=self.handle_sideband_open,
             on_fatal=self._handle_sideband_fatal,
             on_send=self.handle_realtime_send,
             on_activity=self._note_call_activity,
         )
-        self.finalizer = Finalizer(settings, db, self.openai)
+        self.finalizer = Finalizer(settings, db, self.xai)
         self._background: set[asyncio.Task[Any]] = set()
         self._must_finish_background: set[asyncio.Task[Any]] = set()
         self._conference_retry_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
@@ -434,9 +433,7 @@ class CallService:
         self._spawn(self._setup_deadline(call_id), name=f"setup-deadline:{call_id}")
         return StartPhoneCallOutput(call_id=call_id, state=CallState.PREWARMING)
 
-    async def handle_openai_incoming(
-        self, openai_call_id: str, sip_headers: list[dict[str, str]]
-    ) -> str:
+    async def handle_xai_incoming(self, xai_call_id: str, sip_headers: list[dict[str, str]]) -> str:
         headers = {item.get("name", "").lower(): item.get("value", "") for item in sip_headers}
         call_id = headers.get("x-bridge-call-id") or headers.get("x_bridge_call_id")
         plan_id = headers.get("x-plan-id") or headers.get("x_plan_id")
@@ -448,40 +445,40 @@ class CallService:
                     break
         call = await self.db.get_call(call_id) if call_id else None
         if call is None or (plan_id and call["plan_id"] != plan_id):
-            await self.realtime.reject(openai_call_id)
+            await self.realtime.reject(xai_call_id)
             raise LookupError("incoming SIP call could not be mapped to an approved plan")
-        if call.get("openai_call_id") and call["openai_call_id"] != openai_call_id:
-            await self.realtime.reject(openai_call_id)
-            raise RuntimeError("call already mapped to a different OpenAI call")
-        await self.db.update_call(call_id, openai_call_id=openai_call_id)
+        if call.get("xai_call_id") and call["xai_call_id"] != xai_call_id:
+            await self.realtime.reject(xai_call_id)
+            raise RuntimeError("call already mapped to a different XAI call")
+        await self.db.update_call(call_id, xai_call_id=xai_call_id)
         plan = await self.db.get_plan(call["plan_id"])
         packet = ContextPacket.model_validate(plan["context"])
         accept_request = LatencyMark.now()
         try:
-            accept_status = await self.realtime.accept_and_connect(
+            connect_status = await self.realtime.connect(
                 call_id=call_id,
-                openai_call_id=openai_call_id,
+                xai_call_id=xai_call_id,
                 packet=packet,
             )
         except Exception:
             self._queue_latency_batch(
                 call_id,
-                (LatencyStage.OPENAI_ACCEPT_REQUEST, accept_request, ""),
+                (LatencyStage.XAI_CONNECT_REQUEST, accept_request, ""),
             )
-            logger.exception("failed to accept OpenAI call")
-            await self.terminate_call(call_id, "openai_accept_failed")
+            logger.exception("failed to connect xAI call")
+            await self.terminate_call(call_id, "xai_connect_failed")
             raise
         accept_completed = LatencyMark.now()
         self._queue_latency_batch(
             call_id,
-            (LatencyStage.OPENAI_ACCEPT_REQUEST, accept_request, ""),
-            (LatencyStage.OPENAI_ACCEPT_COMPLETED, accept_completed, ""),
+            (LatencyStage.XAI_CONNECT_REQUEST, accept_request, ""),
+            (LatencyStage.XAI_CONNECT_COMPLETED, accept_completed, ""),
         )
         try:
-            await self.db.update_call(call_id, openai_accept_status=accept_status)
+            await self.db.update_call(call_id, xai_connect_status=connect_status)
         except Exception:
-            logger.exception("failed to persist OpenAI accept status")
-            await self.terminate_call(call_id, "openai_accept_failed")
+            logger.exception("failed to persist XAI connect status")
+            await self.terminate_call(call_id, "xai_connect_failed")
             raise
         return call_id
 
@@ -508,7 +505,7 @@ class CallService:
         await self.db.update_call(
             call_id,
             transcription_verified=int(transcription_ok),
-            semantic_vad_verified=int(vad_ok),
+            vad_verified=int(vad_ok),
         )
         if not transcription_ok or not vad_ok:
             await self.terminate_call(call_id, "transcription_config_mismatch")
@@ -692,7 +689,7 @@ class CallService:
             and call["callee_joined"]
             and call["amd_result"]
             and call["transcription_verified"]
-            and call["semantic_vad_verified"]
+            and call["vad_verified"]
         ):
             return
         if not await self.db.cas_state(call_id, CallState.PREWARMING, CallState.READY_TO_ACTIVATE):
@@ -715,7 +712,7 @@ class CallService:
                 call["sideband_open"]
                 and call["callee_joined"]
                 and call["transcription_verified"]
-                and call["semantic_vad_verified"]
+                and call["vad_verified"]
             ):
                 return
             if call.get("answer_handling") == "voicemail":
@@ -798,7 +795,7 @@ class CallService:
         }:
             self._queue_latency(call_id, LatencyStage.FIRST_ASSISTANT_TRANSCRIPT, received)
         elif event_type in {"response.output_audio.delta", "response.audio.delta"}:
-            self._queue_latency(call_id, LatencyStage.FIRST_OPENAI_AUDIO_DELTA, received)
+            self._queue_latency(call_id, LatencyStage.FIRST_XAI_AUDIO_DELTA, received)
         if event_type == "session.created":
             # Observational only. A SIP sideband attaches to an existing session and may
             # miss this startup event, so readiness is established by the explicit
@@ -876,8 +873,8 @@ class CallService:
             self._handle_output_audio_drained(call_id, event)
         elif event_type in {"session.ended", "call.ended"}:
             self._spawn(
-                self.terminate_call(call_id, "openai_terminal_event"),
-                name=f"terminate:{call_id}:openai-terminal",
+                self.terminate_call(call_id, "xai_terminal_event"),
+                name=f"terminate:{call_id}:xai-terminal",
             )
         elif event_type == "error":
             error = event.get("error") or {}
@@ -887,8 +884,8 @@ class CallService:
                 return
             logger.error("realtime error event call_id=%s event=%s", call_id, event)
             self._spawn(
-                self.terminate_call(call_id, "openai_fatal_error"),
-                name=f"terminate:{call_id}:openai-error",
+                self.terminate_call(call_id, "xai_fatal_error"),
+                name=f"terminate:{call_id}:xai-error",
             )
 
     async def handle_realtime_send(self, call_id: str, event: dict[str, Any]) -> None:
@@ -1120,7 +1117,7 @@ class CallService:
         """Delay a post-final-response termination until SIP playback finishes.
 
         response.done only means generation finished; hanging up right away truncates the
-        closing words still buffered on OpenAI's side. output_audio_buffer.stopped (or
+        closing words still buffered on xAI's side. output_audio_buffer.stopped (or
         .cleared, when the callee interrupts) marks actual end of playback. A bounded
         fallback still terminates if neither event is ever delivered.
         """
@@ -1955,7 +1952,7 @@ class CallService:
         self._voice_end_pending.pop(call_id, None)
         self._audio_drain_terminations.pop(call_id, None)
         self._active_response_ids.pop(call_id, None)
-        media_tasks = [self.realtime.hangup(call.get("openai_call_id"))]
+        media_tasks = [self.realtime.hangup(call.get("xai_call_id"))]
         if not preserve_conference:
             media_tasks.append(
                 self.twilio.complete_conference(
@@ -2017,7 +2014,7 @@ class CallService:
             "voicemail_left",
             "owner_request",
             "voice_model_end_call",
-            "openai_terminal_event",
+            "xai_terminal_event",
         }:
             terminal = CallState.COMPLETED
         else:
@@ -2312,7 +2309,7 @@ class CallService:
                     call["call_id"],
                     exc_info=(type(result), result, result.__traceback__),
                 )
-        await self.realtime.close_all()
+        await self.realtime.close()
         # Drain to a stable empty set. Cancellation handlers may register shielded
         # compensation after the first snapshot; must-finish tasks are awaited rather
         # than cancelled, while the stopping gate turns all new ordinary work into no-ops.
@@ -2326,8 +2323,8 @@ class CallService:
             await asyncio.gather(*pending, return_exceptions=True)
             await asyncio.sleep(0)
         await self._flush_call_activity()
-        if self._owns_openai_client:
-            await self.openai.close()
+        if self._owns_xai_client:
+            await self.xai.close()
 
     async def _watchdog(self) -> None:
         while True:

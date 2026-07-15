@@ -28,10 +28,10 @@ logger = logging.getLogger(__name__)
 
 
 class Finalizer:
-    def __init__(self, settings: Settings, db: Database, openai: AsyncOpenAI):
+    def __init__(self, settings: Settings, db: Database, xai: AsyncOpenAI):
         self.settings = settings
         self.db = db
-        self.openai = openai
+        self.xai = xai
         self._locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
@@ -79,7 +79,7 @@ class Finalizer:
         call_status = self._call_status(call["state"])
         fatal_reasons = {
             "sideband_error",
-            "openai_fatal_error",
+            "xai_fatal_error",
             "transcription_config_mismatch",
             "session_update_timeout",
             "session_update_mismatch",
@@ -164,17 +164,25 @@ class Finalizer:
         }
         for attempt in range(2):
             try:
-                response = await self.openai.responses.parse(
+                response = await self.xai.responses.create(
                     model=self.settings.extractor_model,
+                    reasoning={"effort": "low"},
                     instructions=EXTRACTOR_INSTRUCTIONS,
                     input=json.dumps(payload, ensure_ascii=False),
-                    text_format=ExtractedCallResult,
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": "extracted_call_result",
+                            "strict": True,
+                            "schema": ExtractedCallResult.model_json_schema(),
+                        }
+                    },
                     store=False,
-                    timeout=self.settings.openai_extraction_timeout_seconds,
+                    timeout=self.settings.xai_extraction_timeout_seconds,
                 )
-                parsed = response.output_parsed
-                if parsed is None:
-                    raise ValueError("extractor returned no parsed output")
+                if not response.output_text:
+                    raise ValueError("extractor returned no output text")
+                parsed = ExtractedCallResult.model_validate_json(response.output_text)
                 for group in (
                     parsed.commitments,
                     parsed.confirmation_numbers,

@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 from twilio.base.exceptions import TwilioRestException
 
-from app.openai_realtime import RealtimeBridge, RealtimeRuntime
 from app.twilio_bridge import TwilioBridge
+from app.xai_realtime import RealtimeBridge, RealtimeRuntime
 
 
 async def _noop(*args, **kwargs) -> None:
@@ -101,7 +101,7 @@ async def test_opening_response_uses_session_context_without_a_script(settings):
     )
     websocket = FakeWebSocket()
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
 
     await bridge.create_opening("call_1")
@@ -134,7 +134,7 @@ async def test_send_hook_runs_after_success_and_cannot_change_send_outcome(setti
         on_send=hook,
     )
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
 
     await bridge.send("call_1", {"type": "response.create"})
@@ -147,7 +147,7 @@ async def test_send_hook_runs_after_success_and_cannot_change_send_outcome(setti
     assert len(websocket.messages) == 2
 
     bridge._runtime["call_2"] = RealtimeRuntime(
-        call_id="call_2", openai_call_id="rtc_2", websocket=FailingSendWebSocket()
+        call_id="call_2", xai_call_id="rtc_2", websocket=FailingSendWebSocket()
     )
     with pytest.raises(RuntimeError, match="socket send failed"):
         await bridge.send("call_2", {"type": "response.create"})
@@ -165,7 +165,7 @@ async def test_voicemail_prompt_does_not_script_identity_or_callback_wording(set
     )
     websocket = FakeWebSocket()
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
 
     await bridge.create_voicemail("call_1")
@@ -186,7 +186,7 @@ def test_session_prompt_leaves_opening_identity_and_wording_to_poke(settings, pa
             on_open=_noop,
             on_fatal=_noop,
         )
-        .build_accept_payload(packet)
+        .build_session_config(packet)
         .instructions
     )
 
@@ -199,22 +199,17 @@ def test_session_prompt_leaves_opening_identity_and_wording_to_poke(settings, pa
 
 @pytest.mark.asyncio
 async def test_sideband_receives_initial_update_echo_while_open_handler_waits(
-    settings, monkeypatch
+    settings, packet, monkeypatch
 ):
     echoed = {
         "type": "session.updated",
         "session": {
             "audio": {
                 "input": {
-                    "transcription": {"model": "gpt-4o-mini-transcribe"},
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": False,
-                        "interrupt_response": False,
-                    },
+                    "transcription": {"model": "grok-transcribe"},
                 }
-            }
+            },
+            "turn_detection": None,
         },
     }
     websocket = StreamingFakeWebSocket(echoed)
@@ -238,10 +233,10 @@ async def test_sideband_receives_initial_update_echo_while_open_handler_waits(
         on_open=on_open,
         on_fatal=on_fatal,
     )
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1")
+    runtime = RealtimeRuntime(call_id="call_1", xai_call_id="rtc_1", packet=packet)
     bridge._runtime["call_1"] = runtime
     monkeypatch.setattr(
-        "app.openai_realtime.websockets.connect", lambda *args, **kwargs: FakeConnection(websocket)
+        "app.xai_realtime.websockets.connect", lambda *args, **kwargs: FakeConnection(websocket)
     )
 
     await asyncio.wait_for(bridge._run(runtime), timeout=1)
@@ -260,7 +255,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
         on_fatal=_noop,
     )
     websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
+    runtime = RealtimeRuntime(call_id="call_1", xai_call_id="rtc_1", websocket=websocket)
     bridge._runtime["call_1"] = runtime
 
     pending = asyncio.create_task(bridge.enable_automatic_responses("call_1"))
@@ -268,15 +263,10 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
     echoed = {
         "type": "session.updated",
         "session": {
-            "audio": {
-                "input": {
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": True,
-                        "interrupt_response": True,
-                    }
-                }
+            "turn_detection": {
+                "type": "server_vad",
+                "silence_duration_ms": 700,
+                "prefix_padding_ms": 333,
             }
         },
     }
@@ -286,20 +276,10 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
         {
             "type": "session.update",
             "session": {
-                "type": "realtime",
-                "audio": {
-                    "input": {
-                        # Transcription must be re-asserted: session.update replaces the
-                        # nested audio.input object, so omitting it would drop callee
-                        # transcription for the rest of the call.
-                        "transcription": {"model": "gpt-4o-mini-transcribe"},
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "auto",
-                            "create_response": True,
-                            "interrupt_response": True,
-                        },
-                    }
+                "turn_detection": {
+                    "type": "server_vad",
+                    "silence_duration_ms": 700,
+                    "prefix_padding_ms": 333,
                 },
             },
         }
@@ -307,7 +287,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
 
 
 @pytest.mark.asyncio
-async def test_initial_session_update_reasserts_safe_audio_gate(settings):
+async def test_initial_session_update_reasserts_safe_audio_gate(settings, packet):
     bridge = RealtimeBridge(
         settings,
         SimpleNamespace(),
@@ -316,7 +296,9 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
         on_fatal=_noop,
     )
     websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
+    runtime = RealtimeRuntime(
+        call_id="call_1", xai_call_id="rtc_1", packet=packet, websocket=websocket
+    )
     bridge._runtime["call_1"] = runtime
 
     pending = asyncio.create_task(bridge.verify_initial_session("call_1"))
@@ -326,39 +308,21 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
         "session": {
             "audio": {
                 "input": {
-                    "transcription": {"model": "gpt-4o-mini-transcribe"},
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": False,
-                        "interrupt_response": False,
-                    },
+                    "transcription": {"model": "grok-transcribe"},
                 }
-            }
+            },
+            "turn_detection": None,
         },
     }
     runtime.update_waiter.set_result(echoed)
 
     assert await pending == echoed
-    assert websocket.messages == [
-        {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "audio": {
-                    "input": {
-                        "transcription": {"model": "gpt-4o-mini-transcribe"},
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "auto",
-                            "create_response": False,
-                            "interrupt_response": False,
-                        },
-                    }
-                },
-            },
-        }
-    ]
+    sent = websocket.messages[0]
+    assert sent["type"] == "session.update"
+    assert sent["session"]["voice"] == "eve"
+    assert sent["session"]["reasoning"] == {"effort": "high"}
+    assert sent["session"]["audio"]["input"]["transcription"] == {"model": "grok-transcribe"}
+    assert sent["session"]["turn_detection"] is None
 
 
 @pytest.mark.asyncio
@@ -372,7 +336,7 @@ async def test_function_output_precedes_manual_continuation(settings):
     )
     websocket = FakeWebSocket()
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
     await bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
     assert websocket.messages == [
@@ -399,7 +363,7 @@ async def test_tool_output_and_continuation_cannot_be_interleaved(settings):
     )
     websocket = BlockingFirstSendWebSocket()
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
 
     tool_result = asyncio.create_task(
@@ -437,7 +401,7 @@ async def test_cancellation_after_first_frame_finishes_atomic_tool_pair(settings
     )
     websocket = BlockingFirstSendWebSocket()
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
 
     tool_result = asyncio.create_task(
@@ -475,7 +439,7 @@ async def test_cancelled_single_frame_waiting_for_lock_is_never_sent(settings):
         on_fatal=_noop,
     )
     websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
+    runtime = RealtimeRuntime(call_id="call_1", xai_call_id="rtc_1", websocket=websocket)
     bridge._runtime["call_1"] = runtime
     await runtime.send_lock.acquire()
 
@@ -501,7 +465,7 @@ async def test_cancelled_tool_pair_waiting_for_lock_is_never_sent(settings):
         on_fatal=_noop,
     )
     websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
+    runtime = RealtimeRuntime(call_id="call_1", xai_call_id="rtc_1", websocket=websocket)
     bridge._runtime["call_1"] = runtime
     await runtime.send_lock.acquire()
 
@@ -534,7 +498,7 @@ async def test_partial_tool_result_send_notifies_only_successful_frames(settings
     )
     websocket = SecondSendFailsWebSocket()
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
 
     with pytest.raises(RuntimeError, match="second socket send failed"):
@@ -555,7 +519,7 @@ async def test_terminal_function_output_creates_a_dedicated_closing_response(set
     )
     websocket = FakeWebSocket()
     bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
+        call_id="call_1", xai_call_id="rtc_1", websocket=websocket
     )
     await bridge.send_tool_result(
         "call_1",
@@ -634,7 +598,9 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert agent["early_media"] is False
     assert agent["muted"] is False
     assert agent["jitter_buffer_size"] == "small"
-    assert agent["to"].startswith("sip:proj_test@sip.api.openai.com;transport=tls?")
+    assert agent["to"].startswith("sip:+14155550199@sip.voice.x.ai;transport=tls?")
+    assert agent["sip_auth_username"] == "poke-call-test"
+    assert agent["sip_auth_password"] == "sip-test-password"
     assert "X-Plan-Id=plan_1" in agent["to"]
     assert "X-Bridge-Call-Id=call_1" in agent["to"]
     assert agent["conference_status_callback_event"] == [

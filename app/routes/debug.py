@@ -17,9 +17,9 @@ async def get_call(call_id: str, request: Request):
     transcript = await request.app.state.call_service.db.get_transcript(call_id)
     latency_events = await request.app.state.call_service.db.get_latency_events(call_id)
     audit_keys = {
-        "openai_accept_status",
+        "xai_connect_status",
         "transcription_verified",
-        "semantic_vad_verified",
+        "vad_verified",
         "sideband_open",
         "callee_joined",
         "callee_dialed",
@@ -36,7 +36,7 @@ async def get_call(call_id: str, request: Request):
         "twilio_ai_call_sid",
         "twilio_callee_call_sid",
         "conference_sid",
-        "openai_call_id",
+        "xai_call_id",
     }
     return {
         **snapshot.model_dump(mode="json"),

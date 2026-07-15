@@ -8,10 +8,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 import websockets
-from openai import APIStatusError, AsyncOpenAI
 
-from app.models import AcceptPayload, ContextPacket
+from app.models import ContextPacket, RealtimeSessionConfig
 from app.prompts import realtime_instructions
 from app.settings import Settings
 
@@ -43,9 +43,11 @@ class RealtimeEventQueueOverflow(RuntimeError):
 @dataclass(slots=True)
 class RealtimeRuntime:
     call_id: str
-    openai_call_id: str
+    xai_call_id: str
+    packet: ContextPacket | None = None
     websocket: Any | None = None
     task: asyncio.Task[None] | None = None
+    connected_waiter: asyncio.Future[int] | None = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     update_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     update_waiter: asyncio.Future[dict[str, Any]] | None = None
@@ -63,7 +65,7 @@ class RealtimeBridge:
     def __init__(
         self,
         settings: Settings,
-        client: AsyncOpenAI,
+        client: Any | None = None,
         *,
         on_event: EventHandler,
         on_open: OpenHandler,
@@ -72,7 +74,14 @@ class RealtimeBridge:
         on_activity: ActivityHandler | None = None,
     ):
         self.settings = settings
-        self.client = client
+        self.client = client or httpx.AsyncClient(
+            base_url="https://api.x.ai/v1",
+            headers={"Authorization": f"Bearer {Settings.reveal(settings.xai_api_key)}"},
+            timeout=httpx.Timeout(
+                settings.xai_http_timeout_seconds,
+                connect=settings.xai_connect_timeout_seconds,
+            ),
+        )
         self.on_event = on_event
         self.on_open = on_open
         self.on_fatal = on_fatal
@@ -80,15 +89,12 @@ class RealtimeBridge:
         self.on_activity = on_activity
         self._runtime: dict[str, RealtimeRuntime] = {}
 
-    def build_accept_payload(self, packet: ContextPacket) -> AcceptPayload:
-        return AcceptPayload(
+    def build_session_config(self, packet: ContextPacket) -> RealtimeSessionConfig:
+        return RealtimeSessionConfig(
             instructions=realtime_instructions(packet),
             audio={
-                "input": self._input_audio_config(create_response=False, interrupt_response=False),
-                "output": {
-                    "voice": "cedar",
-                    "speed": 1.0,
-                },
+                "input": {"transcription": self._transcription_config()},
+                "output": {"speed": 1.0},
             },
             tools=[
                 {
@@ -150,52 +156,34 @@ class RealtimeBridge:
             ],
         )
 
-    async def accept_and_connect(
+    async def connect(
         self,
         *,
         call_id: str,
-        openai_call_id: str,
+        xai_call_id: str,
         packet: ContextPacket,
     ) -> int:
-        payload = self.build_accept_payload(packet)
-        try:
-            async with asyncio.timeout(self.settings.openai_http_timeout_seconds):
-                raw = await self.client.realtime.calls.with_raw_response.accept(
-                    openai_call_id, **payload.model_dump(exclude_none=True)
-                )
-        except APIStatusError as exc:
-            logger.error(
-                "OpenAI call accept response call_id=%s status=%s headers=%s body=%r",
-                call_id,
-                exc.status_code,
-                dict(exc.response.headers),
-                exc.response.text,
-            )
-            raise
-        except TimeoutError:
-            logger.error(
-                "OpenAI call accept timed out call_id=%s timeout=%ss",
-                call_id,
-                self.settings.openai_http_timeout_seconds,
-            )
-            raise
-        # The accept response is bodyless today; log every non-secret response field.
-        logger.info(
-            "OpenAI call accept response call_id=%s status=%s headers=%s body=%r",
-            call_id,
-            raw.status_code,
-            dict(raw.headers),
-            raw.text,
-        )
-        if raw.status_code < 200 or raw.status_code >= 300:
-            raise RuntimeError(f"OpenAI accept failed with HTTP {raw.status_code}")
-        runtime = RealtimeRuntime(call_id=call_id, openai_call_id=openai_call_id)
+        runtime = RealtimeRuntime(call_id=call_id, xai_call_id=xai_call_id, packet=packet)
+        runtime.connected_waiter = asyncio.get_running_loop().create_future()
         self._runtime[call_id] = runtime
         runtime.task = asyncio.create_task(self._run(runtime), name=f"sideband:{call_id}")
-        return raw.status_code
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(runtime.connected_waiter),
+                timeout=self.settings.xai_connect_timeout_seconds,
+            )
+        except BaseException:
+            if runtime.task and not runtime.task.done():
+                runtime.task.cancel()
+                await asyncio.gather(runtime.task, return_exceptions=True)
+            self._runtime.pop(call_id, None)
+            raise
 
     async def _run(self, runtime: RealtimeRuntime) -> None:
-        url = f"wss://api.openai.com/v1/realtime?call_id={runtime.openai_call_id}"
+        url = (
+            "wss://api.x.ai/v1/realtime"
+            f"?call_id={runtime.xai_call_id}&model={self.settings.realtime_model}"
+        )
         receiver: asyncio.Task[None] | None = None
         dispatcher: asyncio.Task[None] | None = None
         open_task: asyncio.Task[None] | None = None
@@ -203,12 +191,14 @@ class RealtimeBridge:
             async with websockets.connect(
                 url,
                 additional_headers={
-                    "Authorization": f"Bearer {Settings.reveal(self.settings.openai_api_key)}"
+                    "Authorization": f"Bearer {Settings.reveal(self.settings.xai_api_key)}"
                 },
-                open_timeout=10,
+                open_timeout=self.settings.xai_connect_timeout_seconds,
                 close_timeout=2,
             ) as websocket:
                 runtime.websocket = websocket
+                if runtime.connected_waiter and not runtime.connected_waiter.done():
+                    runtime.connected_waiter.set_result(101)
                 # A runtime is single-use today, but resetting here makes the lifecycle explicit
                 # and prevents stale queued events if that ever changes.
                 runtime.event_queue = asyncio.Queue(maxsize=REALTIME_EVENT_QUEUE_MAXSIZE)
@@ -257,6 +247,8 @@ class RealtimeBridge:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if runtime.connected_waiter and not runtime.connected_waiter.done():
+                runtime.connected_waiter.set_exception(exc)
             if not runtime.closing:
                 logger.exception("Realtime sideband failed for %s", runtime.call_id)
                 await self.on_fatal(runtime.call_id, f"sideband_error:{type(exc).__name__}")
@@ -438,7 +430,7 @@ class RealtimeBridge:
                     exc_info=True,
                 )
 
-    async def _update_session(self, call_id: str, audio_input: dict[str, Any]) -> dict[str, Any]:
+    async def _update_session(self, call_id: str, session: dict[str, Any]) -> dict[str, Any]:
         runtime = self._runtime.get(call_id)
         if runtime is None:
             raise RuntimeError("sideband runtime missing")
@@ -449,10 +441,7 @@ class RealtimeBridge:
                 call_id,
                 {
                     "type": "session.update",
-                    "session": {
-                        "type": "realtime",
-                        "audio": {"input": audio_input},
-                    },
+                    "session": session,
                 },
             )
             try:
@@ -461,39 +450,27 @@ class RealtimeBridge:
                 runtime.update_waiter = None
 
     def _transcription_config(self) -> dict[str, Any]:
-        transcription: dict[str, Any] = {"model": self.settings.input_transcription_model}
-        if self.settings.input_transcription_model == "gpt-realtime-whisper":
-            if self.settings.input_transcription_delay:
-                transcription["delay"] = self.settings.input_transcription_delay
-        return transcription
-
-    def _input_audio_config(
-        self, *, create_response: bool, interrupt_response: bool
-    ) -> dict[str, Any]:
-        # Do not specify audio.format: SIP media negotiates G.711 with Twilio, and
-        # explicitly overriding it can silence RTP. Always re-assert transcription
-        # alongside turn_detection: session.update replaces the nested audio.input
-        # object, so a turn_detection-only update would drop input transcription.
-        return {
-            "transcription": self._transcription_config(),
-            "turn_detection": {
-                "type": "semantic_vad",
-                "eagerness": self.settings.semantic_vad_eagerness,
-                "create_response": create_response,
-                "interrupt_response": interrupt_response,
-            },
-        }
+        return {"model": self.settings.input_transcription_model}
 
     async def verify_initial_session(self, call_id: str) -> dict[str, Any]:
-        return await self._update_session(
-            call_id,
-            self._input_audio_config(create_response=False, interrupt_response=False),
-        )
+        runtime = self._runtime.get(call_id)
+        if runtime is None:
+            raise RuntimeError("sideband runtime missing")
+        if runtime.packet is None:
+            raise RuntimeError("sideband runtime is missing approved call context")
+        config = self.build_session_config(runtime.packet)
+        return await self._update_session(call_id, config.model_dump(exclude_none=False))
 
     async def enable_automatic_responses(self, call_id: str) -> dict[str, Any]:
         return await self._update_session(
             call_id,
-            self._input_audio_config(create_response=True, interrupt_response=True),
+            {
+                "turn_detection": {
+                    "type": "server_vad",
+                    "silence_duration_ms": self.settings.server_vad_silence_duration_ms,
+                    "prefix_padding_ms": self.settings.server_vad_prefix_padding_ms,
+                }
+            },
         )
 
     async def create_opening(self, call_id: str) -> None:
@@ -555,26 +532,25 @@ class RealtimeBridge:
             events.append(continuation)
         await self._send_batch(call_id, events)
 
-    async def hangup(self, openai_call_id: str | None) -> None:
-        if not openai_call_id:
+    async def hangup(self, xai_call_id: str | None) -> None:
+        if not xai_call_id:
             return
         try:
-            await self.client.realtime.calls.hangup(openai_call_id)
-        except Exception as exc:
-            status = getattr(exc, "status_code", None)
-            if status in {404, 409, 410, 422}:
+            response = await self.client.post(f"/realtime/calls/{xai_call_id}/hangup")
+            if response.status_code in {404, 409, 410, 422}:
+                return
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {404, 409, 410, 422}:
                 return
             raise
 
-    async def reject(self, openai_call_id: str) -> None:
+    async def reject(self, xai_call_id: str) -> None:
+        # xAI currently exposes hangup rather than a separate SIP reject endpoint.
         try:
-            # The live API defaults to SIP 603 (Decline) when status_code is omitted.
-            await self.client.realtime.calls.reject(openai_call_id)
-        except Exception as exc:
-            status = getattr(exc, "status_code", None)
-            if status in {404, 409, 410, 422}:
-                return
-            logger.warning("failed to reject unmapped SIP call", exc_info=True)
+            await self.hangup(xai_call_id)
+        except Exception:
+            logger.warning("failed to hang up unmapped xAI SIP call", exc_info=True)
 
     async def drain_and_close(self, call_id: str) -> None:
         runtime = self._runtime.get(call_id)
@@ -695,25 +671,19 @@ class RealtimeBridge:
     def expected_transcription_echoed(self, event: dict[str, Any]) -> bool:
         session = event.get("session", {})
         transcription = session.get("audio", {}).get("input", {}).get("transcription") or {}
-        if transcription.get("model") != self.settings.input_transcription_model:
-            return False
-        expected_delay = self.settings.input_transcription_delay
-        return expected_delay is None or transcription.get("delay") == expected_delay
+        return transcription.get("model") == self.settings.input_transcription_model
 
     def expected_initial_vad_echoed(self, event: dict[str, Any]) -> bool:
-        turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
-        return (
-            turn.get("type") == "semantic_vad"
-            and turn.get("eagerness") == self.settings.semantic_vad_eagerness
-            and turn.get("create_response") is False
-            and turn.get("interrupt_response") is False
-        )
+        return event.get("session", {}).get("turn_detection") is None
 
     def activation_update_confirmed(self, event: dict[str, Any]) -> bool:
-        turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
+        turn = event.get("session", {}).get("turn_detection") or {}
         return (
-            turn.get("type") == "semantic_vad"
-            and turn.get("eagerness") == self.settings.semantic_vad_eagerness
-            and turn.get("create_response") is True
-            and turn.get("interrupt_response") is True
+            turn.get("type") == "server_vad"
+            and turn.get("silence_duration_ms") == self.settings.server_vad_silence_duration_ms
+            and turn.get("prefix_padding_ms") == self.settings.server_vad_prefix_padding_ms
         )
+
+    async def close(self) -> None:
+        await self.close_all()
+        await self.client.aclose()

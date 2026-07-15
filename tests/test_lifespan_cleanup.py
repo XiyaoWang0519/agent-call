@@ -91,7 +91,7 @@ async def test_app_lifespan_cancellation_from_cleanup_step_propagates_and_runs_r
         async def close(self) -> None:
             attempts.append("openai")
 
-    monkeypatch.setattr("app.main.create_openai_client", lambda _: ClosingClient())
+    monkeypatch.setattr("app.main.create_xai_client", lambda _: ClosingClient())
     monkeypatch.setattr("app.main.CallService", CancelledStopService)
     application = create_app(settings)
 
@@ -128,7 +128,7 @@ async def test_app_lifespan_cancellation_during_body_propagates_and_runs_cleanup
         async def close(self) -> None:
             attempts.append("openai")
 
-    monkeypatch.setattr("app.main.create_openai_client", lambda _: ClosingClient())
+    monkeypatch.setattr("app.main.create_xai_client", lambda _: ClosingClient())
     monkeypatch.setattr("app.main.CallService", Service)
     application = create_app(settings)
 

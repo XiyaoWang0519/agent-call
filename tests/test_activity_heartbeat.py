@@ -303,7 +303,7 @@ async def test_activity_tombstones_are_bounded_expire_and_safely_reform(
             packet,
             call_id=call_id,
             state=CallState.COMPLETED,
-            openai_call_id=f"rtc_tombstone_{index}",
+            xai_call_id=f"rtc_tombstone_{index}",
         )
         service._tombstone_call_activity(call_id)
         clock[0] += 1

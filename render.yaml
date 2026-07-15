@@ -15,18 +15,22 @@ services:
       - key: ALLOWED_COUNTRY_CODES
         value: +1
       - key: INPUT_TRANSCRIPTION_MODEL
-        value: gpt-4o-mini-transcribe
+        value: grok-transcribe
+      - key: REALTIME_MODEL
+        value: grok-voice-think-fast-1.0
       - key: EXTRACTOR_MODEL
-        value: gpt-5.4-nano-2026-03-17
-      - key: MINI_MODELS_ENABLED
-        value: "false"
+        value: grok-4.3
       - key: POKE_PUSH_ENABLED
         value: "false"
-      - key: OPENAI_API_KEY
+      - key: XAI_API_KEY
         sync: false
-      - key: OPENAI_WEBHOOK_SECRET
+      - key: XAI_WEBHOOK_SECRET
         sync: false
-      - key: OPENAI_PROJECT_ID
+      - key: XAI_SIP_PHONE_NUMBER
+        sync: false
+      - key: XAI_SIP_AUTH_USERNAME
+        sync: false
+      - key: XAI_SIP_AUTH_PASSWORD
         sync: false
       - key: TWILIO_ACCOUNT_SID
         sync: false

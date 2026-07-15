@@ -189,32 +189,19 @@ class TranscriptTurn(BaseModel):
 class InputTranscription(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str = Field(min_length=1)
-    delay: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
-
-
-class SemanticVad(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["semantic_vad"] = "semantic_vad"
-    eagerness: Literal["low", "medium", "high", "auto"] = "auto"
-    create_response: bool
-    interrupt_response: bool
+    model: Literal["grok-transcribe"] = "grok-transcribe"
 
 
 class RealtimeAudioInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # Do not set audio format for SIP: OpenAI negotiates G.711 with the carrier.
-    # Explicit format values have been observed to clobber PCMU into PCM and silence the leg.
+    # xAI negotiates the SIP codec with Twilio, so no explicit format is needed here.
     transcription: InputTranscription
-    turn_detection: SemanticVad
 
 
 class RealtimeAudioOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    voice: Literal["cedar"] = "cedar"
     speed: float = Field(default=1.0, ge=0.25, le=1.5)
 
 
@@ -234,20 +221,14 @@ class RealtimeFunctionTool(BaseModel):
     parameters: dict[str, Any]
 
 
-class AcceptPayload(BaseModel):
+class RealtimeSessionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["realtime"] = "realtime"
-    model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
-    reasoning: dict[str, Literal["low"]] = Field(default_factory=lambda: {"effort": "low"})
-    output_modalities: list[Literal["audio"]] = Field(default_factory=lambda: ["audio"])
-    max_output_tokens: int = Field(default=300, ge=1, le=4096)
-    parallel_tool_calls: Literal[False] = False
-    tool_choice: Literal["auto"] = "auto"
-    # Writes Realtime session activity to the OpenAI Traces dashboard.
-    tracing: Literal["auto"] = "auto"
+    voice: Literal["eve"] = "eve"
+    reasoning: dict[str, Literal["high"]] = Field(default_factory=lambda: {"effort": "high"})
     instructions: str
     audio: RealtimeAudio
+    turn_detection: None = None
     tools: list[RealtimeFunctionTool]
 
 

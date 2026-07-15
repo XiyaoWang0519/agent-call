@@ -41,10 +41,10 @@ CREATE TABLE IF NOT EXISTS calls (
     twilio_ai_call_sid TEXT,
     twilio_callee_call_sid TEXT,
     twilio_owner_call_sid TEXT,
-    openai_call_id TEXT UNIQUE,
-    openai_accept_status INTEGER,
+    xai_call_id TEXT UNIQUE,
+    xai_connect_status INTEGER,
     transcription_verified INTEGER NOT NULL DEFAULT 0,
-    semantic_vad_verified INTEGER NOT NULL DEFAULT 0,
+    vad_verified INTEGER NOT NULL DEFAULT 0,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
     tool_continuation_observed INTEGER NOT NULL DEFAULT 0,
     interruption_observed INTEGER NOT NULL DEFAULT 0,
@@ -154,8 +154,8 @@ TRANSFER_ELIGIBLE_STATES = ("prewarming", "ready_to_activate", "activating", "ac
 class LatencyStage(StrEnum):
     TWILIO_AGENT_REQUEST = "twilio_agent_request"
     TWILIO_AGENT_CREATED = "twilio_agent_created"
-    OPENAI_ACCEPT_REQUEST = "openai_accept_request"
-    OPENAI_ACCEPT_COMPLETED = "openai_accept_completed"
+    XAI_CONNECT_REQUEST = "xai_connect_request"
+    XAI_CONNECT_COMPLETED = "xai_connect_completed"
     SIDEBAND_OPEN = "sideband_open"
     INITIAL_SESSION_ACK = "initial_session_ack"
     TWILIO_CALLEE_REQUEST = "twilio_callee_request"
@@ -163,7 +163,7 @@ class LatencyStage(StrEnum):
     CALLEE_ANSWERED = "callee_answered"
     FIRST_RESPONSE_CREATE = "first_response_create"
     FIRST_ASSISTANT_TRANSCRIPT = "first_assistant_transcript"
-    FIRST_OPENAI_AUDIO_DELTA = "first_openai_audio_delta"
+    FIRST_XAI_AUDIO_DELTA = "first_xai_audio_delta"
     TOOL_CALL_RECEIVED = "tool_call_received"
     TOOL_RESULT_SENT = "tool_result_sent"
 
@@ -252,6 +252,15 @@ class Database:
         await conn.executescript(SCHEMA)
         async with conn.execute("PRAGMA table_info(calls)") as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
+        for old_name, new_name in (
+            ("openai_call_id", "xai_call_id"),
+            ("openai_accept_status", "xai_connect_status"),
+            ("semantic_vad_verified", "vad_verified"),
+        ):
+            if old_name in existing and new_name not in existing:
+                await conn.execute(f"ALTER TABLE calls RENAME COLUMN {old_name} TO {new_name}")
+                existing.remove(old_name)
+                existing.add(new_name)
         if "greeting_sent" in existing and "opening_sent" not in existing:
             await conn.execute("ALTER TABLE calls RENAME COLUMN greeting_sent TO opening_sent")
             existing.remove("greeting_sent")
@@ -264,9 +273,10 @@ class Database:
             ),
         )
         migrations = {
-            "openai_accept_status": "INTEGER",
+            "xai_call_id": "TEXT",
+            "xai_connect_status": "INTEGER",
             "transcription_verified": "INTEGER NOT NULL DEFAULT 0",
-            "semantic_vad_verified": "INTEGER NOT NULL DEFAULT 0",
+            "vad_verified": "INTEGER NOT NULL DEFAULT 0",
             "tool_call_count": "INTEGER NOT NULL DEFAULT 0",
             "tool_continuation_observed": "INTEGER NOT NULL DEFAULT 0",
             "interruption_observed": "INTEGER NOT NULL DEFAULT 0",
@@ -279,6 +289,9 @@ class Database:
                 await conn.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS calls_twilio_owner_idx ON calls(twilio_owner_call_sid)"
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS calls_xai_call_idx ON calls(xai_call_id)"
         )
         await conn.commit()
 
@@ -478,8 +491,8 @@ class Database:
     async def get_call(self, call_id: str) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM calls WHERE call_id=?", (call_id,))
 
-    async def get_call_by_openai_id(self, openai_call_id: str) -> dict[str, Any] | None:
-        return await self.fetch_one("SELECT * FROM calls WHERE openai_call_id=?", (openai_call_id,))
+    async def get_call_by_xai_id(self, xai_call_id: str) -> dict[str, Any] | None:
+        return await self.fetch_one("SELECT * FROM calls WHERE xai_call_id=?", (xai_call_id,))
 
     async def get_call_by_twilio_sid(self, sid: str) -> dict[str, Any] | None:
         return await self.fetch_one(

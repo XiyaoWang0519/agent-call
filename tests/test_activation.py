@@ -27,7 +27,7 @@ async def test_callee_is_not_dialed_until_accept_and_sideband_open(service, pack
     assert service._test_twilio.agent_creates == 1
     assert service._test_twilio.callee_creates == 0
 
-    mapped = await service.handle_openai_incoming(
+    mapped = await service.handle_xai_incoming(
         "rtc_incoming",
         [
             {"name": "X-Plan-Id", "value": prepared.plan_id},
@@ -46,8 +46,8 @@ async def test_callee_is_not_dialed_until_accept_and_sideband_open(service, pack
     assert [event["stage"] for event in latency] == [
         "twilio_agent_request",
         "twilio_agent_created",
-        "openai_accept_request",
-        "openai_accept_completed",
+        "xai_connect_request",
+        "xai_connect_completed",
         "sideband_open",
         "initial_session_ack",
         "twilio_callee_request",
@@ -63,7 +63,7 @@ async def test_callee_is_not_dialed_until_accept_and_sideband_open(service, pack
 @pytest.mark.asyncio
 async def test_unmapped_incoming_sip_call_is_explicitly_rejected(service):
     with pytest.raises(LookupError):
-        await service.handle_openai_incoming(
+        await service.handle_xai_incoming(
             "rtc_unknown",
             [
                 {"name": "X-Plan-Id", "value": "plan_unknown"},
@@ -76,16 +76,14 @@ async def test_unmapped_incoming_sip_call_is_explicitly_rejected(service):
 @pytest.mark.asyncio
 async def test_initial_session_update_mismatch_terminates_before_dialing(service, packet):
     call_id = await seed_call(service.db, packet)
-    await service.db.update_call(
-        call_id, transcription_verified=0, semantic_vad_verified=0, callee_dialed=0
-    )
+    await service.db.update_call(call_id, transcription_verified=0, vad_verified=0, callee_dialed=0)
     service._test_realtime.initial_update_event["session"]["audio"]["input"]["transcription"][
         "model"
     ] = "unexpected-model"
     await service.handle_sideband_open(call_id)
     call = await service.db.get_call(call_id)
     assert call["transcription_verified"] == 0
-    assert call["semantic_vad_verified"] == 1
+    assert call["vad_verified"] == 1
     assert call["state"] == CallState.FAILED.value
     assert call["termination_reason"] == "transcription_config_mismatch"
     assert service._test_twilio.callee_creates == 0
@@ -99,7 +97,7 @@ async def test_missing_session_created_activates_from_explicit_session_update(se
         sideband_open=1,
         callee_joined=1,
         transcription_verified=0,
-        semantic_vad_verified=0,
+        vad_verified=0,
     )
     await service.handle_amd(call_id, "human")
     assert (await service.db.get_call(call_id))["state"] == CallState.PREWARMING.value
@@ -262,9 +260,7 @@ async def test_conference_start_alone_does_not_mark_callee_joined(service, packe
 @pytest.mark.asyncio
 async def test_session_update_must_echo_both_flags(service, packet):
     call_id = await seed_call(service.db, packet)
-    service._test_realtime.update_event["session"]["audio"]["input"]["turn_detection"][
-        "interrupt_response"
-    ] = False
+    service._test_realtime.update_event["session"]["turn_detection"]["silence_duration_ms"] = 701
     await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
     await service.handle_amd(call_id, "human")
     assert (await service.db.get_call(call_id))["state"] == CallState.FAILED.value
@@ -386,7 +382,7 @@ async def test_latency_stages_capture_answer_first_output_and_tool_turnaround(se
     by_stage = {event["stage"]: event for event in events}
     assert {
         "callee_answered",
-        "first_openai_audio_delta",
+        "first_xai_audio_delta",
         "first_assistant_transcript",
         "tool_call_received",
         "tool_result_sent",
@@ -812,7 +808,7 @@ async def test_late_voicemail_amd_cancels_opening_before_response_created(servic
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     assert service._test_realtime.events == [("opening", call_id)]
 
-    # AMD can classify the callee before OpenAI acknowledges the opening response.create.
+    # AMD can classify the callee before xAI acknowledges the opening response.create.
     await service.handle_amd(call_id, "machine_end_beep")
 
     assert service._test_realtime.events == [
