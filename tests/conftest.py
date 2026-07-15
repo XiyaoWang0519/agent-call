@@ -26,11 +26,11 @@ from app.twilio_bridge import ParticipantInfo
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(
-        xai_api_key=SecretStr("xai-test"),
-        xai_webhook_secret=SecretStr("whsec_" + base64.b64encode(b"test webhook secret").decode()),
-        xai_sip_phone_number="+14155550199",
-        xai_sip_auth_username="poke-call-test",
-        xai_sip_auth_password=SecretStr("sip-test-password"),
+        openai_api_key=SecretStr("sk-test"),
+        openai_webhook_secret=SecretStr(
+            "whsec_" + base64.b64encode(b"test webhook secret").decode()
+        ),
+        openai_project_id="proj_test",
         twilio_account_sid="AC" + "1" * 32,
         twilio_auth_token=SecretStr("twilio-test"),
         twilio_caller_id="+14155550199",
@@ -133,10 +133,15 @@ class FakeRealtime:
         self.update_event = {
             "type": "session.updated",
             "session": {
-                "turn_detection": {
-                    "type": "server_vad",
-                    "silence_duration_ms": 700,
-                    "prefix_padding_ms": 333,
+                "audio": {
+                    "input": {
+                        "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "auto",
+                            "create_response": True,
+                            "interrupt_response": True,
+                        }
+                    }
                 }
             },
         }
@@ -145,10 +150,15 @@ class FakeRealtime:
             "session": {
                 "audio": {
                     "input": {
-                        "transcription": {"model": "grok-transcribe"},
+                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "auto",
+                            "create_response": False,
+                            "interrupt_response": False,
+                        },
                     }
-                },
-                "turn_detection": None,
+                }
             },
         }
 
@@ -160,16 +170,19 @@ class FakeRealtime:
         self.events.append(("session.update", call_id))
         return self.update_event
 
-    async def connect(self, *, call_id: str, xai_call_id: str, packet: ContextPacket) -> int:
-        self.accepts.append((call_id, xai_call_id))
-        return 101
+    async def accept_and_connect(
+        self, *, call_id: str, openai_call_id: str, packet: ContextPacket
+    ) -> int:
+        self.accepts.append((call_id, openai_call_id))
+        return 200
 
     def activation_update_confirmed(self, event):
-        turn = event["session"]["turn_detection"]
+        turn = event["session"]["audio"]["input"]["turn_detection"]
         return (
-            turn["type"] == "server_vad"
-            and turn["silence_duration_ms"] == 700
-            and turn["prefix_padding_ms"] == 333
+            turn["type"] == "semantic_vad"
+            and turn["eagerness"] == "auto"
+            and turn["create_response"] is True
+            and turn["interrupt_response"] is True
         )
 
     async def create_opening(self, call_id: str) -> None:
@@ -181,19 +194,16 @@ class FakeRealtime:
     async def create_voicemail(self, call_id: str) -> None:
         self.events.append(("voicemail", call_id))
 
-    async def hangup(self, xai_call_id: str | None) -> None:
-        self.hangups.append(xai_call_id)
+    async def hangup(self, openai_call_id: str | None) -> None:
+        self.hangups.append(openai_call_id)
 
-    async def reject(self, xai_call_id: str) -> None:
-        self.rejects.append(xai_call_id)
+    async def reject(self, openai_call_id: str) -> None:
+        self.rejects.append(openai_call_id)
 
     async def drain_and_close(self, call_id: str) -> None:
         self.closed.append(call_id)
 
     async def close_all(self) -> None:
-        self.close_all_calls += 1
-
-    async def close(self) -> None:
         self.close_all_calls += 1
 
     async def send_tool_result(
@@ -214,11 +224,17 @@ class FakeRealtime:
         transcription = (
             event.get("session", {}).get("audio", {}).get("input", {}).get("transcription", {})
         )
-        return transcription.get("model") == "grok-transcribe"
+        return transcription.get("model") == "gpt-4o-mini-transcribe"
 
     @staticmethod
     def expected_initial_vad_echoed(event) -> bool:
-        return event.get("session", {}).get("turn_detection") is None
+        turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
+        return (
+            turn.get("type") == "semantic_vad"
+            and turn.get("eagerness") == "auto"
+            and turn.get("create_response") is False
+            and turn.get("interrupt_response") is False
+        )
 
 
 class FakeFinalizer:
@@ -257,7 +273,7 @@ async def seed_call(
     *,
     call_id: str = "call_test",
     state: CallState = CallState.PREWARMING,
-    xai_call_id: str = "rtc_test",
+    openai_call_id: str = "rtc_test",
 ) -> str:
     plan_id = f"plan_{call_id}"
     await db.create_plan(
@@ -282,9 +298,9 @@ async def seed_call(
         conference_sid="CF" + "a" * 32,
         twilio_ai_call_sid="CA" + "a" * 32,
         twilio_callee_call_sid="CA" + "b" * 32,
-        xai_call_id=xai_call_id,
+        openai_call_id=openai_call_id,
         transcription_verified=1,
-        vad_verified=1,
+        semantic_vad_verified=1,
         callee_joined=int(state != CallState.PREWARMING),
     )
     return call_id
@@ -296,7 +312,7 @@ async def service(settings: Settings):
     await db.initialize()
     twilio = FakeTwilio()
     placeholder_openai = SimpleNamespace()
-    svc = CallService(settings, db, twilio=twilio, xai=placeholder_openai)
+    svc = CallService(settings, db, twilio=twilio, openai=placeholder_openai)
     realtime = FakeRealtime()
     finalizer = FakeFinalizer(db)
     svc.realtime = realtime

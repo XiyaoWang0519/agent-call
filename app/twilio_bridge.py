@@ -40,7 +40,7 @@ class TwilioBridge:
         self, *, call_id: str, plan_id: str, conference_name: str
     ) -> ParticipantInfo:
         custom = urlencode({"X-Plan-Id": plan_id, "X-Bridge-Call-Id": call_id})
-        sip_uri = f"sip:{self.settings.xai_sip_phone_number}@sip.voice.x.ai;transport=tls?{custom}"
+        sip_uri = f"sip:{self.settings.openai_project_id}@sip.api.openai.com;transport=tls?{custom}"
 
         def create():
             return self.client.conferences(conference_name).participants.create(
@@ -52,13 +52,11 @@ class TwilioBridge:
                 time_limit=720,
                 wait_url="",
                 beep="false",
-                # Match Twilio's xAI SIP conference pattern: avoid early media
+                # Match Twilio's OpenAI SIP conference pattern: avoid early media
                 # while the agent is alone on hold before the callee joins.
                 early_media=False,
                 muted=False,
                 jitter_buffer_size="small",
-                sip_auth_username=self.settings.xai_sip_auth_username,
-                sip_auth_password=Settings.reveal(self.settings.xai_sip_auth_password),
                 status_callback=self._callback(
                     "/webhooks/twilio/participant-status",
                     call_id=call_id,
@@ -195,7 +193,7 @@ class TwilioBridge:
         """Force-unmute a participant after conference start.
 
         Twilio mutes participants that join with start_conference_on_enter=False
-        until the conference starts. Explicit unmute ensures the xAI SIP leg
+        until the conference starts. Explicit unmute ensures the OpenAI SIP leg
         can inject TTS into the mix even if the automatic unmute races activation.
         """
         if not conference_sid_or_name or not participant_call_sid:

@@ -8,10 +8,10 @@ import pytest
 from app.call_state import CallService
 from app.db import Database
 from app.main import create_app
+from app.openai_client import create_openai_client
+from app.openai_realtime import RealtimeBridge
 from app.settings import Settings
 from app.twilio_bridge import TwilioBridge
-from app.xai_client import create_xai_client
-from app.xai_realtime import RealtimeBridge
 
 
 def _leaf_exceptions(error: BaseException) -> list[BaseException]:
@@ -60,7 +60,7 @@ def test_twilio_http_timeout_is_configurable(settings, monkeypatch):
     assert observed["timeout"] == 12
 
 
-def test_xai_client_has_bounded_timeouts_and_no_sdk_retries(settings, monkeypatch):
+def test_openai_client_has_bounded_timeouts_and_no_sdk_retries(settings, monkeypatch):
     observed: dict[str, object] = {}
     transport = object()
 
@@ -72,10 +72,10 @@ def test_xai_client_has_bounded_timeouts_and_no_sdk_retries(settings, monkeypatc
         observed["client_options"] = kwargs
         return SimpleNamespace()
 
-    monkeypatch.setattr("app.xai_client.httpx.AsyncClient", fake_http_client)
-    monkeypatch.setattr("app.xai_client.AsyncOpenAI", fake_openai)
+    monkeypatch.setattr("app.openai_client.httpx.AsyncClient", fake_http_client)
+    monkeypatch.setattr("app.openai_client.AsyncOpenAI", fake_openai)
 
-    create_xai_client(settings)
+    create_openai_client(settings)
 
     client_options = observed["client_options"]
     timeout = client_options["timeout"]
@@ -84,36 +84,35 @@ def test_xai_client_has_bounded_timeouts_and_no_sdk_retries(settings, monkeypatc
     assert timeout.write == 10.0
     assert timeout.pool == 10.0
     assert client_options["max_retries"] == 0
-    assert client_options["base_url"] == "https://api.x.ai/v1"
     assert client_options["http_client"] is transport
     assert observed["transport_options"]["limits"].keepalive_expiry == 60
 
 
-def test_xai_control_timeouts_are_configurable(settings, monkeypatch):
+def test_openai_control_timeouts_are_configurable(settings, monkeypatch):
     values = settings.model_dump()
-    values["xai_connect_timeout_seconds"] = 4
-    values["xai_http_timeout_seconds"] = 20
+    values["openai_connect_timeout_seconds"] = 4
+    values["openai_http_timeout_seconds"] = 20
     configured = Settings(**values)
     observed: dict[str, object] = {}
     monkeypatch.setattr(
-        "app.xai_client.httpx.AsyncClient",
+        "app.openai_client.httpx.AsyncClient",
         lambda **kwargs: observed.update(transport_options=kwargs) or object(),
     )
     monkeypatch.setattr(
-        "app.xai_client.AsyncOpenAI",
+        "app.openai_client.AsyncOpenAI",
         lambda **kwargs: observed.update(kwargs) or SimpleNamespace(),
     )
 
-    create_xai_client(configured)
+    create_openai_client(configured)
 
     timeout = observed["timeout"]
     assert timeout.connect == 4
     assert timeout.read == 20
 
 
-def test_xai_keepalive_expiry_is_configurable(settings, monkeypatch):
+def test_openai_keepalive_expiry_is_configurable(settings, monkeypatch):
     values = settings.model_dump()
-    values["xai_keepalive_expiry_seconds"] = 90
+    values["openai_keepalive_expiry_seconds"] = 90
     configured = Settings(**values)
     observed: dict[str, object] = {}
     transport = object()
@@ -126,10 +125,10 @@ def test_xai_keepalive_expiry_is_configurable(settings, monkeypatch):
         observed["client_options"] = kwargs
         return SimpleNamespace()
 
-    monkeypatch.setattr("app.xai_client.httpx.AsyncClient", fake_http_client)
-    monkeypatch.setattr("app.xai_client.AsyncOpenAI", fake_openai)
+    monkeypatch.setattr("app.openai_client.httpx.AsyncClient", fake_http_client)
+    monkeypatch.setattr("app.openai_client.AsyncOpenAI", fake_openai)
 
-    create_xai_client(configured)
+    create_openai_client(configured)
 
     transport_options = observed["transport_options"]
     assert transport_options["limits"].keepalive_expiry == 90
@@ -142,53 +141,54 @@ def test_xai_keepalive_expiry_is_configurable(settings, monkeypatch):
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("xai_connect_timeout_seconds", 0),
-        ("xai_http_timeout_seconds", 61),
-        ("xai_keepalive_expiry_seconds", 4),
-        ("xai_extraction_timeout_seconds", 121),
+        ("openai_connect_timeout_seconds", 0),
+        ("openai_http_timeout_seconds", 61),
+        ("openai_keepalive_expiry_seconds", 4),
+        ("openai_extraction_timeout_seconds", 121),
     ],
 )
-def test_xai_transport_settings_are_bounded(settings, field, value):
+def test_openai_transport_settings_are_bounded(settings, field, value):
     values = settings.model_dump()
     values[field] = value
     with pytest.raises(ValueError):
         Settings(**values)
 
 
-def test_xai_connect_timeout_cannot_exceed_request_timeout(settings):
+def test_openai_connect_timeout_cannot_exceed_request_timeout(settings):
     values = settings.model_dump()
-    values["xai_connect_timeout_seconds"] = 11
-    values["xai_http_timeout_seconds"] = 10
+    values["openai_connect_timeout_seconds"] = 11
+    values["openai_http_timeout_seconds"] = 10
     with pytest.raises(ValueError, match="cannot exceed"):
         Settings(**values)
 
 
 @pytest.mark.asyncio
-async def test_realtime_connect_has_a_total_wall_clock_deadline(settings, packet, monkeypatch):
-    settings.xai_connect_timeout_seconds = 0.005
-    settings.xai_http_timeout_seconds = 0.01
+async def test_realtime_accept_has_a_total_wall_clock_deadline(settings, packet):
+    settings.openai_connect_timeout_seconds = 0.005
+    settings.openai_http_timeout_seconds = 0.01
 
-    class HangingConnection:
-        async def __aenter__(self):
-            await asyncio.Event().wait()
+    async def hanging_accept(*args, **kwargs):
+        await asyncio.Event().wait()
 
-        async def __aexit__(self, *args):
-            return None
-
-    monkeypatch.setattr(
-        "app.xai_realtime.websockets.connect", lambda *args, **kwargs: HangingConnection()
+    client = SimpleNamespace(
+        realtime=SimpleNamespace(
+            calls=SimpleNamespace(
+                with_raw_response=SimpleNamespace(accept=hanging_accept),
+            )
+        )
     )
     bridge = RealtimeBridge(
         settings,
+        client,
         on_event=lambda *args: None,
         on_open=lambda *args: None,
         on_fatal=lambda *args: None,
     )
 
     with pytest.raises(TimeoutError):
-        await bridge.connect(
+        await bridge.accept_and_connect(
             call_id="call_1",
-            xai_call_id="rtc_1",
+            openai_call_id="rtc_1",
             packet=packet,
         )
 
@@ -201,7 +201,7 @@ async def test_call_service_closes_only_an_internally_created_openai_client(sett
         owned.closed = True
 
     owned.close = close
-    monkeypatch.setattr("app.call_state.create_xai_client", lambda _: owned)
+    monkeypatch.setattr("app.call_state.create_openai_client", lambda _: owned)
     db = Database(settings.database_path)
 
     service = CallService(settings, db, twilio=SimpleNamespace())
@@ -214,7 +214,7 @@ async def test_call_service_closes_only_an_internally_created_openai_client(sett
         injected.closed = True
 
     injected.close = close_injected
-    service = CallService(settings, db, twilio=SimpleNamespace(), xai=injected)
+    service = CallService(settings, db, twilio=SimpleNamespace(), openai=injected)
     await service.stop()
     assert injected.closed is False
 
@@ -242,7 +242,7 @@ async def test_app_lifespan_closes_openai_when_service_shutdown_fails(settings, 
         async def stop(self) -> None:
             raise RuntimeError("stop failed")
 
-    monkeypatch.setattr("app.main.create_xai_client", lambda _: client)
+    monkeypatch.setattr("app.main.create_openai_client", lambda _: client)
     monkeypatch.setattr("app.main.CallService", FailingStopService)
     application = create_app(settings)
 
@@ -276,7 +276,7 @@ async def test_app_lifespan_closes_database_when_openai_shutdown_fails(settings,
         async def stop(self) -> None:
             pass
 
-    monkeypatch.setattr("app.main.create_xai_client", lambda _: FailingCloseClient())
+    monkeypatch.setattr("app.main.create_openai_client", lambda _: FailingCloseClient())
     monkeypatch.setattr("app.main.CallService", Service)
     application = create_app(settings)
 
@@ -303,7 +303,7 @@ async def test_app_lifespan_closes_database_when_openai_client_creation_fails(
         raise RuntimeError("openai client creation failed")
 
     monkeypatch.setattr("app.main.Database", create_database)
-    monkeypatch.setattr("app.main.create_xai_client", fail_client_creation)
+    monkeypatch.setattr("app.main.create_openai_client", fail_client_creation)
     application = create_app(settings)
 
     with pytest.raises(RuntimeError, match="openai client creation failed"):
@@ -346,7 +346,7 @@ async def test_app_lifespan_aggregates_all_cleanup_failures(settings, monkeypatc
             raise RuntimeError("service stop failed")
 
     monkeypatch.setattr("app.main.Database", FailingCloseDatabase)
-    monkeypatch.setattr("app.main.create_xai_client", lambda _: FailingCloseClient())
+    monkeypatch.setattr("app.main.create_openai_client", lambda _: FailingCloseClient())
     monkeypatch.setattr("app.main.CallService", FailingStopService)
     monkeypatch.setattr(
         "app.main.register_tools", lambda _mcp, get_service: service_getters.append(get_service)
@@ -399,7 +399,7 @@ async def test_app_lifespan_preserves_body_error_with_cleanup_failures(settings,
             raise RuntimeError("service stop failed")
 
     monkeypatch.setattr("app.main.Database", FailingCloseDatabase)
-    monkeypatch.setattr("app.main.create_xai_client", lambda _: FailingCloseClient())
+    monkeypatch.setattr("app.main.create_openai_client", lambda _: FailingCloseClient())
     monkeypatch.setattr("app.main.CallService", FailingStopService)
     application = create_app(settings)
 

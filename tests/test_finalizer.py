@@ -20,24 +20,20 @@ class FakeResponses:
         self.error = error
         self.calls = 0
         self.timeouts: list[float] = []
-        self.kwargs: list[dict] = []
 
-    async def create(self, **kwargs):
+    async def parse(self, **kwargs):
         self.calls += 1
         self.timeouts.append(kwargs["timeout"])
-        self.kwargs.append(kwargs)
         if self.error:
             raise self.error
-        return SimpleNamespace(
-            output_text=self.parsed.model_dump_json() if self.parsed is not None else ""
-        )
+        return SimpleNamespace(output_parsed=self.parsed)
 
 
 def status_error(status_code: int) -> APIStatusError:
-    request = httpx.Request("POST", "https://api.x.ai/v1/responses")
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
     response = httpx.Response(status_code, request=request)
     return APIStatusError(
-        f"xAI returned {status_code}",
+        f"OpenAI returned {status_code}",
         response=response,
         body=None,
     )
@@ -56,11 +52,11 @@ async def test_terminal_state_and_raw_transcript_saved_before_extraction(setting
     )
 
     class InspectingResponses(FakeResponses):
-        async def create(inner_self, **kwargs):
+        async def parse(inner_self, **kwargs):
             stored = await service.db.get_result(call_id)
             assert stored.finalization_status == "telephony_only"
             assert stored.raw_transcript_available is True
-            return await super().create(**kwargs)
+            return await super().parse(**kwargs)
 
     parsed = ExtractedCallResult(
         outcome="completed",
@@ -76,16 +72,6 @@ async def test_terminal_state_and_raw_transcript_saved_before_extraction(setting
     assert result.finalization_status == "succeeded"
     assert result.result_source == "post_call_extractor"
     assert responses.timeouts == [30.0]
-    request = responses.kwargs[0]
-    assert request["model"] == "grok-4.3"
-    assert request["reasoning"] == {"effort": "low"}
-    assert request["store"] is False
-    assert request["text"]["format"] == {
-        "type": "json_schema",
-        "name": "extracted_call_result",
-        "strict": True,
-        "schema": ExtractedCallResult.model_json_schema(),
-    }
 
 
 @pytest.mark.asyncio
@@ -99,7 +85,7 @@ async def test_extractor_timeout_can_exceed_live_control_timeout(settings, servi
         follow_ups=[],
         confidence=0.95,
     )
-    settings.xai_extraction_timeout_seconds = 45
+    settings.openai_extraction_timeout_seconds = 45
     responses = FakeResponses(parsed=parsed)
 
     result = await Finalizer(settings, service.db, SimpleNamespace(responses=responses)).finalize(
@@ -158,9 +144,9 @@ async def test_concurrent_finalization_runs_extractor_once(settings, service, pa
     )
 
     class SlowResponses(FakeResponses):
-        async def create(inner_self, **kwargs):
+        async def parse(inner_self, **kwargs):
             await asyncio.sleep(0.02)
-            return await super().create(**kwargs)
+            return await super().parse(**kwargs)
 
     responses = SlowResponses(parsed=parsed)
     finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=responses))
@@ -204,11 +190,11 @@ async def test_extractor_retries_one_transient_failure_only(settings, service, p
     )
 
     class TransientThenSuccess(FakeResponses):
-        async def create(inner_self, **kwargs):
+        async def parse(inner_self, **kwargs):
             inner_self.calls += 1
             if inner_self.calls == 1:
-                raise APITimeoutError(request=httpx.Request("POST", "https://api.x.ai"))
-            return SimpleNamespace(output_text=parsed.model_dump_json())
+                raise APITimeoutError(request=httpx.Request("POST", "https://api.openai.com"))
+            return SimpleNamespace(output_parsed=parsed)
 
     responses = TransientThenSuccess()
     finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=responses))
@@ -231,11 +217,11 @@ async def test_extractor_retries_one_server_error(settings, service, packet):
     )
 
     class ServerErrorThenSuccess(FakeResponses):
-        async def create(inner_self, **kwargs):
+        async def parse(inner_self, **kwargs):
             inner_self.calls += 1
             if inner_self.calls == 1:
                 raise status_error(500)
-            return SimpleNamespace(output_text=parsed.model_dump_json())
+            return SimpleNamespace(output_parsed=parsed)
 
     responses = ServerErrorThenSuccess()
     result = await Finalizer(settings, service.db, SimpleNamespace(responses=responses)).finalize(

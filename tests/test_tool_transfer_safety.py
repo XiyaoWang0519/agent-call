@@ -335,8 +335,8 @@ async def test_cancel_after_termination_claim_still_finishes_media_and_terminal_
     hangup_started = asyncio.Event()
     release_hangup = asyncio.Event()
 
-    async def blocked_hangup(xai_call_id):
-        service._test_realtime.hangups.append(xai_call_id)
+    async def blocked_hangup(openai_call_id):
+        service._test_realtime.hangups.append(openai_call_id)
         hangup_started.set()
         await release_hangup.wait()
 
@@ -570,14 +570,14 @@ async def test_startup_recovery_continues_other_rows_during_sustained_twilio_fai
         packet,
         call_id="call_recovery_failing",
         state=CallState.ACTIVE,
-        xai_call_id="rtc_recovery_failing",
+        openai_call_id="rtc_recovery_failing",
     )
     healthy_call = await seed_call(
         service.db,
         packet,
         call_id="call_recovery_healthy",
         state=CallState.ACTIVE,
-        xai_call_id="rtc_recovery_healthy",
+        openai_call_id="rtc_recovery_healthy",
     )
     failing_conference = "CF" + "f" * 32
     healthy_conference = "CF" + "h" * 32

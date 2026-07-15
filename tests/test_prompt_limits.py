@@ -10,6 +10,7 @@ from app.models import (
     CONTEXT_PACKET_MAX_BYTES,
     ContextPacket,
     PreparePhoneCallInput,
+    SemanticVad,
 )
 from app.prompts import REALTIME_INSTRUCTIONS_MAX_BYTES, realtime_instructions
 
@@ -73,6 +74,29 @@ def test_realtime_instructions_enforce_final_byte_limit(
 
     with pytest.raises(ValueError, match=r"Realtime instructions exceed"):
         realtime_instructions(packet)
+
+
+@pytest.mark.parametrize("eagerness", ["low", "medium", "high", "auto"])
+def test_semantic_vad_accepts_supported_eagerness(eagerness: str):
+    vad = SemanticVad(
+        eagerness=eagerness,
+        create_response=True,
+        interrupt_response=True,
+    )
+
+    assert vad.eagerness == eagerness
+
+
+def test_semantic_vad_defaults_to_auto_and_rejects_unknown_value():
+    vad = SemanticVad(create_response=True, interrupt_response=True)
+
+    assert vad.eagerness == "auto"
+    with pytest.raises(ValidationError):
+        SemanticVad(
+            eagerness="fast",
+            create_response=True,
+            interrupt_response=True,
+        )
 
 
 @pytest.mark.asyncio

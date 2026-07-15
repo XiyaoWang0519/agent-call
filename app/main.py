@@ -11,10 +11,10 @@ from fastmcp import FastMCP
 from app.call_state import CallService
 from app.db import Database
 from app.mcp_tools import register_tools
-from app.routes import debug, deployment, twilio_webhooks, xai_webhooks
+from app.openai_client import create_openai_client
+from app.routes import debug, deployment, openai_webhooks, twilio_webhooks
 from app.security import MCPAuthMiddleware
 from app.settings import Settings
-from app.xai_client import create_xai_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,13 +52,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.require_runtime_configuration()
         db = Database(settings.database_path)
         await db.initialize()
-        xai = None
+        openai = None
         service: CallService | None = None
         primary_error: BaseException | None = None
         cleanup_errors: list[BaseException] = []
         try:
-            xai = create_xai_client(settings)
-            service = CallService(settings, db, xai=xai)
+            openai = create_openai_client(settings)
+            service = CallService(settings, db, openai=openai)
             holder["service"] = service
             app.state.call_service = service
             # Recovery happens before the server accepts traffic.
@@ -76,8 +76,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cleanup_steps = []
             if service is not None:
                 cleanup_steps.append(service.stop)
-            if xai is not None:
-                cleanup_steps.append(xai.close)
+            if openai is not None:
+                cleanup_steps.append(openai.close)
             cleanup_steps.append(db.close)
 
             # Cleanup steps are individually time-bounded and cancellation is
@@ -122,7 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Poke Phone-Call Bridge", version="1.0.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.mcp = mcp
-    app.include_router(xai_webhooks.router)
+    app.include_router(openai_webhooks.router)
     app.include_router(twilio_webhooks.router)
     app.include_router(debug.router)
     app.include_router(deployment.router)

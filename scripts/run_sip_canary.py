@@ -127,9 +127,10 @@ async def run(args: argparse.Namespace) -> int:
         for turn in transcript
     )
     checks = {
-        "xai_sideband_connected": audit["xai_connect_status"] == 101,
+        "accept_2xx": audit["openai_accept_status"] is not None
+        and 200 <= audit["openai_accept_status"] < 300,
         "transcription_echoed": audit["transcription_verified"] == 1,
-        "server_vad_echoed": audit["vad_verified"] == 1,
+        "semantic_vad_echoed": audit["semantic_vad_verified"] == 1,
         "spoken_nonce_transcribed": bool(nonce_turns),
         "automatic_response_after_nonce": responded_after_nonce,
         "record_outcome_tool_behavior": audit["advisory_outcome"] is not None
@@ -149,7 +150,7 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the live xAI SIP/Twilio canary")
+    parser = argparse.ArgumentParser(description="Run the live OpenAI SIP/Twilio canary")
     parser.add_argument("--base-url", help="Deployed public base URL; defaults to PUBLIC_BASE_URL")
     parser.add_argument("--target", help="Canary phone in E.164; defaults to OWNER_PHONE_E164")
     parser.add_argument("--mode", choices=("full", "no-outcome-tool"), default="full")

@@ -9,6 +9,18 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+SUPPORTED_TRANSCRIPTION_MODELS = frozenset(
+    {
+        "whisper-1",
+        "gpt-4o-mini-transcribe",
+        "gpt-4o-mini-transcribe-2025-12-15",
+        "gpt-4o-transcribe",
+        "gpt-4o-transcribe-diarize",
+        "gpt-realtime-whisper",
+    }
+)
+TRANSCRIPTION_DELAYS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -18,11 +30,9 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    xai_api_key: SecretStr | None = None
-    xai_webhook_secret: SecretStr | None = None
-    xai_sip_phone_number: str | None = None
-    xai_sip_auth_username: str | None = None
-    xai_sip_auth_password: SecretStr | None = None
+    openai_api_key: SecretStr | None = None
+    openai_webhook_secret: SecretStr | None = None
+    openai_project_id: str | None = None
     twilio_account_sid: str | None = None
     twilio_auth_token: SecretStr | None = None
     twilio_caller_id: str | None = None
@@ -35,17 +45,18 @@ class Settings(BaseSettings):
     poke_api_key: SecretStr | None = None
     poke_push_enabled: bool = False
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])
-    input_transcription_model: Literal["grok-transcribe"] = "grok-transcribe"
-    server_vad_silence_duration_ms: int = Field(default=700, ge=0, le=10000)
-    server_vad_prefix_padding_ms: int = Field(default=333, ge=0, le=10000)
-    xai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
-    xai_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
-    xai_keepalive_expiry_seconds: float | None = Field(default=60.0, ge=5, le=300)
-    xai_extraction_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
-    extractor_model: Literal["grok-4.3"] = "grok-4.3"
+    input_transcription_model: str = "gpt-4o-mini-transcribe"
+    input_transcription_delay: str | None = None
+    semantic_vad_eagerness: Literal["low", "medium", "high", "auto"] = "auto"
+    openai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    openai_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    openai_keepalive_expiry_seconds: float | None = Field(default=60.0, ge=5, le=300)
+    openai_extraction_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    extractor_model: str = "gpt-5.4-nano-2026-03-17"
     database_url: str = "sqlite:///./poke_call.db"
     public_base_url: str | None = None
-    realtime_model: Literal["grok-voice-think-fast-1.0"] = "grok-voice-think-fast-1.0"
+    realtime_model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
+    mini_models_enabled: bool = False
     setup_deadline_seconds: Literal[60] = 60
     watchdog_stale_seconds: Literal[15] = 15
     plan_ttl_seconds: Literal[600] = 600
@@ -66,7 +77,7 @@ class Settings(BaseSettings):
             raise ValueError("ALLOWED_COUNTRY_CODES must contain E.164 country prefixes")
         return value
 
-    @field_validator("twilio_caller_id", "owner_phone_e164", "xai_sip_phone_number")
+    @field_validator("twilio_caller_id", "owner_phone_e164")
     @classmethod
     def validate_configured_phone(cls, value: str | None) -> str | None:
         if value and not re.fullmatch(r"\+[1-9]\d{1,14}", value):
@@ -89,16 +100,29 @@ class Settings(BaseSettings):
             raise ValueError("PUBLIC_BASE_URL must be an HTTPS origin without a path or query")
         return value.rstrip("/")
 
+    @field_validator("input_transcription_model")
+    @classmethod
+    def validate_transcription_model(cls, value: str) -> str:
+        if value not in SUPPORTED_TRANSCRIPTION_MODELS:
+            supported = ", ".join(sorted(SUPPORTED_TRANSCRIPTION_MODELS))
+            raise ValueError(f"unsupported transcription model; expected one of: {supported}")
+        return value
+
     @model_validator(mode="after")
-    def validate_provider_configuration(self) -> Settings:
-        if self.xai_connect_timeout_seconds > self.xai_http_timeout_seconds:
-            raise ValueError("XAI_CONNECT_TIMEOUT_SECONDS cannot exceed XAI_HTTP_TIMEOUT_SECONDS")
-        if (
-            self.twilio_caller_id
-            and self.xai_sip_phone_number
-            and self.twilio_caller_id != self.xai_sip_phone_number
-        ):
-            raise ValueError("XAI_SIP_PHONE_NUMBER must match TWILIO_CALLER_ID")
+    def validate_transcription_delay(self) -> Settings:
+        if self.input_transcription_delay is not None:
+            if self.input_transcription_model != "gpt-realtime-whisper":
+                raise ValueError(
+                    "INPUT_TRANSCRIPTION_DELAY is only valid with gpt-realtime-whisper"
+                )
+            if self.input_transcription_delay not in TRANSCRIPTION_DELAYS:
+                raise ValueError("invalid INPUT_TRANSCRIPTION_DELAY")
+        if self.mini_models_enabled:
+            raise ValueError("mini realtime models are release-gated and disabled in v1")
+        if self.openai_connect_timeout_seconds > self.openai_http_timeout_seconds:
+            raise ValueError(
+                "OPENAI_CONNECT_TIMEOUT_SECONDS cannot exceed OPENAI_HTTP_TIMEOUT_SECONDS"
+            )
         return self
 
     @cached_property
@@ -112,11 +136,9 @@ class Settings(BaseSettings):
 
     def require_runtime_configuration(self) -> None:
         required = {
-            "XAI_API_KEY": self.xai_api_key,
-            "XAI_WEBHOOK_SECRET": self.xai_webhook_secret,
-            "XAI_SIP_PHONE_NUMBER": self.xai_sip_phone_number,
-            "XAI_SIP_AUTH_USERNAME": self.xai_sip_auth_username,
-            "XAI_SIP_AUTH_PASSWORD": self.xai_sip_auth_password,
+            "OPENAI_API_KEY": self.openai_api_key,
+            "OPENAI_WEBHOOK_SECRET": self.openai_webhook_secret,
+            "OPENAI_PROJECT_ID": self.openai_project_id,
             "TWILIO_ACCOUNT_SID": self.twilio_account_sid,
             "TWILIO_AUTH_TOKEN": self.twilio_auth_token,
             "TWILIO_CALLER_ID": self.twilio_caller_id,

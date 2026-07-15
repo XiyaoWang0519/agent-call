@@ -15,9 +15,9 @@ from app.settings import Settings
 from tests.conftest import seed_call
 
 
-def _xai_headers(settings, body: bytes, webhook_id: str = "wh_test") -> dict[str, str]:
+def _openai_headers(settings, body: bytes, webhook_id: str = "wh_test") -> dict[str, str]:
     timestamp = str(int(time.time()))
-    secret = Settings.reveal(settings.xai_webhook_secret)
+    secret = Settings.reveal(settings.openai_webhook_secret)
     key = base64.b64decode(secret.removeprefix("whsec_"))
     signed = f"{webhook_id}.{timestamp}.".encode() + body
     signature = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
@@ -152,7 +152,7 @@ def test_deployment_lock_requires_its_narrow_token(settings):
     assert released.json() == {"released": True}
 
 
-def test_unsigned_and_invalid_xai_webhooks_rejected(settings):
+def test_unsigned_and_invalid_openai_webhooks_rejected(settings):
     app = create_app(settings)
     body = json.dumps(
         {
@@ -164,9 +164,9 @@ def test_unsigned_and_invalid_xai_webhooks_rejected(settings):
         }
     ).encode()
     with TestClient(app) as client:
-        unsigned = client.post("/webhooks/xai", content=body)
+        unsigned = client.post("/webhooks/openai", content=body)
         invalid = client.post(
-            "/webhooks/xai",
+            "/webhooks/openai",
             content=body,
             headers={
                 "webhook-id": "wh_invalid",
@@ -179,7 +179,7 @@ def test_unsigned_and_invalid_xai_webhooks_rejected(settings):
     assert invalid.status_code == 400
 
 
-def test_xai_webhook_replay_is_rejected(settings):
+def test_openai_webhook_replay_is_rejected(settings):
     app = create_app(settings)
     body = json.dumps(
         {
@@ -191,15 +191,15 @@ def test_xai_webhook_replay_is_rejected(settings):
         },
         separators=(",", ":"),
     ).encode()
-    headers = _xai_headers(settings, body, "wh_replay")
+    headers = _openai_headers(settings, body, "wh_replay")
     with TestClient(app) as client:
-        first = client.post("/webhooks/xai", content=body, headers=headers)
-        second = client.post("/webhooks/xai", content=body, headers=headers)
+        first = client.post("/webhooks/openai", content=body, headers=headers)
+        second = client.post("/webhooks/openai", content=body, headers=headers)
     assert first.status_code == 204
     assert second.status_code == 400
 
 
-def test_valid_xai_incoming_webhook_reaches_call_service(settings):
+def test_valid_openai_incoming_webhook_reaches_call_service(settings):
     app = create_app(settings)
     body = json.dumps(
         {
@@ -219,11 +219,11 @@ def test_valid_xai_incoming_webhook_reaches_call_service(settings):
     ).encode()
     with TestClient(app) as client:
         handler = AsyncMock(return_value="call_1")
-        app.state.call_service.handle_xai_incoming = handler
+        app.state.call_service.handle_openai_incoming = handler
         response = client.post(
-            "/webhooks/xai",
+            "/webhooks/openai",
             content=body,
-            headers=_xai_headers(settings, body, "wh_incoming"),
+            headers=_openai_headers(settings, body, "wh_incoming"),
         )
     assert response.status_code == 200
     handler.assert_awaited_once_with(
