@@ -214,7 +214,7 @@ class RealtimeAudioInput(BaseModel):
 class RealtimeAudioOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    voice: Literal["echo"] = "echo"
+    voice: Literal["cedar"] = "cedar"
     speed: float = Field(default=1.0, ge=0.25, le=1.5)
 
 
