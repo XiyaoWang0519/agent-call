@@ -51,6 +51,11 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     assert end_call["parameters"]["required"] == ["reason"]
     assert "objective_completed" in end_call["parameters"]["properties"]["reason"]["enum"]
     assert "final goodbye" in end_call["description"].lower()
+    # Ending must be gated on the callee having nothing further, not just objective status;
+    # a pending callee request must be answered as a normal turn before end_call.
+    description = end_call["description"].lower()
+    assert "callee has nothing further" in description
+    assert "answer it fully" in description
 
 
 def test_session_created_echo_requires_transcription_and_full_initial_vad(settings, packet):
