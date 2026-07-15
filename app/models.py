@@ -244,6 +244,8 @@ class AcceptPayload(BaseModel):
     max_output_tokens: int = Field(default=300, ge=1, le=4096)
     parallel_tool_calls: Literal[False] = False
     tool_choice: Literal["auto"] = "auto"
+    # Writes Realtime session activity to the OpenAI Traces dashboard.
+    tracing: Literal["auto"] = "auto"
     instructions: str
     audio: RealtimeAudio
     tools: list[RealtimeFunctionTool]
