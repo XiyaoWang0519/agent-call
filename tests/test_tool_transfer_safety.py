@@ -1117,6 +1117,36 @@ async def test_ordinary_termination_atomically_aborts_joining_before_promotion(s
 
 
 @pytest.mark.asyncio
+async def test_transfer_claim_during_prewarming_with_callee_joined_completes(service, packet):
+    # The opening turn starts as soon as the callee answers, while the durable state is
+    # still prewarming (AMD/activation converge asynchronously). A transfer requested in
+    # that window must still be able to claim and complete.
+    call_id = await seed_call(service.db, packet, state=CallState.PREWARMING)
+    await service.db.update_call(call_id, callee_joined=1)
+    service._owner_join_events.setdefault(call_id, asyncio.Event()).set()
+
+    result = await service.transfer_to_owner(call_id, "owner needed")
+
+    assert result["accepted"] is True
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.TRANSFERRED.value
+    assert call["transfer_outcome"] == "completed:owner needed"
+
+
+@pytest.mark.asyncio
+async def test_transfer_claim_before_callee_joined_is_rejected(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.PREWARMING)
+
+    result = await service.transfer_to_owner(call_id, "owner needed")
+
+    assert result["accepted"] is False
+    assert result["error"] == "owner transfer already attempted or call is ending"
+    call = await service.db.get_call(call_id)
+    assert call["transfer_outcome"] is None
+    assert service._test_twilio.owner_creates == 0
+
+
+@pytest.mark.asyncio
 async def test_spawned_task_failure_is_logged(service, caplog):
     async def boom() -> None:
         raise RuntimeError("background task exploded")

@@ -145,6 +145,11 @@ WHERE
 
 DEPLOYMENT_LOCK_TTL = timedelta(minutes=15)
 
+# Transfers are legal once the callee has joined, even while async AMD/activation is
+# still converging toward 'active'. The promote CAS moves state to terminating
+# regardless of which live state it started from.
+TRANSFER_ELIGIBLE_STATES = ("prewarming", "ready_to_activate", "activating", "active")
+
 
 class LatencyStage(StrEnum):
     TWILIO_AGENT_REQUEST = "twilio_agent_request"
@@ -703,16 +708,21 @@ class Database:
         )
 
     async def claim_transfer_joining(self, call_id: str, reason: str) -> bool:
-        """Durably allow at most one owner-transfer attempt for a live call."""
+        """Durably allow at most one owner-transfer attempt for a live call.
 
+        Eligible once the callee has joined, even before activation completes.
+        """
+
+        placeholders = ",".join("?" for _ in TRANSFER_ELIGIBLE_STATES)
         return (
             await self.execute(
-                """UPDATE calls SET transfer_outcome=?, last_event_at=?
+                f"""UPDATE calls SET transfer_outcome=?, last_event_at=?
                    WHERE call_id=?
                      AND transfer_outcome IS NULL
                      AND termination_claimed=0
-                     AND state='active'""",
-                (f"joining:{reason}", _iso_now(), call_id),
+                     AND callee_joined=1
+                     AND state IN ({placeholders})""",  # noqa: S608
+                (f"joining:{reason}", _iso_now(), call_id, *TRANSFER_ELIGIBLE_STATES),
             )
             == 1
         )
@@ -722,15 +732,23 @@ class Database:
     ) -> bool:
         """Persist the owner leg before transfer promotion can become recoverable."""
 
+        placeholders = ",".join("?" for _ in TRANSFER_ELIGIBLE_STATES)
         return (
             await self.execute(
-                """UPDATE calls SET twilio_owner_call_sid=?, last_event_at=?
+                f"""UPDATE calls SET twilio_owner_call_sid=?, last_event_at=?
                    WHERE call_id=?
                      AND transfer_outcome=?
                      AND termination_claimed=0
-                     AND state='active'
-                     AND (twilio_owner_call_sid IS NULL OR twilio_owner_call_sid=?)""",
-                (owner_call_sid, _iso_now(), call_id, expected, owner_call_sid),
+                     AND state IN ({placeholders})
+                     AND (twilio_owner_call_sid IS NULL OR twilio_owner_call_sid=?)""",  # noqa: S608
+                (
+                    owner_call_sid,
+                    _iso_now(),
+                    call_id,
+                    expected,
+                    *TRANSFER_ELIGIBLE_STATES,
+                    owner_call_sid,
+                ),
             )
             == 1
         )
@@ -738,9 +756,10 @@ class Database:
     async def promote_transfer(self, call_id: str, reason: str) -> dict[str, Any] | None:
         """Claim teardown ownership while promoting a joined owner transfer."""
 
+        placeholders = ",".join("?" for _ in TRANSFER_ELIGIBLE_STATES)
         async with self._write_connection() as conn:
             cursor = await conn.execute(
-                """UPDATE calls
+                f"""UPDATE calls
                    SET transfer_outcome=?,
                        termination_claimed=1,
                        state=?,
@@ -749,14 +768,15 @@ class Database:
                    WHERE call_id=?
                      AND transfer_outcome=?
                      AND termination_claimed=0
-                     AND state='active'
-                   RETURNING *""",
+                     AND state IN ({placeholders})
+                   RETURNING *""",  # noqa: S608
                 (
                     f"in_progress:{reason}",
                     CallState.TERMINATING.value,
                     _iso_now(),
                     call_id,
                     f"joining:{reason}",
+                    *TRANSFER_ELIGIBLE_STATES,
                 ),
             )
             row = await cursor.fetchone()
@@ -764,14 +784,15 @@ class Database:
         return _decode_json_columns(dict(row)) if row else None
 
     async def fail_joining_transfer(self, call_id: str, expected: str, failure: str) -> bool:
+        placeholders = ",".join("?" for _ in TRANSFER_ELIGIBLE_STATES)
         return (
             await self.execute(
-                """UPDATE calls SET transfer_outcome=?, last_event_at=?
+                f"""UPDATE calls SET transfer_outcome=?, last_event_at=?
                    WHERE call_id=?
                      AND transfer_outcome=?
                      AND termination_claimed=0
-                     AND state='active'""",
-                (failure, _iso_now(), call_id, expected),
+                     AND state IN ({placeholders})""",  # noqa: S608
+                (failure, _iso_now(), call_id, expected, *TRANSFER_ELIGIBLE_STATES),
             )
             == 1
         )

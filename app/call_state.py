@@ -11,7 +11,13 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from app.db import Database, DeploymentLockedError, LatencyMark, LatencyStage
+from app.db import (
+    TRANSFER_ELIGIBLE_STATES,
+    Database,
+    DeploymentLockedError,
+    LatencyMark,
+    LatencyStage,
+)
 from app.finalizer import Finalizer
 from app.models import (
     TERMINAL_STATES,
@@ -801,7 +807,10 @@ class CallService:
                     source_event_type=event_type,
                     source_event_id=event_id,
                 )
-        elif event_type == "response.output_audio_transcript.done":
+        elif event_type in {
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.done",
+        }:
             text = event.get("transcript", "").strip()
             if text:
                 await self.db.add_transcript_turn(
@@ -1145,7 +1154,7 @@ class CallService:
                     current = await self.db.get_call(call_id)
                     exact_joining = bool(
                         current
-                        and current.get("state") == CallState.ACTIVE.value
+                        and current.get("state") in TRANSFER_ELIGIBLE_STATES
                         and not current.get("termination_claimed")
                         and current.get("transfer_outcome") == joining
                     )
@@ -1615,7 +1624,7 @@ class CallService:
                 current = await self.db.get_call(call_id)
                 exact_owner_sid = bool(
                     current
-                    and current.get("state") == CallState.ACTIVE.value
+                    and current.get("state") in TRANSFER_ELIGIBLE_STATES
                     and not current.get("termination_claimed")
                     and current.get("transfer_outcome") == joining
                     and current.get("twilio_owner_call_sid") == owner_call_sid

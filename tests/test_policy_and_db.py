@@ -441,6 +441,74 @@ async def test_transcript_order_and_source_id_are_idempotent(database):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    ["prewarming", "ready_to_activate", "activating", "active"],
+)
+async def test_claim_transfer_joining_accepts_each_eligible_state(database, state):
+    db = database
+    call_id = f"call_eligible_{state}"
+    await db.create_plan(
+        f"plan_{call_id}", {}, "authority", datetime.now(UTC) + timedelta(minutes=10)
+    )
+    assert await db.claim_plan_and_create_call(
+        plan_id=f"plan_{call_id}",
+        call_id=call_id,
+        conference_name=f"conference_{call_id}",
+        confirmation_text="confirmed",
+    )
+    await db.update_call(call_id, state=state, callee_joined=1)
+
+    assert await db.claim_transfer_joining(call_id, "owner needed") is True
+    call = await db.get_call(call_id)
+    assert call["transfer_outcome"] == "joining:owner needed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    ["completed", "failed", "timed_out", "transferred", "terminating"],
+)
+async def test_claim_transfer_joining_rejects_terminal_and_terminating_states(database, state):
+    db = database
+    call_id = f"call_ineligible_{state}"
+    await db.create_plan(
+        f"plan_{call_id}", {}, "authority", datetime.now(UTC) + timedelta(minutes=10)
+    )
+    assert await db.claim_plan_and_create_call(
+        plan_id=f"plan_{call_id}",
+        call_id=call_id,
+        conference_name=f"conference_{call_id}",
+        confirmation_text="confirmed",
+    )
+    await db.update_call(call_id, state=state, callee_joined=1)
+
+    assert await db.claim_transfer_joining(call_id, "owner needed") is False
+    call = await db.get_call(call_id)
+    assert call["transfer_outcome"] is None
+
+
+@pytest.mark.asyncio
+async def test_claim_transfer_joining_rejects_before_callee_joined(database):
+    db = database
+    call_id = "call_not_joined"
+    await db.create_plan(
+        f"plan_{call_id}", {}, "authority", datetime.now(UTC) + timedelta(minutes=10)
+    )
+    assert await db.claim_plan_and_create_call(
+        plan_id=f"plan_{call_id}",
+        call_id=call_id,
+        conference_name=f"conference_{call_id}",
+        confirmation_text="confirmed",
+    )
+    # PREWARMING is the default state after claim_plan_and_create_call and callee_joined
+    # defaults to 0 until the callee actually answers.
+    assert await db.claim_transfer_joining(call_id, "owner needed") is False
+    call = await db.get_call(call_id)
+    assert call["transfer_outcome"] is None
+
+
+@pytest.mark.asyncio
 async def test_deployment_lock_atomically_blocks_new_calls(database):
     db = database
     await db.create_plan(

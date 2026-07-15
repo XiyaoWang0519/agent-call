@@ -296,6 +296,27 @@ async def test_caller_speech_uses_auto_response_without_manual_create(service, p
 
 
 @pytest.mark.asyncio
+async def test_assistant_transcript_persists_for_aliased_done_event(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
+    await service.handle_amd(call_id, "human")
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.audio_transcript.done",
+            "event_id": "evt_alias_done",
+            "item_id": "turn_assistant_alias",
+            "transcript": "Hello from the alias event.",
+        },
+    )
+    transcript = await service.db.get_transcript(call_id)
+    assert [(turn.speaker, turn.text) for turn in transcript] == [
+        ("assistant", "Hello from the alias event.")
+    ]
+    assert transcript[0].turn_id == "turn_assistant_alias"
+
+
+@pytest.mark.asyncio
 async def test_tool_output_is_followed_by_observed_continuation(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await service.handle_realtime_event(

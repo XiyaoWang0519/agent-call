@@ -289,6 +289,9 @@ async def seed_call(
         confirmation_text="Confirmed",
     )
     assert claimed
+    # Every state past PREWARMING is only reachable in production after the callee has
+    # answered, so default callee_joined accordingly. Callers testing the pre-answer
+    # window keep the default PREWARMING state and set callee_joined explicitly.
     await db.update_call(
         call_id,
         state=state.value,
@@ -298,6 +301,7 @@ async def seed_call(
         openai_call_id=openai_call_id,
         transcription_verified=1,
         semantic_vad_verified=1,
+        callee_joined=int(state != CallState.PREWARMING),
     )
     return call_id
 
