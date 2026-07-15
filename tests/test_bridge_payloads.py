@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -91,7 +92,8 @@ class FakeConnection:
 
 
 @pytest.mark.asyncio
-async def test_opening_response_uses_session_context_without_a_script(settings):
+async def test_opening_response_uses_session_context_without_a_script(settings, caplog):
+    caplog.set_level(logging.INFO, logger="app.xai_realtime")
     bridge = RealtimeBridge(
         settings,
         SimpleNamespace(),
@@ -106,12 +108,39 @@ async def test_opening_response_uses_session_context_without_a_script(settings):
 
     await bridge.create_opening("call_1")
 
-    assert websocket.messages == [
-        {
-            "type": "response.create",
-            "response": {"output_modalities": ["audio"]},
-        }
-    ]
+    assert websocket.messages == [{"type": "response.create"}]
+    assert "Realtime control sent call_id=call_1 type=response.create" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_realtime_lifecycle_log_omits_transcript_content(settings, caplog):
+    caplog.set_level(logging.INFO, logger="app.xai_realtime")
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    websocket = StreamingFakeWebSocket({})
+    runtime = RealtimeRuntime(call_id="call_1", xai_call_id="rtc_1", websocket=websocket)
+    await websocket.incoming.put(
+        json.dumps(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "event_id": "evt_transcript",
+                "transcript": "private spoken content",
+            }
+        )
+    )
+    await websocket.incoming.put(None)
+
+    await bridge._receive_events(runtime, websocket)
+
+    assert "call_id=call_1" in caplog.text
+    assert "type=conversation.item.input_audio_transcription.completed" in caplog.text
+    assert "event_id=evt_transcript" in caplog.text
+    assert "private spoken content" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -539,7 +568,6 @@ async def test_terminal_function_output_creates_a_dedicated_closing_response(set
         {
             "type": "response.create",
             "response": {
-                "output_modalities": ["audio"],
                 "instructions": "Say one concise goodbye. Do not call any function.",
             },
         },

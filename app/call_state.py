@@ -51,6 +51,7 @@ TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS = 12.0
 TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
+OPENING_INPUT_SETTLE_SECONDS = 0.1
 
 
 class OwnerTransferDeparted(RuntimeError):
@@ -96,6 +97,8 @@ class CallService:
         self._owner_transfer_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._owner_transfer_locks: dict[str, asyncio.Lock] = {}
         self._opening_transition_locks: dict[str, asyncio.Lock] = {}
+        self._input_speech_active: set[str] = set()
+        self._opening_waiting_for_input_end: set[str] = set()
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
         self._active_response_ids: dict[str, str | None] = {}
@@ -717,6 +720,11 @@ class CallService:
                 return
             if call.get("answer_handling") == "voicemail":
                 return
+            if call_id in self._input_speech_active:
+                self._opening_waiting_for_input_end.add(call_id)
+                logger.info("deferring opening until caller speech ends call_id=%s", call_id)
+                return
+            self._opening_waiting_for_input_end.discard(call_id)
             if not await self.db.claim_opening_if_not_voicemail(call_id):
                 return
 
@@ -727,6 +735,40 @@ class CallService:
         conference = call.get("conference_sid") or call.get("conference_name")
         # The explicit unmute is a race-safety net. Sending the opening first ensures its
         # Twilio round-trip can never delay the model's response.create.
+        await self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))
+
+    async def _resume_opening_after_input_end(self, call_id: str, source: str) -> None:
+        # speech_stopped precedes Grok's internal audio commit. Let that settle before issuing
+        # response.create, while transcription completion remains a fallback for SIP sessions
+        # that omit input_audio_buffer.committed.
+        await asyncio.sleep(OPENING_INPUT_SETTLE_SECONDS)
+        if call_id in self._opening_waiting_for_input_end:
+            logger.info("resuming deferred opening call_id=%s source=%s", call_id, source)
+            await self._start_opening_on_answer(call_id)
+
+    async def _release_deferred_opening_after_input(self, call_id: str, source: str) -> None:
+        async with self._opening_transition_lock(call_id):
+            self._input_speech_active.discard(call_id)
+            resume_opening = call_id in self._opening_waiting_for_input_end
+        if resume_opening:
+            self._spawn(
+                self._resume_opening_after_input_end(call_id, source),
+                name=f"resume-opening:{call_id}:{source}",
+            )
+
+    async def _adopt_automatic_opening(self, call_id: str) -> None:
+        call: dict[str, Any] | None = None
+        async with self._opening_transition_lock(call_id):
+            if call_id not in self._opening_waiting_for_input_end:
+                return
+            self._opening_waiting_for_input_end.discard(call_id)
+            call = await self.db.get_call(call_id)
+            if call is None or CallState(call["state"]) in TERMINAL_STATES:
+                return
+            if not await self.db.claim_opening_if_not_voicemail(call_id):
+                return
+
+        conference = call.get("conference_sid") or call.get("conference_name")
         await self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))
 
     async def _unmute_agent(
@@ -801,7 +843,16 @@ class CallService:
             # miss this startup event, so readiness is established by the explicit
             # session.update/session.updated handshake in handle_sideband_open.
             logger.debug("observed session.created call_id=%s", call_id)
+        elif event_type == "input_audio_buffer.speech_started":
+            async with self._opening_transition_lock(call_id):
+                self._input_speech_active.add(call_id)
+        elif event_type in {
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+        }:
+            await self._release_deferred_opening_after_input(call_id, event_type)
         elif event_type == "conversation.item.input_audio_transcription.completed":
+            await self._release_deferred_opening_after_input(call_id, event_type)
             text = event.get("transcript", "").strip()
             if text:
                 await self.db.add_transcript_turn(
@@ -835,6 +886,7 @@ class CallService:
                 event_key=str(event.get("call_id") or event_id),
             )
         elif event_type == "response.created":
+            await self._adopt_automatic_opening(call_id)
             if call_id in self._tool_seen_calls:
                 self._tool_seen_calls.discard(call_id)
                 await self.db.mark_tool_continuation_observed(call_id)
@@ -2074,6 +2126,8 @@ class CallService:
         self._owner_failures.pop(call_id, None)
         self._owner_transfer_tasks.pop(call_id, None)
         self._owner_transfer_locks.pop(call_id, None)
+        self._input_speech_active.discard(call_id)
+        self._opening_waiting_for_input_end.discard(call_id)
         self._opening_transition_locks.pop(call_id, None)
         self._tool_seen_calls.discard(call_id)
         try:
