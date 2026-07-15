@@ -26,6 +26,7 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     assert payload["max_output_tokens"] == 300
     assert payload["parallel_tool_calls"] is False
     assert payload["tool_choice"] == "auto"
+    assert payload["tracing"] == "auto"
     assert payload["audio"]["input"] == {
         "transcription": {"model": "gpt-4o-mini-transcribe"},
         "turn_detection": {
