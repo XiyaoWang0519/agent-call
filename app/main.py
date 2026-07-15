@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -19,6 +20,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+logger = logging.getLogger(__name__)
+
+# Each cleanup step must finish within this bound so a supervisor-issued cancel
+# (or a hung client) cannot stall shutdown indefinitely.
+LIFESPAN_CLEANUP_STEP_TIMEOUT_SECONDS = 15.0
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -65,6 +72,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except BaseException as exc:
             primary_error = exc
         finally:
+            cancelled = isinstance(primary_error, asyncio.CancelledError)
             cleanup_steps = []
             if service is not None:
                 cleanup_steps.append(service.stop)
@@ -72,15 +80,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 cleanup_steps.append(openai.close)
             cleanup_steps.append(db.close)
 
+            # Cleanup steps are individually time-bounded and cancellation is
+            # tracked separately from ordinary failures: cancellation must keep
+            # running the remaining (now bounded) steps and ultimately propagate
+            # as CancelledError, never get swallowed or wrapped in a group, or an
+            # external cancel could not bound how long shutdown takes.
             for cleanup in cleanup_steps:
                 try:
-                    await cleanup()
+                    async with asyncio.timeout(LIFESPAN_CLEANUP_STEP_TIMEOUT_SECONDS):
+                        await cleanup()
+                except asyncio.CancelledError:
+                    cancelled = True
                 except BaseException as exc:
                     cleanup_errors.append(exc)
             try:
                 holder.clear()
             except BaseException as exc:  # pragma: no cover - dict.clear is defensive here
                 cleanup_errors.append(exc)
+
+        if cancelled:
+            # Cancellation wins the raise, so anything else that went wrong must be
+            # logged here or it is lost entirely.
+            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError):
+                logger.error("lifespan failed before cancellation", exc_info=primary_error)
+            for error in cleanup_errors:
+                logger.error("lifespan cleanup step failed during cancellation", exc_info=error)
+            raise asyncio.CancelledError
 
         if primary_error is not None:
             if cleanup_errors:

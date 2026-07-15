@@ -128,6 +128,57 @@ async def test_invalid_and_unknown_tools_count_without_overwriting_valid_advisor
 
 
 @pytest.mark.asyncio
+async def test_nontransfer_tool_result_send_race_does_not_propagate(service, packet, monkeypatch):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    async def teardown_race(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("sideband is not open")
+
+    monkeypatch.setattr(service.realtime, "send_tool_result", teardown_race)
+
+    # Must not raise: a benign teardown race sending the tool result cannot escalate
+    # into a fatal error, but the durable write still has to land.
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_race", "future_tool", "{}"),
+    )
+
+    call = await service.db.get_call(call_id)
+    assert call["tool_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_advisory_persistence_failure_sends_rejection_and_propagates(
+    service, packet, monkeypatch
+):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    async def failing_write(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(service.db, "record_tool_call", failing_write)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await service.handle_realtime_event(
+            call_id,
+            _tool_event(
+                "tool_advisory_fail",
+                "record_call_outcome",
+                '{"status":"completed","summary":"Done","commitments":[],"followUps":[]}',
+            ),
+        )
+
+    # The model must still receive a tool result even though its outcome was lost.
+    assert service._test_realtime.tool_results[-1] == (
+        call_id,
+        "tool_advisory_fail",
+        {"accepted": False, "error": "outcome could not be persisted"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_response_created_marks_continuation_without_reading_call(
     service, packet, monkeypatch
 ):
@@ -1063,3 +1114,19 @@ async def test_ordinary_termination_atomically_aborts_joining_before_promotion(s
     assert claimed["termination_reason"] == "owner_request"
     assert claimed["transfer_outcome"] == "failed:termination_won"
     assert await service.db.promote_transfer(call_id, "owner needed") is None
+
+
+@pytest.mark.asyncio
+async def test_spawned_task_failure_is_logged(service, caplog):
+    async def boom() -> None:
+        raise RuntimeError("background task exploded")
+
+    with caplog.at_level("ERROR", logger="app.call_state"):
+        task = service._spawn(boom(), name="test-boom-task")
+        with pytest.raises(RuntimeError, match="background task exploded"):
+            await task
+
+    assert any(
+        record.levelname == "ERROR" and "test-boom-task" in record.getMessage()
+        for record in caplog.records
+    )

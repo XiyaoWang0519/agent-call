@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -30,6 +31,8 @@ REALTIME_MEDIA_DRAIN_SECONDS = 1.5
 REALTIME_CLOSE_TIMEOUT_SECONDS = 2.5
 REALTIME_TASK_DRAIN_TIMEOUT_SECONDS = 2.0
 REALTIME_TASK_CANCEL_TIMEOUT_SECONDS = 1.0
+REALTIME_SEND_TIMEOUT_SECONDS = 10.0
+REALTIME_SHUTDOWN_FINAL_TIMEOUT_SECONDS = 10.0
 _EVENT_QUEUE_CLOSED = object()
 
 
@@ -164,6 +167,13 @@ class RealtimeBridge:
                 exc.status_code,
                 dict(exc.response.headers),
                 exc.response.text,
+            )
+            raise
+        except TimeoutError:
+            logger.error(
+                "OpenAI call accept timed out call_id=%s timeout=%ss",
+                call_id,
+                self.settings.openai_http_timeout_seconds,
             )
             raise
         # The accept response is bodyless today; log every non-secret response field.
@@ -375,7 +385,10 @@ class RealtimeBridge:
                 if websocket is None:
                     raise RuntimeError("sideband is not open")
                 for event, payload in serialized:
-                    await websocket.send(payload)
+                    # An unbounded stalled send makes the sender cancellation-proof via
+                    # _send_batch's shield loop, so bound every write on the wire.
+                    async with asyncio.timeout(REALTIME_SEND_TIMEOUT_SECONDS):
+                        await websocket.send(payload)
                     sent.append(event)
         finally:
             await self._notify_sent(call_id, sent)
@@ -393,7 +406,10 @@ class RealtimeBridge:
             if websocket is None:
                 raise RuntimeError("sideband is not open")
             for event, payload in serialized:
-                await websocket.send(payload)
+                # An unbounded stalled send makes the sender cancellation-proof via
+                # _send_batch's shield loop, so bound every write on the wire.
+                async with asyncio.timeout(REALTIME_SEND_TIMEOUT_SECONDS):
+                    await websocket.send(payload)
                 sent.append(event)
         except BaseException as exc:
             failure = exc
@@ -638,8 +654,10 @@ class RealtimeBridge:
 
         # drain_and_close deliberately retains a cancellation-resistant runtime so
         # a later teardown can see it. Application shutdown has no later owner, so
-        # make one final bounded cancellation pass and keep dependencies open until
-        # every supervisor has actually returned.
+        # make one final bounded cancellation pass. A stalled send (see
+        # REALTIME_SEND_TIMEOUT_SECONDS) can still outlive cancellation briefly, so this
+        # wait itself is bounded rather than left to hang process shutdown; any task still
+        # outstanding after the timeout is logged and abandoned rather than awaited further.
         remaining = tuple(self._runtime.values())
         tasks = {
             task
@@ -655,7 +673,18 @@ class RealtimeBridge:
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                tasks, timeout=REALTIME_SHUTDOWN_FINAL_TIMEOUT_SECONDS
+            )
+            for task in done:
+                with contextlib.suppress(asyncio.CancelledError):
+                    task.exception()
+            if pending:
+                logger.error(
+                    "Realtime shutdown gave up waiting for %d task(s) to stop: %s",
+                    len(pending),
+                    ", ".join(sorted(task.get_name() for task in pending)),
+                )
         for runtime in remaining:
             if runtime.task is None or runtime.task.done():
                 self._runtime.pop(runtime.call_id, None)

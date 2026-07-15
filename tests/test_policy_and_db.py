@@ -230,6 +230,36 @@ async def test_latency_events_are_migration_safe_idempotent_and_correlated(datab
     assert "call_latency_events" in tables
 
 
+@pytest.mark.asyncio
+async def test_conference_cleanup_pending_column_and_round_trip(database, packet):
+    db = database
+    columns = {row["name"] for row in await db.fetch_all("PRAGMA table_info(calls)")}
+    assert "conference_cleanup_pending" in columns
+
+    await db.create_plan(
+        "plan_cleanup",
+        packet.model_dump(mode="json"),
+        "Owner explicitly requested the call",
+        datetime.now(UTC) + timedelta(minutes=10),
+    )
+    assert await db.claim_plan_and_create_call(
+        plan_id="plan_cleanup",
+        call_id="call_cleanup",
+        conference_name="conference_cleanup",
+        confirmation_text="Confirmed",
+    )
+    assert (await db.get_call("call_cleanup"))["conference_cleanup_pending"] == 0
+    assert await db.list_conference_cleanup_pending() == []
+
+    await db.set_conference_cleanup_pending("call_cleanup", True)
+    pending = await db.list_conference_cleanup_pending()
+    assert [row["call_id"] for row in pending] == ["call_cleanup"]
+    assert (await db.get_call("call_cleanup"))["conference_cleanup_pending"] == 1
+
+    await db.set_conference_cleanup_pending("call_cleanup", False)
+    assert await db.list_conference_cleanup_pending() == []
+
+
 @pytest.mark.parametrize(
     "phone",
     ["+1911", "+1933", "+1988", "+1211", "+19005550123", "14155550100"],

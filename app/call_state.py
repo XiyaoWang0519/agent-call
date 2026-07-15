@@ -109,6 +109,18 @@ class CallService:
         def finished(completed: asyncio.Task[Any]) -> None:
             self._background.discard(completed)
             self._must_finish_background.discard(completed)
+            if completed.cancelled():
+                return
+            # Some callers (e.g. owner transfer) attach their own logging callback too;
+            # a duplicate log line there is acceptable so every fire-and-forget failure
+            # is guaranteed to surface instead of only appearing as a GC-time warning.
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "background task failed name=%s",
+                    completed.get_name(),
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
         task.add_done_callback(finished)
         return task
@@ -874,6 +886,35 @@ class CallService:
                 event_key=str(item.get("call_id") or "unknown"),
             )
 
+    async def _guarded_send_tool_result(
+        self,
+        call_id: str,
+        tool_call_id: str,
+        output: dict[str, Any],
+        *,
+        continuation_instructions: str | None = None,
+    ) -> None:
+        """Swallow benign teardown races (e.g. "sideband is not open") so they cannot
+        escalate into a fatal error and redundant termination. CancelledError must still
+        propagate so the dispatcher stays cancellable."""
+
+        try:
+            await self.realtime.send_tool_result(
+                call_id,
+                tool_call_id,
+                output,
+                continuation_instructions=continuation_instructions,
+            )
+        except asyncio.CancelledError:
+            logger.warning("nontransfer tool output was cancelled call_id=%s", call_id)
+            raise
+        except Exception:
+            logger.warning(
+                "nontransfer tool output could not be delivered call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+
     async def _send_nontransfer_tool_result(
         self,
         call_id: str,
@@ -900,8 +941,21 @@ class CallService:
         if advisory_outcome is not None:
             # accepted=true represents business data that must survive a crash. Do not
             # acknowledge a valid advisory until the fused transaction is durable.
-            await persistence
-            await self.realtime.send_tool_result(
+            try:
+                await persistence
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("advisory outcome persistence failed call_id=%s", call_id)
+                # The model must not be left hanging with no tool result at all; best-effort
+                # tell it the outcome was not recorded, then surface the durability failure.
+                await self._guarded_send_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"accepted": False, "error": "outcome could not be persisted"},
+                )
+                raise
+            await self._guarded_send_tool_result(
                 call_id,
                 tool_call_id,
                 output,
@@ -909,7 +963,7 @@ class CallService:
             )
             return
         try:
-            await self.realtime.send_tool_result(
+            await self._guarded_send_tool_result(
                 call_id,
                 tool_call_id,
                 output,
@@ -1195,6 +1249,14 @@ class CallService:
                             name=f"retry-compensation-conference:{call_id}:{attempt}",
                         )
                         await self._await_network_task(completion, propagate_cancellation=True)
+                        try:
+                            await self.db.set_conference_cleanup_pending(call_id, False)
+                        except Exception:
+                            logger.warning(
+                                "failed to clear conference cleanup pending flag call_id=%s",
+                                call_id,
+                                exc_info=True,
+                            )
                         return
                     terminalization = asyncio.create_task(
                         self._finish_claimed_termination(
@@ -1240,11 +1302,29 @@ class CallService:
         )
         try:
             await self._await_network_task(completion)
-            return True
         except Exception:
             logger.warning("failed to compensate conference call_id=%s", call_id, exc_info=True)
+            try:
+                # The in-process retry must still be scheduled even if this durable marker
+                # write fails; the marker only aids crash recovery, it does not gate the retry.
+                await self.db.set_conference_cleanup_pending(call_id, True)
+            except Exception:
+                logger.warning(
+                    "failed to persist conference cleanup pending flag call_id=%s",
+                    call_id,
+                    exc_info=True,
+                )
             self._schedule_conference_completion_retry(call, reason=None)
             return False
+        try:
+            await self.db.set_conference_cleanup_pending(call_id, False)
+        except Exception:
+            logger.warning(
+                "failed to clear conference cleanup pending flag call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+        return True
 
     async def _owner_transfer_workflow(
         self,
@@ -2107,6 +2187,23 @@ class CallService:
                 logger.error("startup recovery scheduled teardown retry call_id=%s", call_id)
                 continue
             recovered.add(call_id)
+        # A crash between a failed compensation attempt and the in-process retry taking
+        # over would otherwise permanently orphan the Twilio conference: the call row is
+        # typically already terminal, so it is invisible to list_nonterminal_calls above.
+        for call in await self.db.list_conference_cleanup_pending():
+            call_id = call["call_id"]
+            if call_id in recovered:
+                continue
+            try:
+                # Twilio conference completion is idempotent (a 404 is treated as success
+                # in twilio_bridge), so a duplicate completion here is harmless.
+                await self._complete_conference_or_schedule(call)
+            except Exception:
+                logger.warning(
+                    "startup conference cleanup recovery failed call_id=%s",
+                    call_id,
+                    exc_info=True,
+                )
         # A crash can occur after telephony is terminal but before finalization committed.
         for call in await self.db.list_terminal_calls_needing_finalization():
             if call["call_id"] not in recovered:

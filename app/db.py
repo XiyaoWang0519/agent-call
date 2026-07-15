@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS calls (
     voicemail_sent INTEGER NOT NULL DEFAULT 0,
     termination_claimed INTEGER NOT NULL DEFAULT 0,
     termination_reason TEXT,
+    conference_cleanup_pending INTEGER NOT NULL DEFAULT 0,
     advisory_outcome_json TEXT,
     transfer_outcome TEXT,
     last_event_at TEXT NOT NULL,
@@ -266,6 +267,7 @@ class Database:
             "interruption_observed": "INTEGER NOT NULL DEFAULT 0",
             "opening_sent": "INTEGER NOT NULL DEFAULT 0",
             "twilio_owner_call_sid": "TEXT",
+            "conference_cleanup_pending": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, definition in migrations.items():
             if name not in existing:
@@ -506,6 +508,15 @@ class Database:
                   )""",  # noqa: S608
             tuple(state.value for state in TERMINAL_STATES),
         )
+
+    async def set_conference_cleanup_pending(self, call_id: str, pending: bool) -> None:
+        await self.execute(
+            "UPDATE calls SET conference_cleanup_pending=? WHERE call_id=?",
+            (1 if pending else 0, call_id),
+        )
+
+    async def list_conference_cleanup_pending(self) -> list[dict[str, Any]]:
+        return await self.fetch_all("SELECT * FROM calls WHERE conference_cleanup_pending=1")
 
     async def touch_call(self, call_id: str) -> None:
         await self.execute(

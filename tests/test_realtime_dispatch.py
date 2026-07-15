@@ -399,6 +399,74 @@ async def test_close_all_stops_every_registered_runtime(settings, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_close_all_gives_up_on_cancellation_resistant_task_and_logs(
+    settings, monkeypatch, caplog
+):
+    # Keep drain_and_close's own bounded retries fast so the test exercises close_all's
+    # final bounded pass rather than timing out inside drain_and_close first.
+    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0)
+    monkeypatch.setattr("app.openai_realtime.REALTIME_TASK_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.openai_realtime.REALTIME_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.openai_realtime.REALTIME_SHUTDOWN_FINAL_TIMEOUT_SECONDS", 0.05)
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        # Swallows cancellation like a stalled send shielded by _send_batch would, so
+        # close_all's final wait must give up rather than hang forever.
+        while True:
+            try:
+                await release.wait()
+                return
+            except asyncio.CancelledError:
+                continue
+
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    task = asyncio.create_task(stubborn(), name="sideband:call_stuck")
+    runtime = RealtimeRuntime(call_id="call_stuck", openai_call_id="rtc_stuck")
+    runtime.task = task
+    bridge._runtime[runtime.call_id] = runtime
+
+    try:
+        with caplog.at_level("ERROR", logger="app.openai_realtime"):
+            await asyncio.wait_for(bridge.close_all(), timeout=2)
+
+        assert any("sideband:call_stuck" in record.getMessage() for record in caplog.records)
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_stalled_websocket_send_raises_timeout(settings, monkeypatch):
+    monkeypatch.setattr("app.openai_realtime.REALTIME_SEND_TIMEOUT_SECONDS", 0.05)
+
+    class HangingWebSocket:
+        async def send(self, message: str) -> None:
+            # Never returns, modeling a dead TCP connection mid-send.
+            await asyncio.Event().wait()
+
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    runtime = RealtimeRuntime(call_id="call_stalled_send", openai_call_id="rtc_stalled_send")
+    runtime.websocket = HangingWebSocket()
+    bridge._runtime[runtime.call_id] = runtime
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(bridge.send(runtime.call_id, {"type": "test.event"}), timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_preserves_fifo_order(settings, monkeypatch):
     websocket = QueueWebSocket()
     handled: list[int] = []
