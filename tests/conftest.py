@@ -137,7 +137,7 @@ class FakeRealtime:
                     "input": {
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "high",
+                            "eagerness": "auto",
                             "create_response": True,
                             "interrupt_response": True,
                         }
@@ -153,7 +153,7 @@ class FakeRealtime:
                         "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "high",
+                            "eagerness": "auto",
                             "create_response": False,
                             "interrupt_response": False,
                         },
@@ -180,7 +180,7 @@ class FakeRealtime:
         turn = event["session"]["audio"]["input"]["turn_detection"]
         return (
             turn["type"] == "semantic_vad"
-            and turn["eagerness"] == "high"
+            and turn["eagerness"] == "auto"
             and turn["create_response"] is True
             and turn["interrupt_response"] is True
         )
@@ -231,7 +231,7 @@ class FakeRealtime:
         turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
         return (
             turn.get("type") == "semantic_vad"
-            and turn.get("eagerness") == "high"
+            and turn.get("eagerness") == "auto"
             and turn.get("create_response") is False
             and turn.get("interrupt_response") is False
         )

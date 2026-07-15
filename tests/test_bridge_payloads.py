@@ -209,7 +209,7 @@ async def test_sideband_receives_initial_update_echo_while_open_handler_waits(
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "high",
+                        "eagerness": "auto",
                         "create_response": False,
                         "interrupt_response": False,
                     },
@@ -272,7 +272,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
                 "input": {
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "high",
+                        "eagerness": "auto",
                         "create_response": True,
                         "interrupt_response": True,
                     }
@@ -295,7 +295,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
                         "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "high",
+                            "eagerness": "auto",
                             "create_response": True,
                             "interrupt_response": True,
                         },
@@ -329,7 +329,7 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "semantic_vad",
-                        "eagerness": "high",
+                        "eagerness": "auto",
                         "create_response": False,
                         "interrupt_response": False,
                     },
@@ -350,7 +350,7 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
                         "transcription": {"model": "gpt-4o-mini-transcribe"},
                         "turn_detection": {
                             "type": "semantic_vad",
-                            "eagerness": "high",
+                            "eagerness": "auto",
                             "create_response": False,
                             "interrupt_response": False,
                         },

@@ -72,10 +72,10 @@ def test_semantic_vad_accepts_supported_eagerness(eagerness: str):
     assert vad.eagerness == eagerness
 
 
-def test_semantic_vad_defaults_to_high_and_rejects_unknown_value():
+def test_semantic_vad_defaults_to_auto_and_rejects_unknown_value():
     vad = SemanticVad(create_response=True, interrupt_response=True)
 
-    assert vad.eagerness == "high"
+    assert vad.eagerness == "auto"
     with pytest.raises(ValidationError):
         SemanticVad(
             eagerness="fast",

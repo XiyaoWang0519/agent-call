@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])
     input_transcription_model: str = "gpt-4o-mini-transcribe"
     input_transcription_delay: str | None = None
-    semantic_vad_eagerness: Literal["low", "medium", "high", "auto"] = "high"
+    semantic_vad_eagerness: Literal["low", "medium", "high", "auto"] = "auto"
     openai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     openai_keepalive_expiry_seconds: float | None = Field(default=60.0, ge=5, le=300)

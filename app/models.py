@@ -197,7 +197,7 @@ class SemanticVad(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["semantic_vad"] = "semantic_vad"
-    eagerness: Literal["low", "medium", "high", "auto"] = "high"
+    eagerness: Literal["low", "medium", "high", "auto"] = "auto"
     create_response: bool
     interrupt_response: bool
 
