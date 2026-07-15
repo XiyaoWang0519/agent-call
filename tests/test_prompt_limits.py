@@ -51,6 +51,21 @@ def test_normal_context_uses_compact_approved_json(packet: ContextPacket):
     assert len(instructions.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
 
 
+def test_ending_instructions_gate_on_callee_engagement(packet: ContextPacket):
+    """Regression: the model once armed end_call while the callee's request (a joke) was
+    still pending, folding the answer into the goodbye. Ending must require both a complete
+    objective and a callee with nothing further."""
+
+    flattened = realtime_instructions(packet).replace("\n", " ")
+
+    assert "the callee has nothing further" in flattened
+    assert (
+        "A pending question or request from the callee means the conversation is not finished"
+        in flattened
+    )
+    assert "answer it fully as a normal turn first" in flattened
+
+
 def test_realtime_instructions_enforce_final_byte_limit(
     packet: ContextPacket, monkeypatch: pytest.MonkeyPatch
 ):

@@ -122,9 +122,12 @@ class RealtimeBridge:
                     "type": "function",
                     "name": "end_call",
                     "description": (
-                        "Request the end of the phone call when the conversation is finished. Call "
-                        "this immediately instead of waiting for the callee or outer client to hang "
-                        "up. After it succeeds, you will be prompted to say the final goodbye."
+                        "Request the end of the phone call once the conversation is truly "
+                        "finished: the objective is resolved and the callee has nothing further. "
+                        "If the callee just asked a question or made a request, answer it fully "
+                        "as a normal turn before calling this. Once finished, call this promptly "
+                        "instead of waiting for the callee or outer client to hang up. After it "
+                        "succeeds, you will be prompted to say the final goodbye."
                     ),
                     "parameters": {
                         "type": "object",
