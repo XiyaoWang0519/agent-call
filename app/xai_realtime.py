@@ -34,6 +34,18 @@ REALTIME_TASK_CANCEL_TIMEOUT_SECONDS = 1.0
 REALTIME_SEND_TIMEOUT_SECONDS = 10.0
 REALTIME_SHUTDOWN_FINAL_TIMEOUT_SECONDS = 10.0
 _EVENT_QUEUE_CLOSED = object()
+_LOGGED_REALTIME_EVENT_TYPES = {
+    "session.updated",
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "input_audio_buffer.committed",
+    "conversation.item.input_audio_transcription.completed",
+    "response.created",
+    "response.output_audio.done",
+    "response.output_audio_transcript.done",
+    "response.done",
+    "error",
+}
 
 
 class RealtimeEventQueueOverflow(RuntimeError):
@@ -266,6 +278,16 @@ class RealtimeBridge:
     async def _receive_events(self, runtime: RealtimeRuntime, websocket: Any) -> None:
         async for message in websocket:
             event = json.loads(message)
+            event_type = event.get("type")
+            if event_type in _LOGGED_REALTIME_EVENT_TYPES:
+                response = event.get("response") or {}
+                logger.info(
+                    "Realtime event received call_id=%s type=%s event_id=%s response_id=%s",
+                    runtime.call_id,
+                    event_type,
+                    event.get("event_id"),
+                    response.get("id") or event.get("response_id"),
+                )
             # Record liveness on the reader fast path. Application dispatch may be
             # intentionally backlogged, but a frame already read from the socket is
             # authoritative evidence that the call is still alive.
@@ -416,9 +438,14 @@ class RealtimeBridge:
             raise failure
 
     async def _notify_sent(self, call_id: str, events: list[dict[str, Any]]) -> None:
-        if self.on_send is None:
-            return
         for event in events:
+            logger.info(
+                "Realtime control sent call_id=%s type=%s",
+                call_id,
+                event.get("type"),
+            )
+            if self.on_send is None:
+                continue
             try:
                 await self.on_send(call_id, event)
             except Exception:

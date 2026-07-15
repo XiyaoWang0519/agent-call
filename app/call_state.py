@@ -51,7 +51,7 @@ TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS = 12.0
 TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
-OPENING_AUTO_RESPONSE_GRACE_SECONDS = 0.1
+OPENING_INPUT_SETTLE_SECONDS = 0.1
 
 
 class OwnerTransferDeparted(RuntimeError):
@@ -98,7 +98,7 @@ class CallService:
         self._owner_transfer_locks: dict[str, asyncio.Lock] = {}
         self._opening_transition_locks: dict[str, asyncio.Lock] = {}
         self._input_speech_active: set[str] = set()
-        self._opening_waiting_for_input_commit: set[str] = set()
+        self._opening_waiting_for_input_end: set[str] = set()
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
         self._active_response_ids: dict[str, str | None] = {}
@@ -721,10 +721,10 @@ class CallService:
             if call.get("answer_handling") == "voicemail":
                 return
             if call_id in self._input_speech_active:
-                self._opening_waiting_for_input_commit.add(call_id)
-                logger.info("deferring opening until caller input commits call_id=%s", call_id)
+                self._opening_waiting_for_input_end.add(call_id)
+                logger.info("deferring opening until caller speech ends call_id=%s", call_id)
                 return
-            self._opening_waiting_for_input_commit.discard(call_id)
+            self._opening_waiting_for_input_end.discard(call_id)
             if not await self.db.claim_opening_if_not_voicemail(call_id):
                 return
 
@@ -737,19 +737,31 @@ class CallService:
         # Twilio round-trip can never delay the model's response.create.
         await self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))
 
-    async def _resume_opening_after_input_commit(self, call_id: str) -> None:
-        # Grok may automatically create a response for a server-VAD commit. Give that
-        # response.created event a brief chance to arrive before issuing the manual fallback.
-        await asyncio.sleep(OPENING_AUTO_RESPONSE_GRACE_SECONDS)
-        if call_id in self._opening_waiting_for_input_commit:
+    async def _resume_opening_after_input_end(self, call_id: str, source: str) -> None:
+        # speech_stopped precedes Grok's internal audio commit. Let that settle before issuing
+        # response.create, while transcription completion remains a fallback for SIP sessions
+        # that omit input_audio_buffer.committed.
+        await asyncio.sleep(OPENING_INPUT_SETTLE_SECONDS)
+        if call_id in self._opening_waiting_for_input_end:
+            logger.info("resuming deferred opening call_id=%s source=%s", call_id, source)
             await self._start_opening_on_answer(call_id)
+
+    async def _release_deferred_opening_after_input(self, call_id: str, source: str) -> None:
+        async with self._opening_transition_lock(call_id):
+            self._input_speech_active.discard(call_id)
+            resume_opening = call_id in self._opening_waiting_for_input_end
+        if resume_opening:
+            self._spawn(
+                self._resume_opening_after_input_end(call_id, source),
+                name=f"resume-opening:{call_id}:{source}",
+            )
 
     async def _adopt_automatic_opening(self, call_id: str) -> None:
         call: dict[str, Any] | None = None
         async with self._opening_transition_lock(call_id):
-            if call_id not in self._opening_waiting_for_input_commit:
+            if call_id not in self._opening_waiting_for_input_end:
                 return
-            self._opening_waiting_for_input_commit.discard(call_id)
+            self._opening_waiting_for_input_end.discard(call_id)
             call = await self.db.get_call(call_id)
             if call is None or CallState(call["state"]) in TERMINAL_STATES:
                 return
@@ -834,16 +846,13 @@ class CallService:
         elif event_type == "input_audio_buffer.speech_started":
             async with self._opening_transition_lock(call_id):
                 self._input_speech_active.add(call_id)
-        elif event_type == "input_audio_buffer.committed":
-            async with self._opening_transition_lock(call_id):
-                self._input_speech_active.discard(call_id)
-                resume_opening = call_id in self._opening_waiting_for_input_commit
-            if resume_opening:
-                self._spawn(
-                    self._resume_opening_after_input_commit(call_id),
-                    name=f"resume-opening:{call_id}",
-                )
+        elif event_type in {
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+        }:
+            await self._release_deferred_opening_after_input(call_id, event_type)
         elif event_type == "conversation.item.input_audio_transcription.completed":
+            await self._release_deferred_opening_after_input(call_id, event_type)
             text = event.get("transcript", "").strip()
             if text:
                 await self.db.add_transcript_turn(
@@ -2118,7 +2127,7 @@ class CallService:
         self._owner_transfer_tasks.pop(call_id, None)
         self._owner_transfer_locks.pop(call_id, None)
         self._input_speech_active.discard(call_id)
-        self._opening_waiting_for_input_commit.discard(call_id)
+        self._opening_waiting_for_input_end.discard(call_id)
         self._opening_transition_locks.pop(call_id, None)
         self._tool_seen_calls.discard(call_id)
         try:

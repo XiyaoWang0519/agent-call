@@ -189,8 +189,8 @@ async def test_callee_answered_status_starts_opening_before_conference_join(serv
 
 
 @pytest.mark.asyncio
-async def test_caller_speech_defers_opening_until_input_commits(service, packet, monkeypatch):
-    monkeypatch.setattr("app.call_state.OPENING_AUTO_RESPONSE_GRACE_SECONDS", 0)
+async def test_caller_speech_defers_opening_until_speech_stops(service, packet, monkeypatch):
+    monkeypatch.setattr("app.call_state.OPENING_INPUT_SETTLE_SECONDS", 0)
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
 
@@ -209,19 +209,6 @@ async def test_caller_speech_defers_opening_until_input_commits(service, packet,
             "event_id": "evt_speech_stopped",
         },
     )
-
-    call = await service.db.get_call(call_id)
-    assert call["opening_sent"] == 0
-    assert service._test_realtime.events == []
-    assert service._test_twilio.unmuted == []
-
-    await service.handle_realtime_event(
-        call_id,
-        {
-            "type": "input_audio_buffer.committed",
-            "event_id": "evt_input_committed",
-        },
-    )
     await wait_background()
 
     call = await service.db.get_call(call_id)
@@ -231,10 +218,50 @@ async def test_caller_speech_defers_opening_until_input_commits(service, packet,
 
 
 @pytest.mark.asyncio
+async def test_transcript_completion_releases_opening_when_commit_event_is_missing(
+    service, packet, monkeypatch
+):
+    monkeypatch.setattr("app.call_state.OPENING_INPUT_SETTLE_SECONDS", 0)
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "input_audio_buffer.speech_started",
+            "event_id": "evt_speech_started",
+        },
+    )
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+
+    call = await service.db.get_call(call_id)
+    assert call["opening_sent"] == 0
+    assert service._test_realtime.events == []
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "event_id": "evt_transcript_completed",
+            "item_id": "item_hello",
+            "transcript": "Hello?",
+        },
+    )
+    await wait_background()
+
+    call = await service.db.get_call(call_id)
+    assert call["opening_sent"] == 1
+    assert service._test_realtime.events == [("opening", call_id)]
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
+    transcript = await service.db.get_transcript(call_id)
+    assert [turn.text for turn in transcript] == ["Hello?"]
+
+
+@pytest.mark.asyncio
 async def test_auto_response_adopts_deferred_opening_without_duplicate_create(
     service, packet, monkeypatch
 ):
-    monkeypatch.setattr("app.call_state.OPENING_AUTO_RESPONSE_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr("app.call_state.OPENING_INPUT_SETTLE_SECONDS", 0.01)
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
 
@@ -249,8 +276,8 @@ async def test_auto_response_adopts_deferred_opening_without_duplicate_create(
     await service.handle_realtime_event(
         call_id,
         {
-            "type": "input_audio_buffer.committed",
-            "event_id": "evt_input_committed",
+            "type": "input_audio_buffer.speech_stopped",
+            "event_id": "evt_speech_stopped",
         },
     )
     await service.handle_realtime_event(
