@@ -189,6 +189,87 @@ async def test_callee_answered_status_starts_opening_before_conference_join(serv
 
 
 @pytest.mark.asyncio
+async def test_caller_speech_defers_opening_until_input_commits(service, packet, monkeypatch):
+    monkeypatch.setattr("app.call_state.OPENING_AUTO_RESPONSE_GRACE_SECONDS", 0)
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "input_audio_buffer.speech_started",
+            "event_id": "evt_speech_started",
+        },
+    )
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "event_id": "evt_speech_stopped",
+        },
+    )
+
+    call = await service.db.get_call(call_id)
+    assert call["opening_sent"] == 0
+    assert service._test_realtime.events == []
+    assert service._test_twilio.unmuted == []
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "input_audio_buffer.committed",
+            "event_id": "evt_input_committed",
+        },
+    )
+    await wait_background()
+
+    call = await service.db.get_call(call_id)
+    assert call["opening_sent"] == 1
+    assert service._test_realtime.events == [("opening", call_id)]
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
+
+
+@pytest.mark.asyncio
+async def test_auto_response_adopts_deferred_opening_without_duplicate_create(
+    service, packet, monkeypatch
+):
+    monkeypatch.setattr("app.call_state.OPENING_AUTO_RESPONSE_GRACE_SECONDS", 0.01)
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "input_audio_buffer.speech_started",
+            "event_id": "evt_speech_started",
+        },
+    )
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "input_audio_buffer.committed",
+            "event_id": "evt_input_committed",
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.created",
+            "event_id": "evt_response_created",
+            "response": {"id": "resp_auto"},
+        },
+    )
+    await wait_background()
+
+    call = await service.db.get_call(call_id)
+    assert call["opening_sent"] == 1
+    assert service._test_realtime.events == []
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
+
+
+@pytest.mark.asyncio
 async def test_opening_exactly_once_after_confirmed_session_update(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)

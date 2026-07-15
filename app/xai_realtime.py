@@ -474,13 +474,7 @@ class RealtimeBridge:
         )
 
     async def create_opening(self, call_id: str) -> None:
-        await self.send(
-            call_id,
-            {
-                "type": "response.create",
-                "response": {"output_modalities": ["audio"]},
-            },
-        )
+        await self.send(call_id, {"type": "response.create"})
 
     async def cancel_response(self, call_id: str, response_id: str | None = None) -> None:
         event: dict[str, Any] = {"type": "response.cancel"}
@@ -494,7 +488,6 @@ class RealtimeBridge:
             {
                 "type": "response.create",
                 "response": {
-                    "output_modalities": ["audio"],
                     "instructions": (
                         "Leave one concise voicemail that advances the approved objective using only "
                         "the approved context. Do not ask questions."
@@ -526,7 +519,6 @@ class RealtimeBridge:
             continuation: dict[str, Any] = {"type": "response.create"}
             if continuation_instructions:
                 continuation["response"] = {
-                    "output_modalities": ["audio"],
                     "instructions": continuation_instructions,
                 }
             events.append(continuation)

@@ -106,12 +106,7 @@ async def test_opening_response_uses_session_context_without_a_script(settings):
 
     await bridge.create_opening("call_1")
 
-    assert websocket.messages == [
-        {
-            "type": "response.create",
-            "response": {"output_modalities": ["audio"]},
-        }
-    ]
+    assert websocket.messages == [{"type": "response.create"}]
 
 
 @pytest.mark.asyncio
@@ -539,7 +534,6 @@ async def test_terminal_function_output_creates_a_dedicated_closing_response(set
         {
             "type": "response.create",
             "response": {
-                "output_modalities": ["audio"],
                 "instructions": "Say one concise goodbye. Do not call any function.",
             },
         },
