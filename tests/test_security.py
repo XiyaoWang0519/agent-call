@@ -66,6 +66,8 @@ def test_authorized_mcp_endpoint_exposes_exact_tool_set(settings):
         "get_call_result",
         "end_phone_call",
         "get_phone_call",
+        "wait_for_call_event",
+        "answer_call_question",
     }
 
 
@@ -278,7 +280,7 @@ def test_signed_twilio_callback_requires_matching_plan_mapping(settings, packet)
     assert wrong.status_code == 400
 
 
-async def test_exactly_five_mcp_tools(settings):
+async def test_exactly_seven_mcp_tools(settings):
     app = create_app(settings)
     tools = await app.state.mcp.list_tools()
     assert {tool.name for tool in tools} == {
@@ -287,4 +289,6 @@ async def test_exactly_five_mcp_tools(settings):
         "get_call_result",
         "end_phone_call",
         "get_phone_call",
+        "wait_for_call_event",
+        "answer_call_question",
     }

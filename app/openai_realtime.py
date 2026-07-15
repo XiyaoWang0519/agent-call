@@ -81,8 +81,122 @@ class RealtimeBridge:
         self._runtime: dict[str, RealtimeRuntime] = {}
 
     def build_accept_payload(self, packet: ContextPacket) -> AcceptPayload:
+        tools: list[dict[str, Any]] = [
+            {
+                "type": "function",
+                "name": "transfer_to_owner",
+                "description": "Transfer only when the owner must personally take over.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"reason": {"type": "string"}},
+                    "required": ["reason"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "record_call_outcome",
+                "description": "Advisory summary of explicit outcomes near the end of the call.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "commitments": {"type": "array", "items": {"type": "string"}},
+                        "followUps": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["status", "summary", "commitments", "followUps"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "search_web",
+                "description": (
+                    "Search the public web for current, recent, location-specific, or "
+                    "uncertain factual information. Use a standalone query with the exact "
+                    "entity, location, and date context."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 2,
+                            "maxLength": 500,
+                            "description": (
+                                "A standalone natural-language web search query with all "
+                                "context needed to understand it."
+                            ),
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+        if self.settings.ask_poke_enabled:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "ask_poke",
+                    "description": (
+                        "Ask the owner's assistant (Poke) one question it can answer from the "
+                        "owner's information — account details, preferences, confirmations not "
+                        "in your approved context. Tell the callee you are checking BEFORE "
+                        "calling this. You will receive the answer or a timeout as the function "
+                        "result. Never guess while waiting."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "minLength": 5,
+                                "maxLength": 500,
+                            },
+                            "reason": {"type": "string", "maxLength": 200},
+                        },
+                        "required": ["question"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+        tools.append(
+            {
+                "type": "function",
+                "name": "end_call",
+                "description": (
+                    "Request the end of the phone call once the conversation is truly "
+                    "finished: the objective is resolved and the callee has nothing further. "
+                    "If the callee just asked a question or made a request, answer it fully "
+                    "as a normal turn before calling this. Once finished, call this promptly "
+                    "instead of waiting for the callee or outer client to hang up. After it "
+                    "succeeds, you will be prompted to say the final goodbye."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "enum": [
+                                "objective_completed",
+                                "callee_declined",
+                                "wrong_number",
+                                "unable_to_complete",
+                                "out_of_scope",
+                            ],
+                        }
+                    },
+                    "required": ["reason"],
+                    "additionalProperties": False,
+                },
+            }
+        )
         return AcceptPayload(
-            instructions=realtime_instructions(packet),
+            instructions=realtime_instructions(
+                packet, ask_poke_enabled=self.settings.ask_poke_enabled
+            ),
             audio={
                 "input": self._input_audio_config(create_response=False, interrupt_response=False),
                 "output": {
@@ -90,89 +204,7 @@ class RealtimeBridge:
                     "speed": 1.0,
                 },
             },
-            tools=[
-                {
-                    "type": "function",
-                    "name": "transfer_to_owner",
-                    "description": "Transfer only when the owner must personally take over.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"reason": {"type": "string"}},
-                        "required": ["reason"],
-                        "additionalProperties": False,
-                    },
-                },
-                {
-                    "type": "function",
-                    "name": "record_call_outcome",
-                    "description": "Advisory summary of explicit outcomes near the end of the call.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "status": {"type": "string"},
-                            "summary": {"type": "string"},
-                            "commitments": {"type": "array", "items": {"type": "string"}},
-                            "followUps": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["status", "summary", "commitments", "followUps"],
-                        "additionalProperties": False,
-                    },
-                },
-                {
-                    "type": "function",
-                    "name": "search_web",
-                    "description": (
-                        "Search the public web for current, recent, location-specific, or "
-                        "uncertain factual information. Use a standalone query with the exact "
-                        "entity, location, and date context."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "minLength": 2,
-                                "maxLength": 500,
-                                "description": (
-                                    "A standalone natural-language web search query with all "
-                                    "context needed to understand it."
-                                ),
-                            }
-                        },
-                        "required": ["query"],
-                        "additionalProperties": False,
-                    },
-                },
-                {
-                    "type": "function",
-                    "name": "end_call",
-                    "description": (
-                        "Request the end of the phone call once the conversation is truly "
-                        "finished: the objective is resolved and the callee has nothing further. "
-                        "If the callee just asked a question or made a request, answer it fully "
-                        "as a normal turn before calling this. Once finished, call this promptly "
-                        "instead of waiting for the callee or outer client to hang up. After it "
-                        "succeeds, you will be prompted to say the final goodbye."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "reason": {
-                                "type": "string",
-                                "enum": [
-                                    "objective_completed",
-                                    "callee_declined",
-                                    "wrong_number",
-                                    "unable_to_complete",
-                                    "out_of_scope",
-                                ],
-                            }
-                        },
-                        "required": ["reason"],
-                        "additionalProperties": False,
-                    },
-                },
-            ],
+            tools=tools,
         )
 
     async def accept_and_connect(

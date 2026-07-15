@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from collections import OrderedDict
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import monotonic_ns
 from typing import Any
@@ -23,6 +26,7 @@ from app.finalizer import Finalizer
 from app.models import (
     TERMINAL_STATES,
     AdvisoryOutcome,
+    AskPokeRequest,
     CallSnapshot,
     CallState,
     ContextPacket,
@@ -34,6 +38,7 @@ from app.models import (
 )
 from app.openai_client import create_openai_client
 from app.openai_realtime import RealtimeBridge
+from app.poke_push import push_message_to_poke
 from app.policy import validate_context
 from app.settings import Settings
 from app.twilio_bridge import TwilioBridge
@@ -53,6 +58,14 @@ TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS = 12.0
 TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
+WATCHDOG_QUESTION_GRACE_SECONDS = 5.0
+
+
+@dataclass(slots=True)
+class PendingQuestion:
+    question_id: str
+    tool_call_id: str
+    deadline_monotonic: float
 
 
 class OwnerTransferDeparted(RuntimeError):
@@ -108,6 +121,8 @@ class CallService:
         self._tool_seen_calls: set[str] = set()
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._pending_questions: dict[str, PendingQuestion] = {}
+        self._event_notifiers: dict[str, asyncio.Event] = {}
 
     def _spawn(self, coroutine, *, name: str, must_finish: bool = False) -> asyncio.Task[Any]:
         if self._stopping and not must_finish:
@@ -1102,6 +1117,18 @@ class CallService:
                 self._voice_end_fallback(call_id, tool_call_id),
                 name=f"voice-end-fallback:{call_id}",
             )
+            # A pending ask_poke answer or timeout must not deliver into the goodbye
+            # turn; resolve the question now so both delivery paths lose their claims.
+            self._clear_pending_question(call_id)
+            try:
+                await self.db.cancel_pending_questions(call_id)
+            except Exception:
+                logger.warning(
+                    "pending question cancellation failed at end_call call_id=%s",
+                    call_id,
+                    exc_info=True,
+                )
+            self._notify_call_event(call_id)
             await self._send_nontransfer_tool_result(
                 call_id,
                 tool_call_id,
@@ -1135,6 +1162,14 @@ class CallService:
                     )
             finally:
                 await persistence
+        elif name == "ask_poke":
+            await self._handle_ask_poke(
+                call_id,
+                tool_call_id,
+                arguments,
+                received=received,
+                event_key=event_key,
+            )
         else:
             await self._send_nontransfer_tool_result(
                 call_id,
@@ -1143,6 +1178,328 @@ class CallService:
                 received=received,
                 event_key=event_key,
             )
+
+    async def _handle_ask_poke(
+        self,
+        call_id: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        *,
+        received: LatencyMark,
+        event_key: str,
+    ) -> None:
+        try:
+            request = AskPokeRequest.model_validate(arguments)
+        except Exception:
+            logger.info("invalid ask_poke tool arguments call_id=%s", call_id)
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"status": "error", "error": "invalid_question"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+
+        if not self.settings.ask_poke_enabled:
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"status": "error", "error": "ask_poke_disabled"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+        if call_id in self._voice_end_pending:
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"status": "error", "error": "call_ending"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+        asked_count = await self.db.count_call_questions(call_id)
+        if asked_count >= self.settings.ask_poke_max_questions_per_call:
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"status": "error", "error": "question_limit_reached"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+
+        deadline_at = (
+            datetime.now(UTC) + timedelta(seconds=self.settings.ask_poke_answer_timeout_seconds)
+        ).isoformat()
+        row, error = await self.db.create_question(
+            call_id,
+            tool_call_id=tool_call_id,
+            question=request.question,
+            reason=request.reason,
+            deadline_at=deadline_at,
+        )
+        if error is not None or row is None:
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"status": "error", "error": error or "call_not_active"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+
+        # Register the pending question and wake parked long-polls before any further
+        # awaits, so a concurrent answer or termination sees (and can clear) the entry
+        # instead of racing a registration that has not happened yet.
+        self._pending_questions[call_id] = PendingQuestion(
+            question_id=row["question_id"],
+            tool_call_id=tool_call_id,
+            deadline_monotonic=time.monotonic() + self.settings.ask_poke_answer_timeout_seconds,
+        )
+        self._notify_call_event(call_id)
+        try:
+            await self.db.record_tool_call(
+                call_id,
+                latency_mark=received,
+                event_key=event_key,
+            )
+        except Exception:
+            logger.exception("ask_poke tool receipt persistence failed call_id=%s", call_id)
+
+        self._queue_latency(
+            call_id,
+            LatencyStage.ASK_POKE_ASKED,
+            LatencyMark.now(),
+            event_key=str(row["question_id"]),
+        )
+        if self.settings.poke_push_enabled:
+            self._spawn(
+                push_message_to_poke(
+                    self.settings,
+                    {
+                        "type": "call_question",
+                        "call_id": call_id,
+                        "question_id": row["question_id"],
+                        "question": request.question,
+                        "reason": request.reason,
+                        "sequence_number": row["sequence_number"],
+                    },
+                ),
+                name=f"poke-push-question:{call_id}:{row['question_id']}",
+            )
+        self._spawn(
+            self._question_deadline(call_id, row["question_id"]),
+            name=f"question-deadline:{call_id}:{row['question_id']}",
+            must_finish=False,
+        )
+        # Leave the OpenAI function call open — answer/timeout deliver out-of-band.
+
+    def _notify_call_event(self, call_id: str) -> None:
+        ev = self._event_notifiers.pop(call_id, None)
+        if ev is not None:
+            ev.set()
+
+    async def _cancel_active_response(self, call_id: str) -> None:
+        # An out-of-band function_call_output + response.create must not collide with a
+        # VAD-triggered response already in flight: OpenAI rejects the create and the
+        # generic error branch would terminate the call.
+        if call_id not in self._active_response_ids:
+            return
+        response_id = self._active_response_ids.pop(call_id, None)
+        try:
+            await self.realtime.cancel_response(call_id, response_id)
+        except Exception:
+            logger.warning(
+                "could not cancel active response before out-of-band tool result call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+
+    def _clear_pending_question(self, call_id: str, question_id: str | None = None) -> None:
+        pending = self._pending_questions.get(call_id)
+        if pending is None:
+            return
+        if question_id is not None and pending.question_id != question_id:
+            return
+        self._pending_questions.pop(call_id, None)
+
+    async def _deliver_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
+        if call_id in self._voice_end_pending:
+            # The goodbye turn owns the sideband now; do not inject an answer relay.
+            logger.info("suppressing question answer delivery during voice end call_id=%s", call_id)
+            self._clear_pending_question(call_id, question_row["question_id"])
+            self._notify_call_event(call_id)
+            return
+        await self._cancel_active_response(call_id)
+        output = {"status": "answered", "answer": question_row["answer"]}
+        await self._guarded_send_tool_result(
+            call_id,
+            question_row["tool_call_id"],
+            output,
+            continuation_instructions=(
+                "Poke answered your question. Relay the relevant part to the callee naturally, "
+                "in one or two sentences. Do not read metadata or mention Poke by name."
+            ),
+        )
+        self._queue_latency(
+            call_id,
+            LatencyStage.ASK_POKE_RESOLVED,
+            LatencyMark.now(),
+            event_key=str(question_row["question_id"]),
+        )
+        self._note_call_activity(call_id)
+        self._clear_pending_question(call_id, question_row["question_id"])
+        self._notify_call_event(call_id)
+
+    async def _question_deadline(self, call_id: str, question_id: str) -> None:
+        await asyncio.sleep(self.settings.ask_poke_answer_timeout_seconds)
+        if call_id in self._voice_end_pending:
+            # end_call already cancels pending questions; the goodbye owns the sideband.
+            return
+        try:
+            row = await self.db.claim_question_expiry(question_id)
+        except Exception:
+            logger.exception(
+                "question expiry claim failed call_id=%s question_id=%s", call_id, question_id
+            )
+            self._clear_pending_question(call_id, question_id)
+            self._notify_call_event(call_id)
+            return
+        if row is None:
+            # Lost the claim (answered or cancelled); drop a stale watchdog carve-out
+            # entry left behind if resolution raced our registration.
+            self._clear_pending_question(call_id, question_id)
+            return
+        await self._cancel_active_response(call_id)
+        await self._guarded_send_tool_result(
+            call_id,
+            row["tool_call_id"],
+            {
+                "status": "timeout",
+                "error": "no_answer_from_poke",
+                "guidance": "Owner's assistant did not respond in time.",
+            },
+            continuation_instructions=(
+                "You could not confirm this information. Tell the callee you cannot confirm it "
+                "right now. Do NOT guess or invent an answer. Offer to take a message or proceed "
+                "without it. Only offer transfer_to_owner if it is already authorized for this call."
+            ),
+        )
+        self._queue_latency(
+            call_id,
+            LatencyStage.ASK_POKE_RESOLVED,
+            LatencyMark.now(),
+            event_key=question_id,
+        )
+        self._note_call_activity(call_id)
+        self._clear_pending_question(call_id, question_id)
+        self._notify_call_event(call_id)
+
+    async def wait_for_call_event(
+        self,
+        call_id: str,
+        after_sequence: int = 0,
+        timeout_seconds: float = 20.0,
+    ) -> dict[str, Any]:
+        timeout = max(
+            0.0, min(float(timeout_seconds), self.settings.wait_for_call_event_max_seconds)
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        # Clamp to SQLite's INTEGER range; an absurd cursor is a caller bug, not a 500.
+        after = min(max(0, int(after_sequence)), 2**63 - 1)
+
+        while True:
+            # Subscribe before reading so a notify that fires between the reads below
+            # and the wait cannot be lost; a set event only costs one extra re-read.
+            notifier = self._event_notifiers.setdefault(call_id, asyncio.Event())
+            call = await self.db.get_call(call_id)
+            if call is None:
+                if self._event_notifiers.get(call_id) is notifier:
+                    self._event_notifiers.pop(call_id, None)
+                raise LookupError(call_id)
+            state = CallState(call["state"])
+            terminal = state in TERMINAL_STATES or state == CallState.TERMINATING
+            questions = await self.db.get_questions_after(call_id, after)
+            remaining = deadline - loop.time()
+            if questions or terminal or remaining <= 0:
+                if terminal and self._event_notifiers.get(call_id) is notifier:
+                    self._event_notifiers.pop(call_id, None)
+                events = [
+                    {
+                        "sequence": row["sequence_number"],
+                        "type": "question",
+                        "question_id": row["question_id"],
+                        "question": row["question"],
+                        "reason": row.get("reason"),
+                        "status": row["status"],
+                        "asked_at": row["asked_at"],
+                        "deadline_at": row["deadline_at"],
+                    }
+                    for row in questions
+                ]
+                next_after = max(
+                    (event["sequence"] for event in events),
+                    default=after,
+                )
+                if terminal:
+                    next_action = "Call is terminal or terminating; call get_call_result."
+                elif events:
+                    next_action = (
+                        "New call events are available. Answer pending questions with "
+                        "answer_call_question, then wait again with next_after_sequence."
+                    )
+                else:
+                    next_action = (
+                        "No new events; re-enter wait_for_call_event with the same after_sequence."
+                    )
+                return {
+                    "call_id": call_id,
+                    "state": state.value,
+                    "terminal": terminal,
+                    "events": events,
+                    "next_after_sequence": next_after,
+                    "next_action": next_action,
+                }
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(notifier.wait(), remaining)
+
+    async def answer_call_question(
+        self,
+        call_id: str,
+        question_id: str,
+        answer: str,
+    ) -> dict[str, Any]:
+        row = await self.db.claim_question_answer(call_id, question_id, answer)
+        if row is not None:
+            self._spawn(
+                self._deliver_question_answer(call_id, row),
+                name=f"deliver-question:{call_id}:{question_id}",
+                must_finish=True,
+            )
+            return {"status": "accepted", "question_id": question_id}
+
+        existing = await self.db.get_question(question_id)
+        if existing is None or existing.get("call_id") != call_id:
+            raise LookupError("unknown question")
+        status = existing.get("status")
+        if status == "answered":
+            return {"status": "already_answered"}
+        if status == "expired":
+            return {
+                "status": "expired",
+                "detail": "timeout already sent to the agent",
+            }
+        if status == "cancelled":
+            return {"status": "call_ended"}
+        call = await self.db.get_call(call_id)
+        if call is None or CallState(call["state"]) in TERMINAL_STATES:
+            return {"status": "call_ended"}
+        # Pending claim lost to a concurrent race without a readable winner — treat as
+        # already handled so Poke can advance rather than retry forever.
+        return {"status": "already_answered"}
 
     async def _handle_voice_end_response_done(self, call_id: str, event: dict[str, Any]) -> None:
         pending = self._voice_end_pending.get(call_id)
@@ -2137,6 +2494,14 @@ class CallService:
         self._owner_transfer_locks.pop(call_id, None)
         self._opening_transition_locks.pop(call_id, None)
         self._tool_seen_calls.discard(call_id)
+        self._pending_questions.pop(call_id, None)
+        try:
+            await self.db.cancel_pending_questions(call_id)
+        except Exception:
+            logger.warning(
+                "pending question cancellation failed call_id=%s", call_id, exc_info=True
+            )
+        self._notify_call_event(call_id)
         try:
             await self.db.add_transcript_turn(
                 call_id=call_id,
@@ -2222,6 +2587,10 @@ class CallService:
         self._spawn(self.terminate_call(call_id, reason), name=f"terminate:{call_id}:sideband")
 
     async def recover_startup(self) -> None:
+        try:
+            await self.db.cancel_all_pending_questions()
+        except Exception:
+            logger.warning("startup could not cancel pending questions", exc_info=True)
         recovered: set[str] = set()
         for call in await self.db.list_nonterminal_calls():
             call_id = call["call_id"]
@@ -2408,6 +2777,13 @@ class CallService:
             call_id = call["call_id"]
             if self._call_activity_is_closed(call):
                 self._tombstone_call_activity(call_id)
+                continue
+            pending = self._pending_questions.get(call_id)
+            if (
+                pending is not None
+                and time.monotonic() < pending.deadline_monotonic + WATCHDOG_QUESTION_GRACE_SECONDS
+            ):
+                # Outstanding ask_poke: silence is expected until answer or deadline+grace.
                 continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue

@@ -120,6 +120,26 @@ CREATE TABLE IF NOT EXISTS deployment_control (
 );
 
 INSERT OR IGNORE INTO deployment_control (singleton, locked) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS call_questions (
+    question_id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL REFERENCES calls(call_id),
+    tool_call_id TEXT NOT NULL,
+    sequence_number INTEGER NOT NULL,
+    question TEXT NOT NULL,
+    reason TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    answer TEXT,
+    asked_at TEXT NOT NULL,
+    deadline_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE (call_id, sequence_number),
+    UNIQUE (call_id, tool_call_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_call_questions_one_pending
+    ON call_questions(call_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS call_questions_call_seq_idx
+    ON call_questions(call_id, sequence_number);
 """
 
 UPSERT_LATENCY_EVENT = """
@@ -167,6 +187,8 @@ class LatencyStage(StrEnum):
     TOOL_CALL_RECEIVED = "tool_call_received"
     EXA_SEARCH_STARTED = "exa_search_started"
     EXA_SEARCH_COMPLETED = "exa_search_completed"
+    ASK_POKE_ASKED = "ask_poke_asked"
+    ASK_POKE_RESOLVED = "ask_poke_resolved"
     TOOL_RESULT_SENT = "tool_result_sent"
 
 
@@ -1081,3 +1103,150 @@ class Database:
             "SELECT result_json FROM call_results WHERE call_id=?", (call_id,)
         )
         return StoredCallResult.model_validate(row["result"]) if row else None
+
+    async def create_question(
+        self,
+        call_id: str,
+        *,
+        tool_call_id: str,
+        question: str,
+        reason: str | None,
+        deadline_at: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Insert a pending question. Returns (row, None) or (None, error_code)."""
+
+        question_id = str(uuid4())
+        asked_at = _iso_now()
+        async with self._write_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                "SELECT state FROM calls WHERE call_id=?",
+                (call_id,),
+            )
+            call_row = await cursor.fetchone()
+            if call_row is None or call_row[0] != CallState.ACTIVE.value:
+                await conn.rollback()
+                return None, "call_not_active"
+            cursor = await conn.execute(
+                """SELECT 1 FROM call_questions
+                   WHERE call_id=? AND status='pending' LIMIT 1""",
+                (call_id,),
+            )
+            if await cursor.fetchone() is not None:
+                await conn.rollback()
+                return None, "question_pending"
+            cursor = await conn.execute(
+                "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM call_questions WHERE call_id=?",
+                (call_id,),
+            )
+            sequence = (await cursor.fetchone())[0]
+            try:
+                cursor = await conn.execute(
+                    """INSERT INTO call_questions
+                       (question_id, call_id, tool_call_id, sequence_number, question, reason,
+                        status, answer, asked_at, deadline_at, resolved_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, NULL)
+                       RETURNING *""",
+                    (
+                        question_id,
+                        call_id,
+                        tool_call_id,
+                        sequence,
+                        question,
+                        reason,
+                        asked_at,
+                        deadline_at,
+                    ),
+                )
+            except aiosqlite.IntegrityError as exc:
+                await conn.rollback()
+                if "tool_call_id" in str(exc):
+                    # UNIQUE(call_id, tool_call_id): a redelivered tool event whose
+                    # question already resolved, not a pending-question conflict.
+                    return None, "duplicate_tool_call"
+                return None, "question_pending"
+            row = await cursor.fetchone()
+            await conn.commit()
+        return dict(row) if row else None, None
+
+    async def claim_question_answer(
+        self,
+        call_id: str,
+        question_id: str,
+        answer: str,
+    ) -> dict[str, Any] | None:
+        resolved_at = _iso_now()
+        async with self._write_connection() as conn:
+            cursor = await conn.execute(
+                """UPDATE call_questions
+                   SET status='answered', answer=?, resolved_at=?
+                   WHERE question_id=? AND call_id=? AND status='pending'
+                   RETURNING *""",
+                (answer, resolved_at, question_id, call_id),
+            )
+            row = await cursor.fetchone()
+            await conn.commit()
+        return dict(row) if row else None
+
+    async def claim_question_expiry(self, question_id: str) -> dict[str, Any] | None:
+        resolved_at = _iso_now()
+        async with self._write_connection() as conn:
+            cursor = await conn.execute(
+                """UPDATE call_questions
+                   SET status='expired', resolved_at=?
+                   WHERE question_id=? AND status='pending'
+                   RETURNING *""",
+                (resolved_at, question_id),
+            )
+            row = await cursor.fetchone()
+            await conn.commit()
+        return dict(row) if row else None
+
+    async def cancel_pending_questions(self, call_id: str) -> list[dict[str, Any]]:
+        resolved_at = _iso_now()
+        async with self._write_connection() as conn:
+            cursor = await conn.execute(
+                """UPDATE call_questions
+                   SET status='cancelled', resolved_at=?
+                   WHERE call_id=? AND status='pending'
+                   RETURNING *""",
+                (resolved_at, call_id),
+            )
+            rows = await cursor.fetchall()
+            await conn.commit()
+        return [dict(row) for row in rows]
+
+    async def cancel_all_pending_questions(self) -> list[dict[str, Any]]:
+        resolved_at = _iso_now()
+        async with self._write_connection() as conn:
+            cursor = await conn.execute(
+                """UPDATE call_questions
+                   SET status='cancelled', resolved_at=?
+                   WHERE status='pending'
+                   RETURNING *""",
+                (resolved_at,),
+            )
+            rows = await cursor.fetchall()
+            await conn.commit()
+        return [dict(row) for row in rows]
+
+    async def get_question(self, question_id: str) -> dict[str, Any] | None:
+        return await self.fetch_one(
+            "SELECT * FROM call_questions WHERE question_id=?",
+            (question_id,),
+        )
+
+    async def get_questions_after(self, call_id: str, after_sequence: int) -> list[dict[str, Any]]:
+        return await self.fetch_all(
+            """SELECT * FROM call_questions
+               WHERE call_id=? AND sequence_number > ?
+               ORDER BY sequence_number ASC""",
+            (call_id, after_sequence),
+        )
+
+    async def count_call_questions(self, call_id: str) -> int:
+        row = await self.fetch_one(
+            "SELECT COUNT(*) AS count FROM call_questions WHERE call_id=?",
+            (call_id,),
+        )
+        return int(row["count"]) if row else 0

@@ -131,6 +131,7 @@ class FakeRealtime:
         self.close_all_calls = 0
         self.tool_results: list[tuple[str, str, dict]] = []
         self.tool_result_continuations: list[bool] = []
+        self.tool_result_continuation_texts: list[str | None] = []
         self.accepts: list[tuple[str, str]] = []
         self.update_event = {
             "type": "session.updated",
@@ -219,6 +220,7 @@ class FakeRealtime:
     ) -> None:
         self.tool_results.append((call_id, tool_call_id, output))
         self.tool_result_continuations.append(continue_response)
+        self.tool_result_continuation_texts.append(continuation_instructions)
         if continuation_instructions:
             self.events.append(("tool_continuation", call_id))
 

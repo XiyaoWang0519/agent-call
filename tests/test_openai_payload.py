@@ -48,6 +48,7 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         "search_web",
         "end_call",
     ]
+    assert "ask_poke" not in [tool["name"] for tool in payload["tools"]]
     search_web = payload["tools"][2]
     assert search_web["parameters"] == {
         "type": "object",
@@ -74,6 +75,31 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     description = end_call["description"].lower()
     assert "callee has nothing further" in description
     assert "answer it fully" in description
+
+
+def test_accept_payload_includes_ask_poke_when_enabled(settings, packet):
+    settings.ask_poke_enabled = True
+    bridge = RealtimeBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=_noop,
+        on_open=_noop,
+        on_fatal=_noop,
+    )
+    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
+    names = [tool["name"] for tool in payload["tools"]]
+    assert names == [
+        "transfer_to_owner",
+        "record_call_outcome",
+        "search_web",
+        "ask_poke",
+        "end_call",
+    ]
+    ask_poke = next(tool for tool in payload["tools"] if tool["name"] == "ask_poke")
+    assert ask_poke["parameters"]["required"] == ["question"]
+    assert "question" in ask_poke["parameters"]["properties"]
+    assert "Never guess" in ask_poke["description"]
+    assert "ask_poke" in payload["instructions"]
 
 
 def test_session_created_echo_requires_transcription_and_full_initial_vad(settings, packet):

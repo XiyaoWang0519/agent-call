@@ -5,9 +5,10 @@ from collections.abc import Callable
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import ValidationError
 
 from app.call_state import CallService
-from app.models import ContextPacket, PreparePhoneCallInput
+from app.models import AnswerCallQuestionRequest, ContextPacket, PreparePhoneCallInput
 
 CONTEXT_GUIDANCE = (
     "Assemble only call-relevant facts from Poke memory and integrations. Resolve relative dates "
@@ -46,8 +47,9 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         name="start_phone_call",
         description=(
             "Start only a valid, unexpired prepared plan after explicit owner confirmation. "
-            "Pass the confirmation text that was read back. Then poll get_call_result until terminal. "
-            + CONTEXT_GUIDANCE
+            "Pass the confirmation text that was read back. Then call wait_for_call_event; answer "
+            "pending questions with answer_call_question, continue waiting with the returned cursor, "
+            "and call get_call_result once the call is terminal. " + CONTEXT_GUIDANCE
         ),
     )
     async def start_phone_call(
@@ -96,3 +98,59 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
             raise ToolError(json.dumps({"code": "call_not_found", "message": str(exc)})) from exc
         data = snapshot.model_dump(mode="json", exclude={"result"})
         return data
+
+    @mcp.tool(
+        name="wait_for_call_event",
+        description=(
+            "Long-poll for mid-call questions or terminal state after a sequence cursor. "
+            "Returns immediately when events exist; on idle timeout returns an empty events list "
+            "(never an error). Re-enter with next_after_sequence. " + CONTEXT_GUIDANCE
+        ),
+    )
+    async def wait_for_call_event(
+        call_id: str,
+        after_sequence: int = 0,
+        timeout_seconds: float = 20.0,
+    ) -> dict:
+        try:
+            return await get_service().wait_for_call_event(
+                call_id,
+                after_sequence=after_sequence,
+                timeout_seconds=timeout_seconds,
+            )
+        except LookupError as exc:
+            raise ToolError(json.dumps({"code": "call_not_found", "message": str(exc)})) from exc
+        except ValueError as exc:
+            raise ToolError(
+                json.dumps({"code": "invalid_call_state", "message": str(exc)})
+            ) from exc
+
+    @mcp.tool(
+        name="answer_call_question",
+        description=(
+            "Answer one pending mid-call question from the voice agent. Exactly-once: a second "
+            "answer returns already_answered; late answers after timeout return expired. "
+            + CONTEXT_GUIDANCE
+        ),
+    )
+    async def answer_call_question(call_id: str, question_id: str, answer: str) -> dict:
+        try:
+            request = AnswerCallQuestionRequest(
+                call_id=call_id,
+                question_id=question_id,
+                answer=answer,
+            )
+        except ValidationError as exc:
+            raise ToolError(str(exc)) from exc
+        try:
+            return await get_service().answer_call_question(
+                request.call_id,
+                request.question_id,
+                request.answer,
+            )
+        except LookupError as exc:
+            raise ToolError("unknown question") from exc
+        except ValueError as exc:
+            raise ToolError(
+                json.dumps({"code": "invalid_call_state", "message": str(exc)})
+            ) from exc
