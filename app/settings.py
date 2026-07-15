@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_webhook_secret: SecretStr | None = None
     openai_project_id: str | None = None
+    exa_api_key: SecretStr | None = None
+    exa_search_timeout_seconds: float = Field(default=3.0, gt=0, le=10)
     twilio_account_sid: str | None = None
     twilio_auth_token: SecretStr | None = None
     twilio_caller_id: str | None = None
@@ -139,6 +141,7 @@ class Settings(BaseSettings):
             "OPENAI_API_KEY": self.openai_api_key,
             "OPENAI_WEBHOOK_SECRET": self.openai_webhook_secret,
             "OPENAI_PROJECT_ID": self.openai_project_id,
+            "EXA_API_KEY": self.exa_api_key,
             "TWILIO_ACCOUNT_SID": self.twilio_account_sid,
             "TWILIO_AUTH_TOKEN": self.twilio_auth_token,
             "TWILIO_CALLER_ID": self.twilio_caller_id,

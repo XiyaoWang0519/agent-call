@@ -5,9 +5,10 @@ import asyncio
 import pytest
 
 import app.call_state as call_state_module
+from app.exa_search import ExaSearchError
 from app.models import CallState
 from app.twilio_bridge import ParticipantInfo
-from tests.conftest import seed_call
+from tests.conftest import seed_call, wait_background
 
 
 def _tool_event(
@@ -21,6 +22,75 @@ def _tool_event(
         "call_id": tool_call_id,
         "name": name,
         "arguments": arguments,
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_web_returns_compact_evidence_and_records_latency(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event(
+            "tool_search",
+            "search_web",
+            '{"query":"  latest   Example Clinic hours  "}',
+        ),
+    )
+    await wait_background()
+
+    assert service._test_exa.queries == ["latest Example Clinic hours"]
+    assert service._test_realtime.tool_results[-1] == (
+        call_id,
+        "tool_search",
+        service._test_exa.result.output,
+    )
+    call = await service.db.get_call(call_id)
+    assert call["tool_call_count"] == 1
+    latency = await service.db.get_latency_events(call_id)
+    assert {event["stage"] for event in latency} >= {
+        "tool_call_received",
+        "exa_search_started",
+        "exa_search_completed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_web_failure_continues_call_with_safe_error(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    service._test_exa.error = ExaSearchError("search_rate_limited")
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_search", "search_web", '{"query":"current opening hours"}'),
+    )
+
+    assert service._test_realtime.tool_results[-1][2] == {
+        "ok": False,
+        "error": "search_rate_limited",
+    }
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+    assert call["tool_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_web_rejects_model_control_of_provider_parameters(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event(
+            "tool_search",
+            "search_web",
+            '{"query":"current opening hours","type":"deep","numResults":100}',
+        ),
+    )
+
+    assert service._test_exa.queries == []
+    assert service._test_realtime.tool_results[-1][2] == {
+        "ok": False,
+        "error": "invalid_search_request",
     }
 
 

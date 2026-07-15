@@ -5,7 +5,14 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 E164 = Annotated[str, StringConstraints(pattern=r"^\+[1-9]\d{1,14}$")]
 CONTEXT_PACKET_MAX_BYTES = 16 * 1024
@@ -229,7 +236,7 @@ class RealtimeFunctionTool(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["function"] = "function"
-    name: Literal["transfer_to_owner", "record_call_outcome", "end_call"]
+    name: Literal["transfer_to_owner", "record_call_outcome", "search_web", "end_call"]
     description: str = Field(min_length=1)
     parameters: dict[str, Any]
 
@@ -260,6 +267,20 @@ class RealtimeIncomingEvent(BaseModel):
     type: Literal["realtime.call.incoming"]
     id: str
     data: RealtimeIncomingData
+
+
+class WebSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=2, max_length=500)
+
+    @field_validator("query")
+    @classmethod
+    def normalize_query(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) < 2:
+            raise ValueError("query must contain at least two non-whitespace characters")
+        return normalized
 
 
 class AdvisoryOutcome(BaseModel):

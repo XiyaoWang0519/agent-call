@@ -165,6 +165,8 @@ class LatencyStage(StrEnum):
     FIRST_ASSISTANT_TRANSCRIPT = "first_assistant_transcript"
     FIRST_OPENAI_AUDIO_DELTA = "first_openai_audio_delta"
     TOOL_CALL_RECEIVED = "tool_call_received"
+    EXA_SEARCH_STARTED = "exa_search_started"
+    EXA_SEARCH_COMPLETED = "exa_search_completed"
     TOOL_RESULT_SENT = "tool_result_sent"
 
 

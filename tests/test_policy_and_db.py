@@ -353,6 +353,14 @@ def test_blank_required_runtime_values_are_missing(settings):
         blank.require_runtime_configuration()
 
 
+def test_exa_api_key_is_required_when_search_tool_is_advertised(settings):
+    values = settings.model_dump()
+    values["exa_api_key"] = None
+    blank = Settings(**values)
+    with pytest.raises(RuntimeError, match="EXA_API_KEY"):
+        blank.require_runtime_configuration()
+
+
 @pytest.mark.parametrize(
     "url",
     ["http://example.test", "https://example.test/a-path", "https://example.test?x=1"],

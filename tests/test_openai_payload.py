@@ -45,9 +45,27 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     assert [tool["name"] for tool in payload["tools"]] == [
         "transfer_to_owner",
         "record_call_outcome",
+        "search_web",
         "end_call",
     ]
-    end_call = payload["tools"][2]
+    search_web = payload["tools"][2]
+    assert search_web["parameters"] == {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 500,
+                "description": (
+                    "A standalone natural-language web search query with all context needed "
+                    "to understand it."
+                ),
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    end_call = payload["tools"][3]
     assert end_call["parameters"]["required"] == ["reason"]
     assert "objective_completed" in end_call["parameters"]["properties"]["reason"]["enum"]
     assert "final goodbye" in end_call["description"].lower()

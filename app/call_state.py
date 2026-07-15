@@ -18,6 +18,7 @@ from app.db import (
     LatencyMark,
     LatencyStage,
 )
+from app.exa_search import ExaSearchClient, ExaSearchError
 from app.finalizer import Finalizer
 from app.models import (
     TERMINAL_STATES,
@@ -29,6 +30,7 @@ from app.models import (
     PreparePhoneCallOutput,
     StartPhoneCallOutput,
     VoiceEndCallRequest,
+    WebSearchRequest,
 )
 from app.openai_client import create_openai_client
 from app.openai_realtime import RealtimeBridge
@@ -65,11 +67,14 @@ class CallService:
         *,
         twilio: TwilioBridge | None = None,
         openai: AsyncOpenAI | None = None,
+        exa: ExaSearchClient | None = None,
     ):
         self.settings = settings
         self.db = db
         self._owns_openai_client = openai is None
         self.openai = openai if openai is not None else create_openai_client(settings)
+        self._owns_exa_client = exa is None
+        self.exa = exa if exa is not None else ExaSearchClient(settings)
         self.twilio = twilio or TwilioBridge(settings)
         self._latest_call_activity: dict[str, LatencyMark] = {}
         self._dirty_call_activity: dict[str, LatencyMark] = {}
@@ -1008,7 +1013,60 @@ class CallService:
             arguments = json.loads(event.get("arguments") or "{}")
         except json.JSONDecodeError:
             arguments = {}
-        if name == "record_call_outcome":
+        if name == "search_web":
+            try:
+                request = WebSearchRequest.model_validate(arguments)
+            except Exception:
+                logger.info("invalid web search tool arguments call_id=%s", call_id)
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "invalid_search_request"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+
+            self._queue_latency(
+                call_id,
+                LatencyStage.EXA_SEARCH_STARTED,
+                LatencyMark.now(),
+                event_key=event_key,
+            )
+            try:
+                result = await self.exa.search(request.query)
+                output = result.output
+                logger.info(
+                    "Exa search completed call_id=%s request_id=%s search_type=%s "
+                    "results=%s output_bytes=%s cost_dollars=%s",
+                    call_id,
+                    result.request_id,
+                    result.search_type,
+                    result.result_count,
+                    result.output_bytes,
+                    result.cost_dollars,
+                )
+            except ExaSearchError as exc:
+                logger.warning("Exa search failed call_id=%s code=%s", call_id, exc.code)
+                output = {"ok": False, "error": exc.code}
+            except Exception:
+                logger.exception("unexpected Exa search failure call_id=%s", call_id)
+                output = {"ok": False, "error": "search_unavailable"}
+            finally:
+                self._queue_latency(
+                    call_id,
+                    LatencyStage.EXA_SEARCH_COMPLETED,
+                    LatencyMark.now(),
+                    event_key=event_key,
+                )
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                output,
+                received=received,
+                event_key=event_key,
+            )
+        elif name == "record_call_outcome":
             advisory_outcome: dict[str, Any] | None = None
             try:
                 advisory = AdvisoryOutcome.model_validate(arguments)
@@ -2326,8 +2384,12 @@ class CallService:
             await asyncio.gather(*pending, return_exceptions=True)
             await asyncio.sleep(0)
         await self._flush_call_activity()
-        if self._owns_openai_client:
-            await self.openai.close()
+        try:
+            if self._owns_exa_client:
+                await self.exa.close()
+        finally:
+            if self._owns_openai_client:
+                await self.openai.close()
 
     async def _watchdog(self) -> None:
         while True:

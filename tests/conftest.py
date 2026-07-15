@@ -11,6 +11,7 @@ from pydantic import SecretStr
 
 from app.call_state import CallService
 from app.db import Database
+from app.exa_search import ExaSearchResult
 from app.models import (
     CallState,
     ContextPacket,
@@ -31,6 +32,7 @@ def settings(tmp_path: Path) -> Settings:
             "whsec_" + base64.b64encode(b"test webhook secret").decode()
         ),
         openai_project_id="proj_test",
+        exa_api_key=SecretStr("exa-test"),
         twilio_account_sid="AC" + "1" * 32,
         twilio_auth_token=SecretStr("twilio-test"),
         twilio_caller_id="+14155550199",
@@ -237,6 +239,35 @@ class FakeRealtime:
         )
 
 
+class FakeExa:
+    def __init__(self):
+        self.queries: list[str] = []
+        self.error: Exception | None = None
+        self.result = ExaSearchResult(
+            output={
+                "ok": True,
+                "results": [
+                    {
+                        "title": "Example result",
+                        "url": "https://example.test/result",
+                        "highlights": ["The requested fact is supported."],
+                    }
+                ],
+            },
+            request_id="exa_request_test",
+            search_type="auto",
+            result_count=1,
+            output_bytes=180,
+            cost_dollars=0.007,
+        )
+
+    async def search(self, query: str) -> ExaSearchResult:
+        self.queries.append(query)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
 class FakeFinalizer:
     def __init__(self, db: Database):
         self.db = db
@@ -312,7 +343,8 @@ async def service(settings: Settings):
     await db.initialize()
     twilio = FakeTwilio()
     placeholder_openai = SimpleNamespace()
-    svc = CallService(settings, db, twilio=twilio, openai=placeholder_openai)
+    exa = FakeExa()
+    svc = CallService(settings, db, twilio=twilio, openai=placeholder_openai, exa=exa)
     realtime = FakeRealtime()
     finalizer = FakeFinalizer(db)
     svc.realtime = realtime
@@ -320,6 +352,7 @@ async def service(settings: Settings):
     svc._test_twilio = twilio
     svc._test_realtime = realtime
     svc._test_finalizer = finalizer
+    svc._test_exa = exa
     yield svc
     try:
         await svc.stop()

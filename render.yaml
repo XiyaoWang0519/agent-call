@@ -28,6 +28,8 @@ services:
         sync: false
       - key: OPENAI_PROJECT_ID
         sync: false
+      - key: EXA_API_KEY
+        sync: false
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN

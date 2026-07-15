@@ -120,6 +120,31 @@ class RealtimeBridge:
                 },
                 {
                     "type": "function",
+                    "name": "search_web",
+                    "description": (
+                        "Search the public web for current, recent, location-specific, or "
+                        "uncertain factual information. Use a standalone query with the exact "
+                        "entity, location, and date context."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 500,
+                                "description": (
+                                    "A standalone natural-language web search query with all "
+                                    "context needed to understand it."
+                                ),
+                            }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "type": "function",
                     "name": "end_call",
                     "description": (
                         "Request the end of the phone call once the conversation is truly "

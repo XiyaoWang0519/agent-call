@@ -21,6 +21,7 @@ Calls are retained as transcripts. The application does not force a verbal ident
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - A paid/voice-enabled Twilio account, an E.164 caller ID, and outbound SIP/Conference Participant AMD access
 - An OpenAI project with Realtime SIP access, an API key, and a webhook signing secret
+- An Exa API key for in-call public-web search
 - A stable public HTTPS URL (tunnel for local work; always-on Render instance for deployment)
 
 The locked implementation was developed against OpenAI Python `2.45.0`, Twilio Python `9.10.9`, FastMCP `3.4.4`, FastAPI `0.139.0`, and websockets `16.1`. `uv.lock` is authoritative.
@@ -43,6 +44,9 @@ retry. Twilio requests use the pooled, no-retry transport bounded by
 medium-eagerness behavior); set it to `high` for quicker turn completion.
 `OPENAI_KEEPALIVE_EXPIRY_SECONDS=60` keeps the control-plane TLS connection reusable between
 sporadic calls; set it only to a bounded 5-300 second value.
+The voice model can call `search_web` for current or uncertain facts. The application fixes Exa
+Search to `type=auto`, 10 results, moderation, and token-efficient highlights, with a three-second
+wall-clock deadline controlled by `EXA_SEARCH_TIMEOUT_SECONDS`.
 
 Run validation:
 

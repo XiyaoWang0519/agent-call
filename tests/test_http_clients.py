@@ -7,6 +7,7 @@ import pytest
 
 from app.call_state import CallService
 from app.db import Database
+from app.exa_search import ExaSearchClient
 from app.main import create_app
 from app.openai_client import create_openai_client
 from app.openai_realtime import RealtimeBridge
@@ -138,6 +139,29 @@ def test_openai_keepalive_expiry_is_configurable(settings, monkeypatch):
     assert observed["client_options"]["http_client"] is transport
 
 
+def test_exa_client_has_bounded_pooled_transport(settings, monkeypatch):
+    observed: dict[str, object] = {}
+    transport = SimpleNamespace()
+
+    def fake_http_client(**kwargs):
+        observed.update(kwargs)
+        return transport
+
+    monkeypatch.setattr("app.exa_search.httpx.AsyncClient", fake_http_client)
+
+    ExaSearchClient(settings)
+
+    timeout = observed["timeout"]
+    assert timeout.connect == 1.0
+    assert timeout.read == 3.0
+    assert timeout.write == 3.0
+    assert timeout.pool == 3.0
+    assert observed["limits"].max_connections == 20
+    assert observed["limits"].max_keepalive_connections == 10
+    assert observed["limits"].keepalive_expiry == 60
+    assert observed["follow_redirects"] is True
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -150,6 +174,14 @@ def test_openai_keepalive_expiry_is_configurable(settings, monkeypatch):
 def test_openai_transport_settings_are_bounded(settings, field, value):
     values = settings.model_dump()
     values[field] = value
+    with pytest.raises(ValueError):
+        Settings(**values)
+
+
+@pytest.mark.parametrize("value", [0, 11])
+def test_exa_search_timeout_is_bounded(settings, value):
+    values = settings.model_dump()
+    values["exa_search_timeout_seconds"] = value
     with pytest.raises(ValueError):
         Settings(**values)
 
@@ -194,19 +226,27 @@ async def test_realtime_accept_has_a_total_wall_clock_deadline(settings, packet)
 
 
 @pytest.mark.asyncio
-async def test_call_service_closes_only_an_internally_created_openai_client(settings, monkeypatch):
+async def test_call_service_closes_only_internally_created_api_clients(settings, monkeypatch):
     owned = SimpleNamespace(closed=False)
+    owned_exa = SimpleNamespace(closed=False)
 
     async def close() -> None:
         owned.closed = True
 
     owned.close = close
+
+    async def close_exa() -> None:
+        owned_exa.closed = True
+
+    owned_exa.close = close_exa
     monkeypatch.setattr("app.call_state.create_openai_client", lambda _: owned)
+    monkeypatch.setattr("app.call_state.ExaSearchClient", lambda _: owned_exa)
     db = Database(settings.database_path)
 
     service = CallService(settings, db, twilio=SimpleNamespace())
     await service.stop()
     assert owned.closed is True
+    assert owned_exa.closed is True
 
     injected = SimpleNamespace(closed=False)
 
@@ -214,9 +254,22 @@ async def test_call_service_closes_only_an_internally_created_openai_client(sett
         injected.closed = True
 
     injected.close = close_injected
-    service = CallService(settings, db, twilio=SimpleNamespace(), openai=injected)
+    injected_exa = SimpleNamespace(closed=False)
+
+    async def close_injected_exa() -> None:
+        injected_exa.closed = True
+
+    injected_exa.close = close_injected_exa
+    service = CallService(
+        settings,
+        db,
+        twilio=SimpleNamespace(),
+        openai=injected,
+        exa=injected_exa,
+    )
     await service.stop()
     assert injected.closed is False
+    assert injected_exa.closed is False
 
 
 @pytest.mark.asyncio
