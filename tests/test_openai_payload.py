@@ -23,12 +23,12 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     assert payload["model"] == "gpt-realtime-2.1"
     assert payload["reasoning"] == {"effort": "low"}
     assert payload["output_modalities"] == ["audio"]
-    assert payload["max_output_tokens"] == 300
-    assert payload["parallel_tool_calls"] is False
+    assert payload["max_output_tokens"] == "inf"
+    assert payload["parallel_tool_calls"] is True
     assert payload["tool_choice"] == "auto"
     assert payload["tracing"] == "auto"
     assert payload["audio"]["input"] == {
-        "transcription": {"model": "gpt-4o-mini-transcribe"},
+        "transcription": {"model": "gpt-realtime-whisper"},
         "turn_detection": {
             "type": "semantic_vad",
             "eagerness": "auto",
@@ -70,7 +70,7 @@ def test_session_created_echo_requires_transcription_and_full_initial_vad(settin
         "session": {
             "audio": {
                 "input": {
-                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "transcription": {"model": "gpt-realtime-whisper"},
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "auto",

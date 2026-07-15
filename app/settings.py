@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     poke_api_key: SecretStr | None = None
     poke_push_enabled: bool = False
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])
-    input_transcription_model: str = "gpt-4o-mini-transcribe"
+    input_transcription_model: str = "gpt-realtime-whisper"
     input_transcription_delay: str | None = None
     semantic_vad_eagerness: Literal["low", "medium", "high", "auto"] = "auto"
     openai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)

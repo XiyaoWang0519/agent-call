@@ -206,7 +206,7 @@ async def test_sideband_receives_initial_update_echo_while_open_handler_waits(
         "session": {
             "audio": {
                 "input": {
-                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "transcription": {"model": "gpt-realtime-whisper"},
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "auto",
@@ -292,7 +292,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
                         # Transcription must be re-asserted: session.update replaces the
                         # nested audio.input object, so omitting it would drop callee
                         # transcription for the rest of the call.
-                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "transcription": {"model": "gpt-realtime-whisper"},
                         "turn_detection": {
                             "type": "semantic_vad",
                             "eagerness": "auto",
@@ -326,7 +326,7 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
         "session": {
             "audio": {
                 "input": {
-                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "transcription": {"model": "gpt-realtime-whisper"},
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "auto",
@@ -347,7 +347,7 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
                 "type": "realtime",
                 "audio": {
                     "input": {
-                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "transcription": {"model": "gpt-realtime-whisper"},
                         "turn_detection": {
                             "type": "semantic_vad",
                             "eagerness": "auto",

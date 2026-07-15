@@ -241,8 +241,8 @@ class AcceptPayload(BaseModel):
     model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
     reasoning: dict[str, Literal["low"]] = Field(default_factory=lambda: {"effort": "low"})
     output_modalities: list[Literal["audio"]] = Field(default_factory=lambda: ["audio"])
-    max_output_tokens: int = Field(default=300, ge=1, le=4096)
-    parallel_tool_calls: Literal[False] = False
+    max_output_tokens: Literal["inf"] = "inf"
+    parallel_tool_calls: Literal[True] = True
     tool_choice: Literal["auto"] = "auto"
     # Writes Realtime session activity to the OpenAI Traces dashboard.
     tracing: Literal["auto"] = "auto"

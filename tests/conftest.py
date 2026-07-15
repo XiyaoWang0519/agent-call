@@ -150,7 +150,7 @@ class FakeRealtime:
             "session": {
                 "audio": {
                     "input": {
-                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "transcription": {"model": "gpt-realtime-whisper"},
                         "turn_detection": {
                             "type": "semantic_vad",
                             "eagerness": "auto",
@@ -224,7 +224,7 @@ class FakeRealtime:
         transcription = (
             event.get("session", {}).get("audio", {}).get("input", {}).get("transcription", {})
         )
-        return transcription.get("model") == "gpt-4o-mini-transcribe"
+        return transcription.get("model") == "gpt-realtime-whisper"
 
     @staticmethod
     def expected_initial_vad_echoed(event) -> bool:
