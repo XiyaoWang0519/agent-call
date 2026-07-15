@@ -66,6 +66,19 @@ def test_ending_instructions_gate_on_callee_engagement(packet: ContextPacket):
     assert "answer it fully as a normal turn first" in flattened
 
 
+def test_realtime_instructions_encode_sassy_personal_assistant_voice(packet: ContextPacket):
+    flattened = realtime_instructions(packet).replace("\n", " ")
+
+    assert "# Personality and tone" in realtime_instructions(packet)
+    assert "sassy personal assistant" in flattened
+    assert "I'd be happy to help" in flattened
+    assert "sentence fragments" in flattened
+    assert "You have opinions" in flattened
+    assert "dry sarcasm" in flattened
+    assert "# Preambles" in realtime_instructions(packet)
+    assert "Speak naturally, briefly, and professionally" not in flattened
+
+
 def test_realtime_instructions_enforce_final_byte_limit(
     packet: ContextPacket, monkeypatch: pytest.MonkeyPatch
 ):
