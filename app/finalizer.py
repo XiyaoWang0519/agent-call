@@ -5,7 +5,6 @@ import json
 import logging
 from typing import Any
 
-import httpx
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -192,17 +191,6 @@ class Finalizer:
         raise RuntimeError("unreachable")
 
     async def _maybe_push(self, result: StoredCallResult) -> None:
-        if not self.settings.poke_push_enabled or self.settings.poke_api_key is None:
-            return
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                response = await client.post(
-                    "https://poke.com/api/v1/inbound/api-message",
-                    headers={
-                        "Authorization": f"Bearer {Settings.reveal(self.settings.poke_api_key)}"
-                    },
-                    json={"message": result.model_dump(mode="json")},
-                )
-                response.raise_for_status()
-        except Exception:
-            logger.warning("optional Poke result push failed", exc_info=True)
+        from app.poke_push import push_message_to_poke
+
+        await push_message_to_poke(self.settings, result.model_dump(mode="json"))

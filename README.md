@@ -10,7 +10,8 @@ Single-user FastAPI + FastMCP service that lets Poke prepare, confirm, start, mo
 - Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
 - The voice model chooses how to open from Poke's approved call context; the bridge does not impose identity, disclosure, or recipient-confirmation wording. It may not share or request passwords, auth codes, payment credentials, or government identifiers.
 - The in-call voice model decides when the conversation is finished and invokes its private `end_call` function. The bridge asks it for one final spoken goodbye, waits for that closing response to complete, and then tears down OpenAI and Twilio. The public `end_phone_call` MCP tool remains a manual stop.
-- Poke push is optional and non-canonical. Polling `get_call_result` is canonical.
+- Poke push is optional and non-canonical. During a live call, `wait_for_call_event` is the
+  canonical monitoring loop; after it reports a terminal state, call `get_call_result`.
 
 Do not deploy or restart while a call is active. Recovery stops stranded billable media and finalizes missing results, but a process restart necessarily ends the live call.
 
@@ -87,7 +88,7 @@ X-Poke-User-Id: ALLOWED_POKE_USER_ID
 Transport: Streamable HTTP
 ```
 
-The server exposes exactly five tools: `prepare_phone_call`, `start_phone_call`, `get_call_result`, `end_phone_call`, and `get_phone_call`.
+The server exposes exactly seven tools: `prepare_phone_call`, `start_phone_call`, `get_call_result`, `end_phone_call`, `get_phone_call`, `wait_for_call_event`, and `answer_call_question`.
 
 ## Live SIP canary
 

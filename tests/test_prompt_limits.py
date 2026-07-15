@@ -90,6 +90,38 @@ def test_realtime_instructions_bound_web_search_behavior(packet: ContextPacket):
     assert "never invent a current fact" in flattened
 
 
+def test_realtime_instructions_gate_ask_poke_guidance(packet: ContextPacket):
+    disabled = realtime_instructions(packet, ask_poke_enabled=False)
+    enabled = realtime_instructions(packet, ask_poke_enabled=True)
+
+    assert "Use ask_poke for facts only the owner" not in disabled
+    assert "Use ask_poke for facts only the owner" in enabled
+    assert "never guess or invent the pending answer" in enabled.replace("\n", " ")
+    assert "One question at a time" in enabled
+    assert "ask_poke" not in disabled.split("# Approved context")[0]
+    assert len(enabled.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
+
+
+def test_realtime_instructions_drop_ask_poke_guidance_before_overflowing(
+    packet: ContextPacket, monkeypatch: pytest.MonkeyPatch
+):
+    base_size = len(realtime_instructions(packet).encode("utf-8"))
+    with_guidance = len(realtime_instructions(packet, ask_poke_enabled=True).encode("utf-8"))
+    assert with_guidance > base_size
+
+    # A context that fits the base template but not the optional guidance must keep
+    # working with the flag on: the guidance is dropped instead of failing the accept.
+    monkeypatch.setattr(prompts, "REALTIME_INSTRUCTIONS_MAX_BYTES", with_guidance - 1)
+    instructions = realtime_instructions(packet, ask_poke_enabled=True)
+    assert "Use ask_poke for facts only the owner" not in instructions
+    assert len(instructions.encode("utf-8")) == base_size
+
+    # A context that cannot fit even the base template still raises.
+    monkeypatch.setattr(prompts, "REALTIME_INSTRUCTIONS_MAX_BYTES", base_size - 1)
+    with pytest.raises(ValueError, match=r"Realtime instructions exceed"):
+        realtime_instructions(packet, ask_poke_enabled=True)
+
+
 def test_realtime_instructions_enforce_final_byte_limit(
     packet: ContextPacket, monkeypatch: pytest.MonkeyPatch
 ):

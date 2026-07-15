@@ -111,7 +111,8 @@ class StartPhoneCallOutput(BaseModel):
     state: CallState
     poll_after_seconds: int = 2
     next_action: str = (
-        "Poll get_call_result until state is completed, failed, timed_out, or transferred."
+        "Call wait_for_call_event. Answer pending questions with answer_call_question and continue "
+        "waiting with next_after_sequence; when terminal, call get_call_result."
     )
 
 
@@ -236,7 +237,7 @@ class RealtimeFunctionTool(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["function"] = "function"
-    name: Literal["transfer_to_owner", "record_call_outcome", "search_web", "end_call"]
+    name: Literal["transfer_to_owner", "record_call_outcome", "search_web", "ask_poke", "end_call"]
     description: str = Field(min_length=1)
     parameters: dict[str, Any]
 
@@ -281,6 +282,54 @@ class WebSearchRequest(BaseModel):
         if len(normalized) < 2:
             raise ValueError("query must contain at least two non-whitespace characters")
         return normalized
+
+
+class QuestionStatus(StrEnum):
+    PENDING = "pending"
+    ANSWERED = "answered"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class AskPokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=5, max_length=500)
+    reason: str | None = Field(default=None, max_length=200)
+
+    @field_validator("question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) < 5:
+            raise ValueError("question must contain at least five non-whitespace characters")
+        return normalized
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        return normalized or None
+
+
+class AnswerCallQuestionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    call_id: str = Field(min_length=1, max_length=120)
+    question_id: str = Field(min_length=1, max_length=120)
+    answer: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("answer")
+    @classmethod
+    def validate_answer(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("answer must be non-empty")
+        if len(stripped.encode("utf-8")) > 4096:
+            raise ValueError("answer exceeds 4096 UTF-8 bytes")
+        return stripped
 
 
 class AdvisoryOutcome(BaseModel):

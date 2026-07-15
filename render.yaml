@@ -22,6 +22,8 @@ services:
         value: "false"
       - key: POKE_PUSH_ENABLED
         value: "false"
+      - key: ASK_POKE_ENABLED
+        value: "false"
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_WEBHOOK_SECRET
