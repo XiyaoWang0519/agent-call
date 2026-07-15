@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -7,6 +8,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 E164 = Annotated[str, StringConstraints(pattern=r"^\+[1-9]\d{1,14}$")]
+CONTEXT_PACKET_MAX_BYTES = 16 * 1024
 
 
 def utc_now() -> datetime:
@@ -63,6 +65,25 @@ class ContextPacket(BaseModel):
     allowed_commitments: list[str] = Field(default_factory=list, max_length=100)
     prohibited_actions: list[str] = Field(default_factory=list, max_length=100)
     escalation: EscalationContext
+
+    def approved_context_json(self) -> str:
+        approved = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        size_bytes = len(approved.encode("utf-8"))
+        if size_bytes > CONTEXT_PACKET_MAX_BYTES:
+            raise ValueError(
+                "ContextPacket compact JSON exceeds "
+                f"{CONTEXT_PACKET_MAX_BYTES} UTF-8 bytes (received {size_bytes})"
+            )
+        return approved
+
+    @model_validator(mode="after")
+    def validate_serialized_size(self) -> ContextPacket:
+        self.approved_context_json()
+        return self
 
 
 class PreparePhoneCallInput(BaseModel):
@@ -176,7 +197,7 @@ class SemanticVad(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["semantic_vad"] = "semantic_vad"
-    eagerness: Literal["auto"] = "auto"
+    eagerness: Literal["low", "medium", "high", "auto"] = "auto"
     create_response: bool
     interrupt_response: bool
 
@@ -193,7 +214,7 @@ class RealtimeAudioInput(BaseModel):
 class RealtimeAudioOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    voice: Literal["marin"] = "marin"
+    voice: Literal["echo"] = "echo"
     speed: float = Field(default=1.0, ge=0.25, le=1.5)
 
 

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastmcp import FastMCP
-from openai import AsyncOpenAI
 
 from app.call_state import CallService
 from app.db import Database
 from app.mcp_tools import register_tools
+from app.openai_client import create_openai_client
 from app.routes import debug, deployment, openai_webhooks, twilio_webhooks
 from app.security import MCPAuthMiddleware
 from app.settings import Settings
@@ -19,6 +20,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+logger = logging.getLogger(__name__)
+
+# Each cleanup step must finish within this bound so a supervisor-issued cancel
+# (or a hung client) cannot stall shutdown indefinitely.
+LIFESPAN_CLEANUP_STEP_TIMEOUT_SECONDS = 15.0
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -45,24 +52,72 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.require_runtime_configuration()
         db = Database(settings.database_path)
         await db.initialize()
-        openai = AsyncOpenAI(
-            api_key=Settings.reveal(settings.openai_api_key),
-            webhook_secret=Settings.reveal(settings.openai_webhook_secret),
-        )
-        service = CallService(settings, db, openai=openai)
-        holder["service"] = service
-        app.state.call_service = service
-        # Recovery happens before the server accepts traffic.
-        await service.recover_startup()
-        # A successful restart completes the deployment lease. Failed or canceled
-        # deployments are also bounded by the database lock's TTL.
-        await db.release_deployment_lock()
-        await service.start_watchdog()
-        async with mcp_http_app.lifespan(app):
-            yield
-        await service.stop()
-        await openai.close()
-        holder.clear()
+        openai = None
+        service: CallService | None = None
+        primary_error: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        try:
+            openai = create_openai_client(settings)
+            service = CallService(settings, db, openai=openai)
+            holder["service"] = service
+            app.state.call_service = service
+            # Recovery happens before the server accepts traffic.
+            await service.recover_startup()
+            # A successful restart completes the deployment lease. Failed or canceled
+            # deployments are also bounded by the database lock's TTL.
+            await db.release_deployment_lock()
+            await service.start_watchdog()
+            async with mcp_http_app.lifespan(app):
+                yield
+        except BaseException as exc:
+            primary_error = exc
+        finally:
+            cancelled = isinstance(primary_error, asyncio.CancelledError)
+            cleanup_steps = []
+            if service is not None:
+                cleanup_steps.append(service.stop)
+            if openai is not None:
+                cleanup_steps.append(openai.close)
+            cleanup_steps.append(db.close)
+
+            # Cleanup steps are individually time-bounded and cancellation is
+            # tracked separately from ordinary failures: cancellation must keep
+            # running the remaining (now bounded) steps and ultimately propagate
+            # as CancelledError, never get swallowed or wrapped in a group, or an
+            # external cancel could not bound how long shutdown takes.
+            for cleanup in cleanup_steps:
+                try:
+                    async with asyncio.timeout(LIFESPAN_CLEANUP_STEP_TIMEOUT_SECONDS):
+                        await cleanup()
+                except asyncio.CancelledError:
+                    cancelled = True
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            try:
+                holder.clear()
+            except BaseException as exc:  # pragma: no cover - dict.clear is defensive here
+                cleanup_errors.append(exc)
+
+        if cancelled:
+            # Cancellation wins the raise, so anything else that went wrong must be
+            # logged here or it is lost entirely.
+            if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError):
+                logger.error("lifespan failed before cancellation", exc_info=primary_error)
+            for error in cleanup_errors:
+                logger.error("lifespan cleanup step failed during cancellation", exc_info=error)
+            raise asyncio.CancelledError
+
+        if primary_error is not None:
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "application lifespan failed and cleanup also failed",
+                    [primary_error, *cleanup_errors],
+                )
+            raise primary_error
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise BaseExceptionGroup("application lifespan cleanup failed", cleanup_errors)
 
     app = FastAPI(title="Poke Phone-Call Bridge", version="1.0.0", lifespan=lifespan)
     app.state.settings = settings

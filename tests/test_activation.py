@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
+
 import pytest
 
+from app.db import LatencyMark
 from app.models import CallState, PreparePhoneCallInput
 from tests.conftest import seed_call, wait_background
 
@@ -37,6 +41,23 @@ async def test_callee_is_not_dialed_until_accept_and_sideband_open(service, pack
     await service.handle_sideband_open(started.call_id)
     assert service._test_twilio.callee_creates == 1
     assert service._test_realtime.initial_updates == [started.call_id]
+    await wait_background()
+    latency = await service.db.get_latency_events(started.call_id)
+    assert [event["stage"] for event in latency] == [
+        "twilio_agent_request",
+        "twilio_agent_created",
+        "openai_accept_request",
+        "openai_accept_completed",
+        "sideband_open",
+        "initial_session_ack",
+        "twilio_callee_request",
+        "twilio_callee_created",
+    ]
+    assert all(datetime.fromisoformat(event["occurred_at"]).tzinfo is not None for event in latency)
+    assert len({event["clock_id"] for event in latency}) == 1
+    assert [event["monotonic_ns"] for event in latency] == sorted(
+        event["monotonic_ns"] for event in latency
+    )
 
 
 @pytest.mark.asyncio
@@ -275,6 +296,27 @@ async def test_caller_speech_uses_auto_response_without_manual_create(service, p
 
 
 @pytest.mark.asyncio
+async def test_assistant_transcript_persists_for_aliased_done_event(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
+    await service.handle_amd(call_id, "human")
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.audio_transcript.done",
+            "event_id": "evt_alias_done",
+            "item_id": "turn_assistant_alias",
+            "transcript": "Hello from the alias event.",
+        },
+    )
+    transcript = await service.db.get_transcript(call_id)
+    assert [(turn.speaker, turn.text) for turn in transcript] == [
+        ("assistant", "Hello from the alias event.")
+    ]
+    assert transcript[0].turn_id == "turn_assistant_alias"
+
+
+@pytest.mark.asyncio
 async def test_tool_output_is_followed_by_observed_continuation(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await service.handle_realtime_event(
@@ -296,6 +338,120 @@ async def test_tool_output_is_followed_by_observed_continuation(service, packet)
     assert call["tool_call_count"] == 1
     assert call["tool_continuation_observed"] == 1
     assert call["advisory_outcome"]["summary"] == "Done"
+
+
+@pytest.mark.asyncio
+async def test_latency_stages_capture_answer_first_output_and_tool_turnaround(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "answered"})
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.output_audio.delta",
+            "event_id": "evt_audio",
+            "delta": "not-persisted-audio",
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.output_audio_transcript.delta",
+            "event_id": "evt_transcript",
+            "delta": "Hello",
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.function_call_arguments.done",
+            "event_id": "evt_tool",
+            "call_id": "tool_latency",
+            "name": "record_call_outcome",
+            "arguments": (
+                '{"status":"completed","summary":"Done","commitments":[],"followUps":[]}'
+            ),
+        },
+    )
+    await service.handle_realtime_send(
+        call_id,
+        {
+            "type": "conversation.item.create",
+            "item": {"type": "function_call_output", "call_id": "tool_latency"},
+        },
+    )
+    await service.handle_realtime_send(call_id, {"type": "response.create"})
+    await wait_background()
+
+    events = await service.db.get_latency_events(call_id)
+    by_stage = {event["stage"]: event for event in events}
+    assert {
+        "callee_answered",
+        "first_openai_audio_delta",
+        "first_assistant_transcript",
+        "tool_call_received",
+        "tool_result_sent",
+        "first_response_create",
+    } <= by_stage.keys()
+    assert by_stage["tool_call_received"]["event_key"] == "tool_latency"
+    assert by_stage["tool_result_sent"]["event_key"] == "tool_latency"
+    assert (
+        by_stage["tool_call_received"]["monotonic_ns"]
+        <= by_stage["tool_result_sent"]["monotonic_ns"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_earlier_answer_callback_mark_wins_when_it_finishes_later(
+    service, packet, monkeypatch
+):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    marks = iter(
+        [
+            LatencyMark("2026-07-14T12:00:00+00:00", 100),
+            LatencyMark("2026-07-14T12:00:01+00:00", 200),
+        ]
+    )
+    monkeypatch.setattr(LatencyMark, "now", classmethod(lambda cls: next(marks)))
+
+    original_get_call = service.db.get_call
+    first_get_started = asyncio.Event()
+    release_first_get = asyncio.Event()
+    get_count = 0
+
+    async def delay_first_get(call_id: str):
+        nonlocal get_count
+        get_count += 1
+        if get_count == 1:
+            first_get_started.set()
+            await release_first_get.wait()
+        return await original_get_call(call_id)
+
+    monkeypatch.setattr(service.db, "get_call", delay_first_get)
+    earlier_callback = asyncio.create_task(
+        service.handle_conference_event(
+            call_id,
+            {
+                "StatusCallbackEvent": "participant-join",
+                "ParticipantLabel": "callee",
+                "CallSid": "CA" + "b" * 32,
+            },
+        )
+    )
+    await first_get_started.wait()
+
+    # This callback has a later receipt mark but reaches persistence first.
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "answered"})
+    release_first_get.set()
+    await earlier_callback
+    await wait_background()
+
+    answer_event = next(
+        event
+        for event in await service.db.get_latency_events(call_id)
+        if event["stage"] == "callee_answered"
+    )
+    assert answer_event["monotonic_ns"] == 100
+    assert answer_event["occurred_at"] == "2026-07-14T12:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -405,6 +561,7 @@ async def test_transfer_tool_returns_output_before_removing_ai(service, packet):
             "arguments": '{"reason":"owner needed"}',
         },
     )
+    await wait_background()
     assert order[:2] == ["tool_output", "remove_participant"]
 
 
@@ -431,7 +588,101 @@ async def test_machine_waits_for_message_end_and_all_gates(service, packet):
     await service.db.update_call(call_id, callee_joined=1)
     await service._check_activation_gate(call_id)
     assert service._test_realtime.events == [
-        ("session.update", call_id),
+        ("voicemail", call_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_voicemail_activation_never_enables_automatic_responses(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
+
+    async def forbidden_update(_call_id: str):
+        raise AssertionError("voicemail must not enable automatic responses")
+
+    service._test_realtime.enable_automatic_responses = forbidden_update
+
+    await service.handle_amd(call_id, "machine_end_beep")
+
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.events == [("voicemail", call_id)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_amd_wins_before_opening_claim(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1)
+    claim_reached = asyncio.Event()
+    release_claim = asyncio.Event()
+    original_claim = service.db.claim_opening_if_not_voicemail
+
+    async def delayed_claim(candidate_call_id: str) -> bool:
+        claim_reached.set()
+        await release_claim.wait()
+        return await original_claim(candidate_call_id)
+
+    service.db.claim_opening_if_not_voicemail = delayed_claim
+    answered = asyncio.create_task(
+        service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    )
+    await asyncio.wait_for(claim_reached.wait(), timeout=1)
+
+    amd = asyncio.create_task(service.handle_amd(call_id, "machine_end_beep"))
+    for _ in range(100):
+        if (await service.db.get_call(call_id))["answer_handling"] == "voicemail":
+            break
+        await asyncio.sleep(0.001)
+    else:
+        pytest.fail("AMD classification was not persisted")
+    release_claim.set()
+    await asyncio.gather(answered, amd)
+
+    call = await service.db.get_call(call_id)
+    assert call["answer_handling"] == "voicemail"
+    assert call["opening_sent"] == 0
+    assert service._test_realtime.events == [("voicemail", call_id)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_opening_claim_wins_before_amd_cancel(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.db.update_call(call_id, sideband_open=1)
+    opening_send_reached = asyncio.Event()
+    release_opening_send = asyncio.Event()
+    original_create_opening = service._test_realtime.create_opening
+
+    async def delayed_opening(candidate_call_id: str) -> None:
+        opening_send_reached.set()
+        await release_opening_send.wait()
+        await original_create_opening(candidate_call_id)
+
+    service._test_realtime.create_opening = delayed_opening
+    answered = asyncio.create_task(
+        service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    )
+    await asyncio.wait_for(opening_send_reached.wait(), timeout=1)
+    call = await service.db.get_call(call_id)
+    assert call["opening_sent"] == 1
+
+    amd = asyncio.create_task(service.handle_amd(call_id, "machine_end_beep"))
+    for _ in range(100):
+        if (await service.db.get_call(call_id))["answer_handling"] == "voicemail":
+            break
+        await asyncio.sleep(0.001)
+    else:
+        pytest.fail("AMD classification was not persisted")
+
+    await asyncio.sleep(0)
+    assert not amd.done()
+    assert service._test_realtime.events == []
+
+    release_opening_send.set()
+    await asyncio.gather(answered, amd)
+
+    assert service._test_realtime.events == [
+        ("opening", call_id),
+        ("cancel_response", call_id),
         ("voicemail", call_id),
     ]
 
@@ -448,7 +699,6 @@ async def test_late_voicemail_amd_cancels_opening_before_response_created(servic
 
     assert service._test_realtime.events == [
         ("opening", call_id),
-        ("session.update", call_id),
         ("cancel_response", call_id),
         ("voicemail", call_id),
     ]
@@ -468,7 +718,6 @@ async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
 
     assert service._test_realtime.events == [
         ("opening", call_id),
-        ("session.update", call_id),
         ("cancel_response", call_id),
         ("voicemail", call_id),
     ]

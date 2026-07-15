@@ -165,3 +165,36 @@ async def test_get_result_never_in_progress_after_terminal(service, packet):
     response = await service.get_result(call_id)
     assert response["state"] == CallState.COMPLETED
     assert response["result"] is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_compensation_durably_marks_conference_cleanup_pending(
+    service, packet, monkeypatch
+):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    call = await service.db.get_call(call_id)
+
+    async def failed_complete(_conference):
+        raise RuntimeError("Twilio unavailable")
+
+    monkeypatch.setattr(service._test_twilio, "complete_conference", failed_complete)
+
+    result = await service._complete_conference_or_schedule(call)
+
+    assert result is False
+    stored = await service.db.get_call(call_id)
+    assert stored["conference_cleanup_pending"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_startup_completes_pending_conference_cleanup(service, packet):
+    # The call row is already terminal, so it is invisible to list_nonterminal_calls;
+    # only the durable flag lets startup recovery find and finish the orphaned conference.
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.set_conference_cleanup_pending(call_id, True)
+
+    await service.recover_startup()
+
+    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    stored = await service.db.get_call(call_id)
+    assert stored["conference_cleanup_pending"] == 0

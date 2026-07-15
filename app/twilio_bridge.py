@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
+from twilio.base.exceptions import TwilioRestException
+from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 
 from app.models import ContextPacket
@@ -22,6 +24,11 @@ class TwilioBridge:
         self.client = client or Client(
             settings.twilio_account_sid,
             Settings.reveal(settings.twilio_auth_token),
+            http_client=TwilioHttpClient(
+                pool_connections=True,
+                timeout=settings.twilio_http_timeout_seconds,
+                max_retries=0,
+            ),
         )
 
     def _callback(self, path: str, *, call_id: str, plan_id: str, **extra: str) -> str:
@@ -49,6 +56,7 @@ class TwilioBridge:
                 # while the agent is alone on hold before the callee joins.
                 early_media=False,
                 muted=False,
+                jitter_buffer_size="small",
                 status_callback=self._callback(
                     "/webhooks/twilio/participant-status",
                     call_id=call_id,
@@ -87,6 +95,7 @@ class TwilioBridge:
                 beep="false",
                 timeout=self.settings.setup_deadline_seconds,
                 machine_detection="DetectMessageEnd",
+                jitter_buffer_size="small",
                 amd_status_callback=self._callback(
                     "/webhooks/twilio/amd", call_id=call_id, plan_id=plan_id
                 ),
@@ -121,6 +130,7 @@ class TwilioBridge:
                 time_limit=self.settings.max_call_seconds,
                 timeout=30,
                 beep="false",
+                jitter_buffer_size="small",
                 status_callback=self._callback(
                     "/webhooks/twilio/participant-status",
                     call_id=call_id,
@@ -140,7 +150,14 @@ class TwilioBridge:
         def complete() -> None:
             self.client.conferences(conference_sid_or_name).update(status="completed")
 
-        await asyncio.to_thread(complete)
+        try:
+            await asyncio.to_thread(complete)
+        except TwilioRestException as exc:
+            # A missing conference is already fully torn down, which is the desired
+            # idempotent outcome for retry and startup recovery paths.
+            if exc.status == 404:
+                return
+            raise
 
     async def remove_participant(
         self, conference_sid_or_name: str | None, participant_call_sid: str | None
@@ -154,6 +171,21 @@ class TwilioBridge:
             ).delete()
 
         await asyncio.to_thread(remove)
+
+    async def enable_end_conference_on_exit(
+        self, conference_sid_or_name: str | None, participant_call_sid: str | None
+    ) -> None:
+        """Make the transferred owner leg the conference lifetime owner."""
+
+        if not conference_sid_or_name or not participant_call_sid:
+            return
+
+        def enable() -> None:
+            self.client.conferences(conference_sid_or_name).participants(
+                participant_call_sid
+            ).update(end_conference_on_exit=True)
+
+        await asyncio.to_thread(enable)
 
     async def unmute_participant(
         self, conference_sid_or_name: str | None, participant_call_sid: str | None

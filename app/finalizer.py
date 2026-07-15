@@ -8,9 +8,9 @@ from typing import Any
 import httpx
 from openai import (
     APIConnectionError,
+    APIStatusError,
     APITimeoutError,
     AsyncOpenAI,
-    RateLimitError,
 )
 
 from app.db import Database
@@ -41,6 +41,14 @@ class Finalizer:
         if state == CallState.TIMED_OUT.value:
             return "timed_out"
         return "failed"
+
+    @staticmethod
+    def _retryable_extraction_error(exc: Exception) -> bool:
+        if isinstance(exc, (APIConnectionError, APITimeoutError)):
+            return True
+        if isinstance(exc, APIStatusError):
+            return exc.status_code in {408, 409, 429} or exc.status_code >= 500
+        return False
 
     async def finalize(self, call_id: str) -> StoredCallResult:
         lock = self._locks.setdefault(call_id, asyncio.Lock())
@@ -154,7 +162,6 @@ class Finalizer:
             "realtime_advisory_outcome": call.get("advisory_outcome"),
             "transcript": [turn.model_dump(mode="json") for turn in transcript],
         }
-        retryable = (APIConnectionError, APITimeoutError, RateLimitError)
         for attempt in range(2):
             try:
                 response = await self.openai.responses.parse(
@@ -163,6 +170,7 @@ class Finalizer:
                     input=json.dumps(payload, ensure_ascii=False),
                     text_format=ExtractedCallResult,
                     store=False,
+                    timeout=self.settings.openai_extraction_timeout_seconds,
                 )
                 parsed = response.output_parsed
                 if parsed is None:
@@ -176,8 +184,8 @@ class Finalizer:
                         if not set(item.evidence_turn_ids).issubset(evidence_ids):
                             raise ValueError("extractor cited an unknown transcript turn_id")
                 return parsed
-            except retryable:
-                if attempt == 0:
+            except Exception as exc:
+                if attempt == 0 and self._retryable_extraction_error(exc):
                     await asyncio.sleep(0.25)
                     continue
                 raise

@@ -72,11 +72,22 @@ def packet() -> ContextPacket:
     )
 
 
+@pytest.fixture
+async def database(settings: Settings):
+    db = Database(settings.database_path)
+    await db.initialize()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
 class FakeTwilio:
     def __init__(self):
         self.completed: list[str | None] = []
         self.removed: list[tuple[str | None, str | None]] = []
         self.unmuted: list[tuple[str | None, str | None]] = []
+        self.end_on_exit: list[tuple[str | None, str | None]] = []
         self.agent_creates = 0
         self.callee_creates = 0
         self.owner_creates = 0
@@ -102,6 +113,11 @@ class FakeTwilio:
     async def unmute_participant(self, conference_sid_or_name, participant_call_sid) -> None:
         self.unmuted.append((conference_sid_or_name, participant_call_sid))
 
+    async def enable_end_conference_on_exit(
+        self, conference_sid_or_name, participant_call_sid
+    ) -> None:
+        self.end_on_exit.append((conference_sid_or_name, participant_call_sid))
+
 
 class FakeRealtime:
     def __init__(self):
@@ -110,6 +126,7 @@ class FakeRealtime:
         self.hangups: list[str | None] = []
         self.rejects: list[str] = []
         self.closed: list[str] = []
+        self.close_all_calls = 0
         self.tool_results: list[tuple[str, str, dict]] = []
         self.tool_result_continuations: list[bool] = []
         self.accepts: list[tuple[str, str]] = []
@@ -119,6 +136,8 @@ class FakeRealtime:
                 "audio": {
                     "input": {
                         "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "auto",
                             "create_response": True,
                             "interrupt_response": True,
                         }
@@ -157,10 +176,14 @@ class FakeRealtime:
         self.accepts.append((call_id, openai_call_id))
         return 200
 
-    @staticmethod
-    def activation_update_confirmed(event):
+    def activation_update_confirmed(self, event):
         turn = event["session"]["audio"]["input"]["turn_detection"]
-        return turn["create_response"] is True and turn["interrupt_response"] is True
+        return (
+            turn["type"] == "semantic_vad"
+            and turn["eagerness"] == "auto"
+            and turn["create_response"] is True
+            and turn["interrupt_response"] is True
+        )
 
     async def create_opening(self, call_id: str) -> None:
         self.events.append(("opening", call_id))
@@ -179,6 +202,9 @@ class FakeRealtime:
 
     async def drain_and_close(self, call_id: str) -> None:
         self.closed.append(call_id)
+
+    async def close_all(self) -> None:
+        self.close_all_calls += 1
 
     async def send_tool_result(
         self,
@@ -263,6 +289,9 @@ async def seed_call(
         confirmation_text="Confirmed",
     )
     assert claimed
+    # Every state past PREWARMING is only reachable in production after the callee has
+    # answered, so default callee_joined accordingly. Callers testing the pre-answer
+    # window keep the default PREWARMING state and set callee_joined explicitly.
     await db.update_call(
         call_id,
         state=state.value,
@@ -272,6 +301,7 @@ async def seed_call(
         openai_call_id=openai_call_id,
         transcription_verified=1,
         semantic_vad_verified=1,
+        callee_joined=int(state != CallState.PREWARMING),
     )
     return call_id
 
@@ -291,7 +321,10 @@ async def service(settings: Settings):
     svc._test_realtime = realtime
     svc._test_finalizer = finalizer
     yield svc
-    await svc.stop()
+    try:
+        await svc.stop()
+    finally:
+        await db.close()
 
 
 async def wait_background() -> None:
