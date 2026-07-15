@@ -494,11 +494,129 @@ async def test_voice_model_ends_call_only_after_its_completed_response(service, 
     )
     await wait_background()
 
+    # Generation finishing must not hang up while the goodbye is still playing over SIP.
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.hangups == []
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "output_audio_buffer.stopped", "response_id": "resp_closing"},
+    )
+    await wait_background()
+
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
     assert call["termination_reason"] == "voice_model_end_call"
     assert service._test_realtime.hangups == ["rtc_test"]
     assert service._test_twilio.completed == ["CF" + "a" * 32]
+
+
+@pytest.mark.asyncio
+async def test_voice_end_ignores_stale_audio_buffer_stopped_events(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await service._handle_tool_call(
+        call_id,
+        {
+            "call_id": "tool_end",
+            "name": "end_call",
+            "arguments": '{"reason":"objective_completed"}',
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.created", "response": {"id": "resp_closing"}},
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {"id": "resp_closing", "status": "completed"},
+        },
+    )
+
+    # A drain event for an earlier response must not end the call early.
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "output_audio_buffer.stopped", "response_id": "resp_earlier"},
+    )
+    await wait_background()
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.hangups == []
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "output_audio_buffer.stopped", "response_id": "resp_closing"},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.COMPLETED.value
+    assert call["termination_reason"] == "voice_model_end_call"
+
+
+@pytest.mark.asyncio
+async def test_voice_end_interrupted_playback_still_terminates(service, packet):
+    """output_audio_buffer.cleared (callee interrupt) also marks the end of playback."""
+
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await service._handle_tool_call(
+        call_id,
+        {
+            "call_id": "tool_end",
+            "name": "end_call",
+            "arguments": '{"reason":"objective_completed"}',
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.created", "response": {"id": "resp_closing"}},
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {"id": "resp_closing", "status": "completed"},
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "output_audio_buffer.cleared", "response_id": "resp_closing"},
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.COMPLETED.value
+    assert call["termination_reason"] == "voice_model_end_call"
+
+
+@pytest.mark.asyncio
+async def test_voice_end_terminates_after_drain_timeout_without_buffer_event(
+    service, packet, monkeypatch
+):
+    monkeypatch.setattr("app.call_state.TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS", 0.05)
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await service._handle_tool_call(
+        call_id,
+        {
+            "call_id": "tool_end",
+            "name": "end_call",
+            "arguments": '{"reason":"objective_completed"}',
+        },
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.created", "response": {"id": "resp_closing"}},
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {"id": "resp_closing", "status": "completed"},
+        },
+    )
+    await wait_background()
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.COMPLETED.value
+    assert call["termination_reason"] == "voice_model_end_call"
 
 
 @pytest.mark.asyncio
@@ -734,6 +852,15 @@ async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
     await service.handle_realtime_event(
         call_id,
         {"type": "response.done", "response": {"id": "resp_vm", "status": "completed"}},
+    )
+    await wait_background()
+    # The voicemail hangup waits for playback to drain so the message is not cut off.
+    call = await service.db.get_call(call_id)
+    assert call["state"] == CallState.ACTIVE.value
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "output_audio_buffer.stopped", "response_id": "resp_vm"},
     )
     await wait_background()
     call = await service.db.get_call(call_id)

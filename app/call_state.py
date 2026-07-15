@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS = 15 * 60
 CALL_ACTIVITY_TOMBSTONE_MAX = 4096
 OWNER_JOIN_TIMEOUT_SECONDS = 30
+# Over SIP, response.done marks the end of audio *generation*; playback to the phone lags
+# behind because OpenAI drains a server-side output buffer in real time. Termination after a
+# final spoken turn (voice-initiated end_call goodbye, voicemail) must wait for
+# output_audio_buffer.stopped or the callee hears the closing words cut off. The fallback
+# below bounds that wait in case the event is never delivered; it stays under the 15s
+# watchdog staleness window so a completed call is not misreported as timed out.
+TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS = 12.0
 TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
@@ -91,6 +98,7 @@ class CallService:
         self._owner_transfer_locks: dict[str, asyncio.Lock] = {}
         self._opening_transition_locks: dict[str, asyncio.Lock] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
+        self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
         self._active_response_ids: dict[str, str | None] = {}
         self._tool_seen_calls: set[str] = set()
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
@@ -859,10 +867,13 @@ class CallService:
             # A cancelled response.done here is the opening turn we cancelled when AMD
             # reported voicemail; the voicemail response itself is still in flight.
             if call and call.get("voicemail_sent") and status not in {"cancelled", "canceled"}:
-                self._spawn(
-                    self.terminate_call(call_id, "voicemail_left"),
-                    name=f"terminate:{call_id}:voicemail",
+                self._terminate_after_audio_drain(
+                    call_id,
+                    response.get("id") or event.get("response_id"),
+                    "voicemail_left",
                 )
+        elif event_type in {"output_audio_buffer.stopped", "output_audio_buffer.cleared"}:
+            self._handle_output_audio_drained(call_id, event)
         elif event_type in {"session.ended", "call.ended"}:
             self._spawn(
                 self.terminate_call(call_id, "openai_terminal_event"),
@@ -1093,10 +1104,7 @@ class CallService:
         if status != "completed":
             return
         self._voice_end_pending.pop(call_id, None)
-        self._spawn(
-            self.terminate_call(call_id, "voice_model_end_call"),
-            name=f"terminate:{call_id}:voice-end",
-        )
+        self._terminate_after_audio_drain(call_id, response_id, "voice_model_end_call")
 
     async def _voice_end_fallback(self, call_id: str, tool_call_id: str) -> None:
         await asyncio.sleep(15)
@@ -1105,6 +1113,47 @@ class CallService:
             return
         self._voice_end_pending.pop(call_id, None)
         await self.terminate_call(call_id, "voice_model_end_call")
+
+    def _terminate_after_audio_drain(
+        self, call_id: str, response_id: str | None, reason: str
+    ) -> None:
+        """Delay a post-final-response termination until SIP playback finishes.
+
+        response.done only means generation finished; hanging up right away truncates the
+        closing words still buffered on OpenAI's side. output_audio_buffer.stopped (or
+        .cleared, when the callee interrupts) marks actual end of playback. A bounded
+        fallback still terminates if neither event is ever delivered.
+        """
+
+        self._audio_drain_terminations[call_id] = (response_id, reason)
+        self._spawn(
+            self._audio_drain_fallback(call_id, response_id, reason),
+            name=f"audio-drain-fallback:{call_id}",
+        )
+
+    def _handle_output_audio_drained(self, call_id: str, event: dict[str, Any]) -> None:
+        pending = self._audio_drain_terminations.get(call_id)
+        if pending is None:
+            return
+        expected_response_id, reason = pending
+        response_id = event.get("response_id")
+        if expected_response_id and response_id and expected_response_id != response_id:
+            return
+        self._audio_drain_terminations.pop(call_id, None)
+        self._spawn(
+            self.terminate_call(call_id, reason),
+            name=f"terminate:{call_id}:audio-drained",
+        )
+
+    async def _audio_drain_fallback(
+        self, call_id: str, response_id: str | None, reason: str
+    ) -> None:
+        await asyncio.sleep(TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS)
+        pending = self._audio_drain_terminations.get(call_id)
+        if pending is None or pending != (response_id, reason):
+            return
+        self._audio_drain_terminations.pop(call_id, None)
+        await self.terminate_call(call_id, reason)
 
     async def transfer_to_owner(
         self, call_id: str, reason: str, *, terminate_after: bool = True
@@ -1904,6 +1953,7 @@ class CallService:
         call_id = call["call_id"]
         self._tombstone_call_activity(call_id)
         self._voice_end_pending.pop(call_id, None)
+        self._audio_drain_terminations.pop(call_id, None)
         self._active_response_ids.pop(call_id, None)
         media_tasks = [self.realtime.hangup(call.get("openai_call_id"))]
         if not preserve_conference:
