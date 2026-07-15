@@ -540,6 +540,7 @@ async def test_transfer_tool_returns_output_before_removing_ai(service, packet):
             "arguments": '{"reason":"owner needed"}',
         },
     )
+    await wait_background()
     assert order[:2] == ["tool_output", "remove_participant"]
 
 

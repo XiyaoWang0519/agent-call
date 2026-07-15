@@ -381,6 +381,24 @@ async def test_external_drain_waits_for_queued_events_before_cancel_fallback(set
 
 
 @pytest.mark.asyncio
+async def test_close_all_stops_every_registered_runtime(settings, monkeypatch):
+    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0)
+    websocket = QueueWebSocket()
+    bridge, runtime, task, fatals, _ = await _start_bridge(
+        settings,
+        monkeypatch,
+        call_id="call_shutdown_all",
+        websocket=websocket,
+        on_event=_noop,
+    )
+    await asyncio.wait_for(bridge.close_all(), timeout=1)
+
+    assert task.done()
+    assert runtime.call_id not in bridge._runtime
+    assert fatals == []
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_preserves_fifo_order(settings, monkeypatch):
     websocket = QueueWebSocket()
     handled: list[int] = []

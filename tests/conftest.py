@@ -87,6 +87,7 @@ class FakeTwilio:
         self.completed: list[str | None] = []
         self.removed: list[tuple[str | None, str | None]] = []
         self.unmuted: list[tuple[str | None, str | None]] = []
+        self.end_on_exit: list[tuple[str | None, str | None]] = []
         self.agent_creates = 0
         self.callee_creates = 0
         self.owner_creates = 0
@@ -112,6 +113,11 @@ class FakeTwilio:
     async def unmute_participant(self, conference_sid_or_name, participant_call_sid) -> None:
         self.unmuted.append((conference_sid_or_name, participant_call_sid))
 
+    async def enable_end_conference_on_exit(
+        self, conference_sid_or_name, participant_call_sid
+    ) -> None:
+        self.end_on_exit.append((conference_sid_or_name, participant_call_sid))
+
 
 class FakeRealtime:
     def __init__(self):
@@ -120,6 +126,7 @@ class FakeRealtime:
         self.hangups: list[str | None] = []
         self.rejects: list[str] = []
         self.closed: list[str] = []
+        self.close_all_calls = 0
         self.tool_results: list[tuple[str, str, dict]] = []
         self.tool_result_continuations: list[bool] = []
         self.accepts: list[tuple[str, str]] = []
@@ -195,6 +202,9 @@ class FakeRealtime:
 
     async def drain_and_close(self, call_id: str) -> None:
         self.closed.append(call_id)
+
+    async def close_all(self) -> None:
+        self.close_all_calls += 1
 
     async def send_tool_result(
         self,

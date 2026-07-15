@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
+from twilio.base.exceptions import TwilioRestException
 from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 
@@ -149,7 +150,14 @@ class TwilioBridge:
         def complete() -> None:
             self.client.conferences(conference_sid_or_name).update(status="completed")
 
-        await asyncio.to_thread(complete)
+        try:
+            await asyncio.to_thread(complete)
+        except TwilioRestException as exc:
+            # A missing conference is already fully torn down, which is the desired
+            # idempotent outcome for retry and startup recovery paths.
+            if exc.status == 404:
+                return
+            raise
 
     async def remove_participant(
         self, conference_sid_or_name: str | None, participant_call_sid: str | None
@@ -163,6 +171,21 @@ class TwilioBridge:
             ).delete()
 
         await asyncio.to_thread(remove)
+
+    async def enable_end_conference_on_exit(
+        self, conference_sid_or_name: str | None, participant_call_sid: str | None
+    ) -> None:
+        """Make the transferred owner leg the conference lifetime owner."""
+
+        if not conference_sid_or_name or not participant_call_sid:
+            return
+
+        def enable() -> None:
+            self.client.conferences(conference_sid_or_name).participants(
+                participant_call_sid
+            ).update(end_conference_on_exit=True)
+
+        await asyncio.to_thread(enable)
 
     async def unmute_participant(
         self, conference_sid_or_name: str | None, participant_call_sid: str | None

@@ -618,6 +618,48 @@ class RealtimeBridge:
         if self._runtime.get(call_id) is runtime:
             self._runtime.pop(call_id, None)
 
+    async def close_all(self) -> None:
+        """Stop every sideband runtime before its callback dependencies are closed."""
+
+        if not self._runtime:
+            return
+        call_ids = tuple(self._runtime)
+        results = await asyncio.gather(
+            *(self.drain_and_close(call_id) for call_id in call_ids),
+            return_exceptions=True,
+        )
+        for call_id, result in zip(call_ids, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "failed to close Realtime runtime call_id=%s",
+                    call_id,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+
+        # drain_and_close deliberately retains a cancellation-resistant runtime so
+        # a later teardown can see it. Application shutdown has no later owner, so
+        # make one final bounded cancellation pass and keep dependencies open until
+        # every supervisor has actually returned.
+        remaining = tuple(self._runtime.values())
+        tasks = {
+            task
+            for runtime in remaining
+            for task in (
+                runtime.task,
+                runtime.open_task,
+                runtime.receiver_task,
+                runtime.dispatcher_task,
+            )
+            if task is not None and not task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for runtime in remaining:
+            if runtime.task is None or runtime.task.done():
+                self._runtime.pop(runtime.call_id, None)
+
     def expected_transcription_echoed(self, event: dict[str, Any]) -> bool:
         session = event.get("session", {})
         transcription = session.get("audio", {}).get("input", {}).get("transcription") or {}

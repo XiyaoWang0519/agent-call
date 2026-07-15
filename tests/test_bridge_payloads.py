@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from twilio.base.exceptions import TwilioRestException
 
 from app.openai_realtime import RealtimeBridge, RealtimeRuntime
 from app.twilio_bridge import TwilioBridge
@@ -667,6 +668,23 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert owner["jitter_buffer_size"] == "small"
 
     await bridge.unmute_participant("CF1", "CA" + "a" * 32)
+    await bridge.enable_end_conference_on_exit("CF1", "CA" + "c" * 32)
     assert client.conferences("CF1").participants.updates == [
-        {"call_sid": "CA" + "a" * 32, "muted": False}
+        {"call_sid": "CA" + "a" * 32, "muted": False},
+        {"call_sid": "CA" + "c" * 32, "end_conference_on_exit": True},
     ]
+
+
+@pytest.mark.asyncio
+async def test_complete_conference_treats_missing_resource_as_already_closed(settings):
+    class MissingConference:
+        participants = FakeParticipants()
+
+        def update(self, **kwargs):
+            del kwargs
+            raise TwilioRestException(404, "/Conferences/CF-missing", "not found")
+
+    client = SimpleNamespace(conferences=lambda _name: MissingConference())
+    bridge = TwilioBridge(settings, client=client)
+
+    await bridge.complete_conference("CF-missing")
