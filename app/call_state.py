@@ -70,6 +70,7 @@ class PendingQuestion:
     deadline_monotonic: float
     delivering: bool = False
 
+
 # Assistant speech / SIP playback evidence. On SIP sidebands, RTP carries the media, so
 # response.audio.delta frames may be sparse or absent while the callee still hears audio.
 # These events (and in-memory "live work" flags) must keep the 15s watchdog from hanging up.
