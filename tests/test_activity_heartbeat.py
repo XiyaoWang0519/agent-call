@@ -51,11 +51,12 @@ async def test_realtime_deltas_flush_one_latest_arrival_without_per_event_writes
             {"type": "response.audio.delta", "event_id": f"evt_{sequence}"},
         )
 
+    expected = service._latest_call_activity[call_id]
     await service._flush_call_activity()
 
     assert latest is not None
-    assert batches == [[(call_id, latest.occurred_at)]]
-    assert (await service.db.get_call(call_id))["last_event_at"] == latest.occurred_at
+    assert batches == [[(call_id, expected.occurred_at)]]
+    assert (await service.db.get_call(call_id))["last_event_at"] == expected.occurred_at
 
 
 @pytest.mark.asyncio
@@ -197,6 +198,10 @@ async def test_terminal_call_clears_all_activity_tracking(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._note_call_activity(call_id)
     service._watchdog_claims.add(call_id)
+    service._active_response_ids[call_id] = "resp_live"
+    service._sip_output_playing.add(call_id)
+    service._audio_drain_terminations[call_id] = ("resp_live", "voice_model_end_call")
+    service._inflight_tools.add(call_id)
 
     assert await service.terminate_call(call_id, "owner_request") is True
     await wait_background()
@@ -205,6 +210,34 @@ async def test_terminal_call_clears_all_activity_tracking(service, packet):
     assert call_id not in service._dirty_call_activity
     assert call_id not in service._watchdog_claims
     assert call_id in service._activity_tombstones
+    assert call_id not in service._active_response_ids
+    assert call_id not in service._sip_output_playing
+    assert call_id not in service._audio_drain_terminations
+    assert call_id not in service._inflight_tools
+
+
+@pytest.mark.asyncio
+async def test_live_assistant_response_prevents_false_stale_timeout(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _make_call_stale(service, call_id)
+    service._active_response_ids[call_id] = "resp_live"
+
+    await service._watchdog_once()
+
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert call_id in service._latest_call_activity
+    assert call_id not in service._watchdog_claims
+
+
+@pytest.mark.asyncio
+async def test_sip_output_events_track_live_playback(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    await service.handle_realtime_event(call_id, {"type": "output_audio_buffer.started"})
+    assert call_id in service._sip_output_playing
+
+    await service.handle_realtime_event(call_id, {"type": "output_audio_buffer.stopped"})
+    assert call_id not in service._sip_output_playing
 
 
 @pytest.mark.asyncio
