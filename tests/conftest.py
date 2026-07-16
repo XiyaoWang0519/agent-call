@@ -132,6 +132,7 @@ class FakeRealtime:
         self.tool_results: list[tuple[str, str, dict]] = []
         self.tool_result_continuations: list[bool] = []
         self.tool_result_continuation_texts: list[str | None] = []
+        self.tool_result_failures_remaining = 0
         self.accepts: list[tuple[str, str]] = []
         self.update_event = {
             "type": "session.updated",
@@ -218,6 +219,9 @@ class FakeRealtime:
         continue_response: bool = True,
         continuation_instructions: str | None = None,
     ) -> None:
+        if self.tool_result_failures_remaining > 0:
+            self.tool_result_failures_remaining -= 1
+            raise RuntimeError("injected sideband send failure")
         self.tool_results.append((call_id, tool_call_id, output))
         self.tool_result_continuations.append(continue_response)
         self.tool_result_continuation_texts.append(continuation_instructions)

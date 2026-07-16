@@ -149,6 +149,9 @@ class CallService:
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
+        # Answered questions whose tool result never reached the sideband; a Poke retry
+        # of answer_call_question re-attempts delivery instead of reporting already_answered.
+        self._undelivered_answers: dict[str, set[str]] = {}
         self._event_notifiers: dict[str, asyncio.Event] = {}
 
     def _spawn(self, coroutine, *, name: str, must_finish: bool = False) -> asyncio.Task[Any]:
@@ -285,6 +288,7 @@ class CallService:
             self._activity_tombstones.popitem(last=False)
         self._clear_assistant_work(call_id)
         self._clear_call_activity(call_id)
+        self._undelivered_answers.pop(call_id, None)
 
     def _prune_activity_tombstones(self, now_ns: int | None = None) -> None:
         cutoff = monotonic_ns() if now_ns is None else now_ns
@@ -991,10 +995,11 @@ class CallService:
         output: dict[str, Any],
         *,
         continuation_instructions: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Swallow benign teardown races (e.g. "sideband is not open") so they cannot
         escalate into a fatal error and redundant termination. CancelledError must still
-        propagate so the dispatcher stays cancellable."""
+        propagate so the dispatcher stays cancellable. Returns False when delivery
+        failed, so callers that must retry (question answers) can record that."""
 
         try:
             await self.realtime.send_tool_result(
@@ -1012,6 +1017,8 @@ class CallService:
                 call_id,
                 exc_info=True,
             )
+            return False
+        return True
 
     async def _send_nontransfer_tool_result(
         self,
@@ -1281,26 +1288,19 @@ class CallService:
                 event_key=event_key,
             )
             return
-        asked_count = await self.db.count_call_questions(call_id)
-        if asked_count >= self.settings.ask_poke_max_questions_per_call:
-            await self._send_nontransfer_tool_result(
-                call_id,
-                tool_call_id,
-                {"status": "error", "error": "question_limit_reached"},
-                received=received,
-                event_key=event_key,
-            )
-            return
-
         deadline_at = (
             datetime.now(UTC) + timedelta(seconds=self.settings.ask_poke_answer_timeout_seconds)
         ).isoformat()
+        # The question quota is enforced inside create_question, after its duplicate
+        # tool_call_id check, so a redelivered ask_poke at the limit reuses the pending
+        # row instead of closing the still-open function call with question_limit_reached.
         row, error = await self.db.create_question(
             call_id,
             tool_call_id=tool_call_id,
             question=request.question,
             reason=request.reason,
             deadline_at=deadline_at,
+            max_questions=self.settings.ask_poke_max_questions_per_call,
         )
         if error is not None or row is None:
             await self._send_nontransfer_tool_result(
@@ -1412,7 +1412,7 @@ class CallService:
         self._mark_question_delivering(call_id, question_row["question_id"])
         await self._cancel_active_response(call_id)
         output = {"status": "answered", "answer": question_row["answer"]}
-        await self._guarded_send_tool_result(
+        delivered = await self._guarded_send_tool_result(
             call_id,
             question_row["tool_call_id"],
             output,
@@ -1421,13 +1421,24 @@ class CallService:
                 "in one or two sentences. Do not read metadata or mention Poke by name."
             ),
         )
-        self._queue_latency(
-            call_id,
-            LatencyStage.ASK_POKE_RESOLVED,
-            LatencyMark.now(),
-            event_key=str(question_row["question_id"]),
-        )
-        self._note_call_activity(call_id)
+        if delivered:
+            undelivered = self._undelivered_answers.get(call_id)
+            if undelivered is not None:
+                undelivered.discard(question_row["question_id"])
+                if not undelivered:
+                    self._undelivered_answers.pop(call_id, None)
+            self._queue_latency(
+                call_id,
+                LatencyStage.ASK_POKE_RESOLVED,
+                LatencyMark.now(),
+                event_key=str(question_row["question_id"]),
+            )
+            self._note_call_activity(call_id)
+        else:
+            # The question is durably 'answered' but the model never saw the output.
+            # Remember it so a Poke retry re-attempts delivery instead of stopping at
+            # already_answered with the function call still open.
+            self._undelivered_answers.setdefault(call_id, set()).add(question_row["question_id"])
         self._clear_pending_question(call_id, question_row["question_id"])
         self._notify_call_event(call_id)
 
@@ -1447,8 +1458,9 @@ class CallService:
             self._notify_call_event(call_id)
             return
         if row is None:
-            # Lost the claim (answered or cancelled); drop a stale watchdog carve-out
-            # entry left behind if resolution raced our registration.
+            # Lost the claim (answered, cancelled, or termination owns the call and
+            # will cancel it); drop a stale watchdog carve-out entry left behind if
+            # resolution raced our registration.
             self._clear_pending_question(call_id, question_id)
             return
         await self._cancel_active_response(call_id)
@@ -1567,6 +1579,30 @@ class CallService:
             raise LookupError("unknown question")
         status = existing.get("status")
         if status == "answered":
+            undelivered = self._undelivered_answers.get(call_id)
+            if undelivered is not None and question_id in undelivered:
+                # Claim the retry before awaiting so a concurrent retry cannot also
+                # spawn delivery; the first answer text (already stored) wins.
+                undelivered.discard(question_id)
+                if not undelivered:
+                    self._undelivered_answers.pop(call_id, None)
+                call = await self.db.get_call(call_id)
+                if call is None or self._call_activity_is_closed(call):
+                    return {"status": "call_ended"}
+                if call_id not in self._pending_questions:
+                    # Restore the watchdog carve-out for the re-delivery window.
+                    self._pending_questions[call_id] = PendingQuestion(
+                        question_id=question_id,
+                        tool_call_id=existing["tool_call_id"],
+                        deadline_monotonic=time.monotonic(),
+                        delivering=True,
+                    )
+                self._spawn(
+                    self._deliver_question_answer(call_id, existing),
+                    name=f"deliver-question:{call_id}:{question_id}",
+                    must_finish=True,
+                )
+                return {"status": "accepted", "question_id": question_id}
             return {"status": "already_answered"}
         if status == "expired":
             return {
