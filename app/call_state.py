@@ -71,6 +71,28 @@ class PendingQuestion:
     delivering: bool = False
 
 
+# Assistant speech / SIP playback evidence. On SIP sidebands, RTP carries the media, so
+# response.audio.delta frames may be sparse or absent while the callee still hears audio.
+# These events (and in-memory "live work" flags) must keep the 15s watchdog from hanging up.
+ASSISTANT_SPEECH_EVENT_TYPES = frozenset(
+    {
+        "response.created",
+        "response.done",
+        "response.output_audio.delta",
+        "response.audio.delta",
+        "response.output_audio.done",
+        "response.audio.done",
+        "response.output_audio_transcript.delta",
+        "response.output_audio_transcript.done",
+        "response.audio_transcript.delta",
+        "response.audio_transcript.done",
+        "output_audio_buffer.started",
+        "output_audio_buffer.stopped",
+        "output_audio_buffer.cleared",
+    }
+)
+
+
 class OwnerTransferDeparted(RuntimeError):
     """The owner leg became terminal before the AI handoff finished."""
 
@@ -121,6 +143,8 @@ class CallService:
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
         self._active_response_ids: dict[str, str | None] = {}
+        self._sip_output_playing: set[str] = set()
+        self._inflight_tools: set[str] = set()
         self._tool_seen_calls: set[str] = set()
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
@@ -225,6 +249,26 @@ class CallService:
             self._dirty_call_activity[call_id] = observed
         return True
 
+    def _assistant_work_is_live(self, call_id: str) -> bool:
+        """True when the assistant is generating, playing SIP audio, or awaiting a tool.
+
+        The 15s stale watchdog only sees sideband/Twilio heartbeats. SIP media and
+        in-flight tool waits can leave that clock idle while the callee still hears
+        (or is about to hear) the assistant, so those states must count as live.
+        """
+        return (
+            call_id in self._active_response_ids
+            or call_id in self._sip_output_playing
+            or call_id in self._audio_drain_terminations
+            or call_id in self._inflight_tools
+        )
+
+    def _clear_assistant_work(self, call_id: str) -> None:
+        self._active_response_ids.pop(call_id, None)
+        self._sip_output_playing.discard(call_id)
+        self._audio_drain_terminations.pop(call_id, None)
+        self._inflight_tools.discard(call_id)
+
     def _clear_call_activity(self, call_id: str) -> None:
         self._latest_call_activity.pop(call_id, None)
         self._dirty_call_activity.pop(call_id, None)
@@ -239,6 +283,7 @@ class CallService:
         )
         while len(self._activity_tombstones) > CALL_ACTIVITY_TOMBSTONE_MAX:
             self._activity_tombstones.popitem(last=False)
+        self._clear_assistant_work(call_id)
         self._clear_call_activity(call_id)
 
     def _prune_activity_tombstones(self, now_ns: int | None = None) -> None:
@@ -813,6 +858,10 @@ class CallService:
         received = LatencyMark.now()
         event_type = event.get("type", "")
         event_id = event.get("event_id") or f"evt_{secrets.token_urlsafe(12)}"
+        # Reader already heartbeats on frame arrival; re-assert here for assistant speech
+        # so dispatcher-only paths (and sparse SIP sidebands) still refresh the watchdog.
+        if event_type in ASSISTANT_SPEECH_EVENT_TYPES:
+            self._note_call_activity(call_id, received)
         if event_type in {
             "response.output_audio_transcript.delta",
             "response.output_audio_transcript.done",
@@ -895,7 +944,10 @@ class CallService:
                     response.get("id") or event.get("response_id"),
                     "voicemail_left",
                 )
+        elif event_type == "output_audio_buffer.started":
+            self._sip_output_playing.add(call_id)
         elif event_type in {"output_audio_buffer.stopped", "output_audio_buffer.cleared"}:
+            self._sip_output_playing.discard(call_id)
             self._handle_output_audio_drained(call_id, event)
         elif event_type in {"session.ended", "call.ended"}:
             self._spawn(
@@ -916,6 +968,9 @@ class CallService:
 
     async def handle_realtime_send(self, call_id: str, event: dict[str, Any]) -> None:
         sent = LatencyMark.now()
+        # Outbound control (response.create, tool results) is proof the call is live even
+        # when the SIP sideband is quiet between assistant audio frames.
+        self._note_call_activity(call_id, sent)
         event_type = event.get("type")
         if event_type == "response.create":
             self._queue_latency(call_id, LatencyStage.FIRST_RESPONSE_CREATE, sent)
@@ -1051,6 +1106,8 @@ class CallService:
                 LatencyMark.now(),
                 event_key=event_key,
             )
+            self._inflight_tools.add(call_id)
+            self._note_call_activity(call_id)
             try:
                 result = await self.exa.search(request.query)
                 output = result.output
@@ -1071,6 +1128,8 @@ class CallService:
                 logger.exception("unexpected Exa search failure call_id=%s", call_id)
                 output = {"ok": False, "error": "search_unavailable"}
             finally:
+                self._inflight_tools.discard(call_id)
+                self._note_call_activity(call_id)
                 self._queue_latency(
                     call_id,
                     LatencyStage.EXA_SEARCH_COMPLETED,
@@ -1139,8 +1198,8 @@ class CallService:
                 received=received,
                 event_key=event_key,
                 continuation_instructions=(
-                    "The call is now ending. Briefly confirm the outcome or next step if useful, "
-                    "then say one concise, natural goodbye. Do not call any function."
+                    "The call is now ending. Say one short, natural goodbye and nothing else. "
+                    "Do not recap details already confirmed. Do not call any function."
                 ),
             )
         elif name == "transfer_to_owner":
@@ -2402,8 +2461,6 @@ class CallService:
         call_id = call["call_id"]
         self._tombstone_call_activity(call_id)
         self._voice_end_pending.pop(call_id, None)
-        self._audio_drain_terminations.pop(call_id, None)
-        self._active_response_ids.pop(call_id, None)
         media_tasks = [self.realtime.hangup(call.get("openai_call_id"))]
         if not preserve_conference:
             media_tasks.append(
@@ -2822,6 +2879,11 @@ class CallService:
                 continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue
+            if self._assistant_work_is_live(call_id):
+                # SIP playback / tool waits can exceed the heartbeat gap without sideband
+                # frames. Refresh liveness so durable last_event_at stays aligned.
+                self._note_call_activity(call_id, now)
+                continue
             activity_before = self._latest_call_activity.get(call_id)
             if (
                 activity_before is not None
@@ -2839,6 +2901,9 @@ class CallService:
                 self._tombstone_call_activity(call_id)
                 continue
             if datetime.fromisoformat(current["last_event_at"]) >= cutoff:
+                continue
+            if self._assistant_work_is_live(call_id):
+                self._note_call_activity(call_id, now)
                 continue
             activity_after = self._latest_call_activity.get(call_id)
             if activity_after is not None:

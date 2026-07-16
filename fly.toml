@@ -5,9 +5,9 @@ primary_region = 'lax'
 
 [env]
   ALLOWED_COUNTRY_CODES = '["+1"]'
+  ASK_POKE_ENABLED = 'true'
   DATABASE_URL = 'sqlite:////data/poke_call.db'
   PUBLIC_BASE_URL = 'https://poke-call.fly.dev'
-  # ASK_POKE_ENABLED = 'false'
 
 [http_service]
   internal_port = 8000

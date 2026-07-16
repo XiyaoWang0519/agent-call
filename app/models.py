@@ -120,7 +120,13 @@ class EvidenceValue(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     value: str
-    evidence_turn_ids: list[str] = Field(min_length=1)
+    evidence_turn_ids: list[str] = Field(
+        min_length=1,
+        description=(
+            "Exact turn_id values copied verbatim from the provided transcript entries. "
+            "Never invent, alter, or abbreviate an id."
+        ),
+    )
 
 
 class Commitment(EvidenceValue):
