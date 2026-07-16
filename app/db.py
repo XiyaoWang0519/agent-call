@@ -1127,6 +1127,20 @@ class Database:
             if call_row is None or call_row[0] != CallState.ACTIVE.value:
                 await conn.rollback()
                 return None, "call_not_active"
+            # Same tool_call_id first: a redelivered ask_poke must reuse the pending row
+            # instead of returning question_pending and closing the open function call.
+            cursor = await conn.execute(
+                """SELECT * FROM call_questions
+                   WHERE call_id=? AND tool_call_id=?""",
+                (call_id, tool_call_id),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None:
+                await conn.rollback()
+                existing_row = dict(existing)
+                if existing_row["status"] == "pending":
+                    return existing_row, None
+                return None, "duplicate_tool_call"
             cursor = await conn.execute(
                 """SELECT 1 FROM call_questions
                    WHERE call_id=? AND status='pending' LIMIT 1""",
@@ -1177,6 +1191,15 @@ class Database:
     ) -> dict[str, Any] | None:
         resolved_at = _iso_now()
         async with self._write_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                "SELECT state FROM calls WHERE call_id=?",
+                (call_id,),
+            )
+            call_row = await cursor.fetchone()
+            if call_row is None or call_row[0] != CallState.ACTIVE.value:
+                await conn.rollback()
+                return None
             cursor = await conn.execute(
                 """UPDATE call_questions
                    SET status='answered', answer=?, resolved_at=?
@@ -1185,8 +1208,11 @@ class Database:
                 (answer, resolved_at, question_id, call_id),
             )
             row = await cursor.fetchone()
+            if row is None:
+                await conn.rollback()
+                return None
             await conn.commit()
-        return dict(row) if row else None
+        return dict(row)
 
     async def claim_question_expiry(self, question_id: str) -> dict[str, Any] | None:
         resolved_at = _iso_now()

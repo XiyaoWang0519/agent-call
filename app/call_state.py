@@ -37,7 +37,7 @@ from app.models import (
     WebSearchRequest,
 )
 from app.openai_client import create_openai_client
-from app.openai_realtime import RealtimeBridge
+from app.openai_realtime import REALTIME_SEND_TIMEOUT_SECONDS, RealtimeBridge
 from app.poke_push import push_message_to_poke
 from app.policy import validate_context
 from app.settings import Settings
@@ -58,7 +58,9 @@ TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS = 12.0
 TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
-WATCHDOG_QUESTION_GRACE_SECONDS = 5.0
+# cancel_response + function_call_output each bound to REALTIME_SEND_TIMEOUT_SECONDS; keep
+# the stale-call carve-out long enough for both sends after the answer deadline fires.
+WATCHDOG_QUESTION_GRACE_SECONDS = 2 * REALTIME_SEND_TIMEOUT_SECONDS + 5.0
 
 
 @dataclass(slots=True)
@@ -66,6 +68,7 @@ class PendingQuestion:
     question_id: str
     tool_call_id: str
     deadline_monotonic: float
+    delivering: bool = False
 
 
 class OwnerTransferDeparted(RuntimeError):
@@ -1250,6 +1253,16 @@ class CallService:
             )
             return
 
+        # Redelivered ask_poke for an already-tracked pending question: leave the open
+        # function call alone so the eventual answer/timeout can deliver exactly once.
+        existing_pending = self._pending_questions.get(call_id)
+        if (
+            existing_pending is not None
+            and existing_pending.question_id == row["question_id"]
+            and existing_pending.tool_call_id == tool_call_id
+        ):
+            return
+
         # Register the pending question and wake parked long-polls before any further
         # awaits, so a concurrent answer or termination sees (and can clear) the entry
         # instead of racing a registration that has not happened yet.
@@ -1325,6 +1338,11 @@ class CallService:
             return
         self._pending_questions.pop(call_id, None)
 
+    def _mark_question_delivering(self, call_id: str, question_id: str) -> None:
+        pending = self._pending_questions.get(call_id)
+        if pending is not None and pending.question_id == question_id:
+            pending.delivering = True
+
     async def _deliver_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
         if call_id in self._voice_end_pending:
             # The goodbye turn owns the sideband now; do not inject an answer relay.
@@ -1332,6 +1350,7 @@ class CallService:
             self._clear_pending_question(call_id, question_row["question_id"])
             self._notify_call_event(call_id)
             return
+        self._mark_question_delivering(call_id, question_row["question_id"])
         await self._cancel_active_response(call_id)
         output = {"status": "answered", "answer": question_row["answer"]}
         await self._guarded_send_tool_result(
@@ -1358,6 +1377,7 @@ class CallService:
         if call_id in self._voice_end_pending:
             # end_call already cancels pending questions; the goodbye owns the sideband.
             return
+        self._mark_question_delivering(call_id, question_id)
         try:
             row = await self.db.claim_question_expiry(question_id)
         except Exception:
@@ -1421,7 +1441,9 @@ class CallService:
                     self._event_notifiers.pop(call_id, None)
                 raise LookupError(call_id)
             state = CallState(call["state"])
-            terminal = state in TERMINAL_STATES or state == CallState.TERMINATING
+            # TERMINATING is not terminal: get_call_result has no final row yet, so clients
+            # must keep long-polling until a durable TERMINAL_STATES transition.
+            terminal = state in TERMINAL_STATES
             questions = await self.db.get_questions_after(call_id, after)
             remaining = deadline - loop.time()
             if questions or terminal or remaining <= 0:
@@ -1445,7 +1467,7 @@ class CallService:
                     default=after,
                 )
                 if terminal:
-                    next_action = "Call is terminal or terminating; call get_call_result."
+                    next_action = "Call is terminal; call get_call_result."
                 elif events:
                     next_action = (
                         "New call events are available. Answer pending questions with "
@@ -1495,7 +1517,7 @@ class CallService:
         if status == "cancelled":
             return {"status": "call_ended"}
         call = await self.db.get_call(call_id)
-        if call is None or CallState(call["state"]) in TERMINAL_STATES:
+        if call is None or self._call_activity_is_closed(call):
             return {"status": "call_ended"}
         # Pending claim lost to a concurrent race without a readable winner — treat as
         # already handled so Poke can advance rather than retry forever.
@@ -2318,6 +2340,18 @@ class CallService:
                 logger.warning("reconciled ambiguous termination claim call_id=%s", call_id)
             if call is not None:
                 transfer_task = self._owner_transfer_tasks.get(call_id)
+                # Cancel pending questions at claim time so answers cannot race media
+                # teardown and mark a question answered after the call left ACTIVE.
+                self._pending_questions.pop(call_id, None)
+                try:
+                    await self.db.cancel_pending_questions(call_id)
+                except Exception:
+                    logger.warning(
+                        "pending question cancellation failed at termination claim call_id=%s",
+                        call_id,
+                        exc_info=True,
+                    )
+                self._notify_call_event(call_id)
         if call is None:
             current = await self.db.get_call(call_id)
             if current is None:
@@ -2779,11 +2813,12 @@ class CallService:
                 self._tombstone_call_activity(call_id)
                 continue
             pending = self._pending_questions.get(call_id)
-            if (
-                pending is not None
-                and time.monotonic() < pending.deadline_monotonic + WATCHDOG_QUESTION_GRACE_SECONDS
+            if pending is not None and (
+                pending.delivering
+                or time.monotonic() < pending.deadline_monotonic + WATCHDOG_QUESTION_GRACE_SECONDS
             ):
-                # Outstanding ask_poke: silence is expected until answer or deadline+grace.
+                # Outstanding ask_poke: silence is expected until answer/deadline delivery
+                # finishes (delivering) or deadline+grace (covers cancel+send bounds).
                 continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue
