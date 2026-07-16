@@ -43,13 +43,13 @@ mcp_call() { # $1=json body, $2=session id (optional)
   curl -fsS -D "$WORKDIR/headers.txt" "${HDR[@]}" ${extra[@]+"${extra[@]}"} -X POST "$MCP_URL" -d "$1"
 }
 
-INIT_RESP="$(mcp_call '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}')"
+INIT_RESP="$(mcp_call '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}')" || { echo "FAIL: initialize (transport)"; cat "$WORKDIR/server.log"; exit 1; }
 echo "$INIT_RESP" | grep -q '"serverInfo"' || { echo "FAIL: initialize"; echo "$INIT_RESP"; exit 1; }
 SESSION="$(grep -i '^mcp-session-id:' "$WORKDIR/headers.txt" | tr -d '\r' | awk '{print $2}' || true)"
 mcp_call '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$SESSION" >/dev/null || true
 echo "OK mcp initialize${SESSION:+ (session $SESSION)}"
 
-TOOLS="$(mcp_call '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$SESSION")"
+TOOLS="$(mcp_call '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' "$SESSION")" || { echo "FAIL: tools/list (transport)"; cat "$WORKDIR/server.log"; exit 1; }
 for tool in prepare_phone_call start_phone_call get_call_result end_phone_call get_phone_call wait_for_call_event answer_call_question; do
   echo "$TOOLS" | grep -q "\"$tool\"" || { echo "FAIL: tool $tool missing"; echo "$TOOLS"; exit 1; }
 done
@@ -62,12 +62,12 @@ PREPARE='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"prepare
     "objective":"Smoke test objective",
     "escalation":{"mode":"end_call","owner_phone":"+15550000001"}},
   "requested_by_owner":true}}}'
-PREP_RESP="$(mcp_call "$(echo "$PREPARE" | tr -d '\n')" "$SESSION")"
+PREP_RESP="$(mcp_call "$(echo "$PREPARE" | tr -d '\n')" "$SESSION")" || { echo "FAIL: prepare_phone_call (transport)"; cat "$WORKDIR/server.log"; exit 1; }
 echo "$PREP_RESP" | grep -q 'plan_id' || { echo "FAIL: prepare_phone_call returned no plan_id"; echo "$PREP_RESP"; exit 1; }
 echo "OK prepare_phone_call (plan persisted)"
 
 # Unauthenticated request must be rejected
-STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$MCP_URL" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')"
+STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$MCP_URL" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')" || { echo "FAIL: unauthenticated MCP request (transport)"; cat "$WORKDIR/server.log"; exit 1; }
 [ "$STATUS" = "401" ] || [ "$STATUS" = "403" ] || { echo "FAIL: unauthenticated MCP got $STATUS"; exit 1; }
 echo "OK auth rejection ($STATUS)"
 

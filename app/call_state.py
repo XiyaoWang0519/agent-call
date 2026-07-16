@@ -129,7 +129,25 @@ class CallService:
         self._must_finish_background: set[asyncio.Task[Any]] = set()
         self._conference_retry_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         self._stopping = False
-        self._owner_transfer = OwnerTransferCoordinator(self)
+        self._owner_transfer = OwnerTransferCoordinator(
+            self.db,
+            self.twilio,
+            realtime=lambda: self.realtime,
+            is_stopping=lambda: self._stopping,
+            spawn=lambda coro, **kwargs: self._spawn(coro, **kwargs),
+            await_network_task=lambda task, **kwargs: self._await_network_task(task, **kwargs),
+            finish_claimed_termination=(
+                lambda call, reason, **kwargs: self._finish_claimed_termination(
+                    call, reason, **kwargs
+                )
+            ),
+            complete_conference_or_schedule=(
+                lambda call: self._complete_conference_or_schedule(call)
+            ),
+            terminate_call=lambda call_id, reason, **kwargs: self.terminate_call(
+                call_id, reason, **kwargs
+            ),
+        )
         self._opening_transition_locks: dict[str, asyncio.Lock] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
@@ -177,25 +195,20 @@ class CallService:
     def _opening_transition_lock(self, call_id: str) -> asyncio.Lock:
         return self._opening_transition_locks.setdefault(call_id, asyncio.Lock())
 
-    # -- Legacy owner-transfer delegators -----------------------------------
-    # Kept under their original names because tests call/patch these directly.
-    # Internal call sites in this class use self._owner_transfer.<method> instead
-    # of routing back through these.
+    # -- Owner-transfer delegators -------------------------------------------
+    # Kept under their original names because internal call sites elsewhere in
+    # this class (webhook handling, transfer locking) still call them under
+    # these names; they just forward to the coordinator that owns the actual
+    # state. Not called or patched directly by tests.
 
     def _owner_transfer_lock(self, call_id: str) -> asyncio.Lock:
         return self._owner_transfer.lock(call_id)
-
-    def _owner_sid_matches(self, call_id: str, call_sid: str | None) -> bool:
-        return self._owner_transfer.owner_sid_matches(call_id, call_sid)
 
     def _record_owner_join(self, call_id: str, call_sid: str | None) -> None:
         self._owner_transfer.record_owner_join(call_id, call_sid)
 
     def _record_owner_failure(self, call_id: str, call_sid: str | None, reason: str) -> None:
         self._owner_transfer.record_owner_failure(call_id, call_sid, reason)
-
-    def _track_owner_transfer(self, call_id: str, task: asyncio.Task[dict[str, Any]]) -> None:
-        self._owner_transfer.track(call_id, task)
 
     # -- Legacy owner-transfer attribute properties --------------------------
     # Forward to the coordinator so external code (mainly tests) that reads or

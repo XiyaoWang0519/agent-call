@@ -12,6 +12,14 @@ class DeploymentLockedError(RuntimeError):
     """Raised when a deployment lease temporarily blocks new phone calls."""
 
 
+def _lock_is_active(locked_at: str | None) -> bool:
+    """Whether a deployment lock timestamp is still within the TTL window."""
+
+    if not locked_at:
+        return False
+    return datetime.now(UTC) - datetime.fromisoformat(locked_at) < DEPLOYMENT_LOCK_TTL
+
+
 class DeploymentMixin:
     async def acquire_deployment_lock(self) -> int:
         """Atomically block new calls if no call is currently nonterminal.
@@ -49,6 +57,6 @@ class DeploymentMixin:
         row = await self.fetch_one(
             "SELECT locked, locked_at FROM deployment_control WHERE singleton=1"
         )
-        if not row or not row["locked"] or not row["locked_at"]:
+        if not row or not row["locked"]:
             return False
-        return datetime.now(UTC) - datetime.fromisoformat(row["locked_at"]) < DEPLOYMENT_LOCK_TTL
+        return _lock_is_active(row["locked_at"])

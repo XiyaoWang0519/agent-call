@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import StrEnum
 from time import monotonic_ns
 from typing import Any
@@ -58,7 +57,7 @@ class LatencyMark:
 
     @classmethod
     def now(cls) -> LatencyMark:
-        return cls(datetime.now(UTC).isoformat(), monotonic_ns())
+        return cls(_iso_now(), monotonic_ns())
 
 
 class TelemetryMixin:

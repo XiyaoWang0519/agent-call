@@ -55,6 +55,8 @@ async def get_call(call_id: str, request: Request):
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="call not found") from exc
     row = await request.app.state.call_service.get_call_record(call_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="call not found")
     transcript = await request.app.state.call_service.get_transcript_records(call_id)
     latency_events = await request.app.state.call_service.get_latency_event_records(call_id)
     return {

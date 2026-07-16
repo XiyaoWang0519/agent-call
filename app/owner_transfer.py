@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+from collections.abc import Awaitable, Callable
+from typing import Any
 
-from app.db import TRANSFER_ELIGIBLE_STATES
+from app.db import TRANSFER_ELIGIBLE_STATES, Database
 from app.models import ContextPacket
-
-if TYPE_CHECKING:
-    from app.call_state import CallService
+from app.openai_realtime import RealtimeBridge
+from app.twilio_bridge import TwilioBridge
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +35,40 @@ class OwnerTransferCoordinator:
     attempts (join/departure signaling, expected/joined SIDs, failures, tasks,
     per-call locks) and the entry points that reach into it from webhooks,
     termination, and the public transfer_to_owner API.
+
+    ``db`` and ``twilio`` are stable for the coordinator's lifetime and are held as
+    typed objects. ``realtime`` can be replaced on CallService after construction
+    (tests do this to install a fake), so it is supplied as a callable returning the
+    current value rather than captured once. The remaining CallService behaviors this
+    coordinator doesn't own (spawning tasks, awaiting network tasks, checking/using
+    shutdown state, finishing a claimed termination, completing/scheduling the
+    conference, terminating a call) are supplied as named callables so CallService can
+    wire them as late-binding lambdas that keep working when tests monkeypatch the
+    underlying CallService attributes.
     """
 
-    def __init__(self, service: CallService) -> None:
-        self._service = service
+    def __init__(
+        self,
+        db: Database,
+        twilio: TwilioBridge,
+        *,
+        realtime: Callable[[], RealtimeBridge],
+        is_stopping: Callable[[], bool],
+        spawn: Callable[..., asyncio.Task[Any]],
+        await_network_task: Callable[..., Awaitable[Any]],
+        finish_claimed_termination: Callable[..., Awaitable[bool]],
+        complete_conference_or_schedule: Callable[[dict[str, Any]], Awaitable[bool]],
+        terminate_call: Callable[..., Awaitable[bool]],
+    ) -> None:
+        self._db = db
+        self._twilio = twilio
+        self._realtime = realtime
+        self._is_stopping = is_stopping
+        self._spawn = spawn
+        self._await_network_task = await_network_task
+        self._finish_claimed_termination = finish_claimed_termination
+        self._complete_conference_or_schedule = complete_conference_or_schedule
+        self._terminate_call = terminate_call
         self.join_events: dict[str, asyncio.Event] = {}
         self.departure_events: dict[str, asyncio.Event] = {}
         self.expected_sids: dict[str, str] = {}
@@ -117,13 +147,12 @@ class OwnerTransferCoordinator:
         *,
         tool_call_id: str | None,
     ) -> tuple[asyncio.Task[dict[str, Any]] | None, str | None]:
-        service = self._service
-        if service._stopping:
+        if self._is_stopping():
             return None, "service is stopping"
-        call = await service.db.get_call(call_id)
+        call = await self._db.get_call(call_id)
         if call is None:
             return None, "call not found"
-        plan = await service.db.get_plan(call["plan_id"])
+        plan = await self._db.get_plan(call["plan_id"])
         if plan is None:
             return None, "call plan not found"
         packet = ContextPacket.model_validate(plan["context"])
@@ -134,18 +163,18 @@ class OwnerTransferCoordinator:
             async with self.lock(call_id):
                 if call_id in self.tasks:
                     return None, "owner transfer already in progress"
-                if service._stopping:
+                if self._is_stopping():
                     return None, "service is stopping"
                 joining = f"joining:{reason}"
                 claim_error: Exception | None = None
                 try:
-                    claimed = await service.db.claim_transfer_joining(call_id, reason)
+                    claimed = await self._db.claim_transfer_joining(call_id, reason)
                 except Exception as exc:
                     claimed = False
                     claim_error = exc
                 claimed_call = call
                 if not claimed:
-                    current = await service.db.get_call(call_id)
+                    current = await self._db.get_call(call_id)
                     exact_joining = bool(
                         current
                         and current.get("state") in TRANSFER_ELIGIBLE_STATES
@@ -158,8 +187,8 @@ class OwnerTransferCoordinator:
                         return None, "owner transfer already attempted or call is ending"
                     claimed_call = current
                     logger.warning("reconciled ambiguous owner transfer claim call_id=%s", call_id)
-                if service._stopping:
-                    await service.db.fail_joining_transfer(
+                if self._is_stopping():
+                    await self._db.fail_joining_transfer(
                         call_id, joining, "failed:service_stopping"
                     )
                     return None, "service is stopping"
@@ -173,7 +202,7 @@ class OwnerTransferCoordinator:
                     reason,
                     tool_call_id=tool_call_id,
                 )
-                task = service._spawn(
+                task = self._spawn(
                     run.run(),
                     name=f"owner-transfer:{call_id}",
                 )
@@ -182,12 +211,12 @@ class OwnerTransferCoordinator:
 
         # Cancellation after SQLite commits but before this caller observes the result
         # must not leave durable joining without a registered cleanup workflow.
-        claim = service._spawn(
+        claim = self._spawn(
             claim_and_spawn(),
             name=f"claim-owner-transfer:{call_id}",
             must_finish=True,
         )
-        return await service._await_network_task(claim)
+        return await self._await_network_task(claim)
 
 
 class OwnerTransferRun:
@@ -209,7 +238,6 @@ class OwnerTransferRun:
         tool_call_id: str | None,
     ) -> None:
         self._coordinator = coordinator
-        self._service = coordinator._service
         self.call = call
         self.packet = packet
         self.reason = reason
@@ -232,19 +260,19 @@ class OwnerTransferRun:
     async def _spawn_and_await_compensation(self, coro: Any, *, name: str) -> None:
         """Run a must-finish owner-transfer compensation coroutine via _spawn so caller
         cancellation cannot abandon it mid-flight, then wait for it to settle."""
-        compensation = self._service._spawn(coro, name=name, must_finish=True)
-        await self._service._await_network_task(compensation)
+        compensation = self._coordinator._spawn(coro, name=name, must_finish=True)
+        await self._coordinator._await_network_task(compensation)
 
     async def _remove_owner_transfer_leg(self) -> bool:
         owner_call_sid = self.owner_call_sid
         if owner_call_sid is None:
             raise RuntimeError("owner transfer leg removal requires a created owner SID")
         cleanup = asyncio.create_task(
-            self._service.twilio.remove_participant(self.conference, owner_call_sid),
+            self._coordinator._twilio.remove_participant(self.conference, owner_call_sid),
             name=f"remove-owner:{self.call_id}",
         )
         try:
-            await self._service._await_network_task(cleanup)
+            await self._coordinator._await_network_task(cleanup)
             return True
         except Exception:
             # The primary transfer/termination outcome must survive cleanup failure.
@@ -297,7 +325,7 @@ class OwnerTransferRun:
         if self.tool_call_id is None:
             return
         try:
-            await self._service.realtime.send_tool_result(
+            await self._coordinator._realtime().send_tool_result(
                 self.call_id,
                 self.tool_call_id,
                 {"accepted": False, "error": error},
@@ -321,7 +349,7 @@ class OwnerTransferRun:
         owner_call_sid = self.owner_call_sid
         if owner_call_sid is None:
             raise RuntimeError("owner transfer SID persistence requires a created owner SID")
-        db = self._service.db
+        db = self._coordinator._db
         owner_sid_error: Exception | None = None
         try:
             owner_sid_persisted = await db.record_transfer_owner_sid(
@@ -355,7 +383,7 @@ class OwnerTransferRun:
         call_id = self.call_id
         ai_call_sid = self.call.get("twilio_ai_call_sid")
         remove_ai = asyncio.create_task(
-            self._service.twilio.remove_participant(self.conference, ai_call_sid),
+            self._coordinator._twilio.remove_participant(self.conference, ai_call_sid),
             name=f"remove-ai:{call_id}",
         )
         departure_wait = asyncio.create_task(
@@ -367,7 +395,7 @@ class OwnerTransferRun:
             )
             if departure_wait in done:
                 try:
-                    await self._service._await_network_task(remove_ai)
+                    await self._coordinator._await_network_task(remove_ai)
                 except Exception:
                     logger.warning(
                         "AI removal also failed after owner departure call_id=%s",
@@ -378,7 +406,7 @@ class OwnerTransferRun:
             remove_ai.result()
         except asyncio.CancelledError:
             try:
-                await self._service._await_network_task(remove_ai)
+                await self._coordinator._await_network_task(remove_ai)
             except Exception:
                 logger.warning(
                     "AI removal failed while transfer was cancelled call_id=%s",
@@ -392,12 +420,14 @@ class OwnerTransferRun:
         self._raise_if_owner_departed()
 
     async def _fail_joining_owner_transfer(self, *, failure: str, cleaned: bool) -> None:
-        service = self._service
+        coordinator = self._coordinator
         call = self.call
         call_id = self.call_id
         transitioned: bool | None
         try:
-            transitioned = await service.db.fail_joining_transfer(call_id, self.joining, failure)
+            transitioned = await coordinator._db.fail_joining_transfer(
+                call_id, self.joining, failure
+            )
         except Exception:
             transitioned = None
             logger.warning(
@@ -412,7 +442,7 @@ class OwnerTransferRun:
             suffix = failure.removeprefix("failed:") or "owner_transfer"
             failure_reason = f"transfer_failed:{suffix}"
             try:
-                promoted_transition = await service.db.fail_promoted_transfer(
+                promoted_transition = await coordinator._db.fail_promoted_transfer(
                     call_id,
                     self.in_progress,
                     failure,
@@ -427,7 +457,7 @@ class OwnerTransferRun:
                 )
             if promoted_transition is True:
                 try:
-                    finished = await service._finish_claimed_termination(
+                    finished = await coordinator._finish_claimed_termination(
                         call,
                         failure_reason,
                         preserve_conference=False,
@@ -443,14 +473,14 @@ class OwnerTransferRun:
                     )
                 if finished:
                     return
-                await service._complete_conference_or_schedule(call)
+                await coordinator._complete_conference_or_schedule(call)
                 return
             if promoted_transition is None:
-                await service._complete_conference_or_schedule(call)
+                await coordinator._complete_conference_or_schedule(call)
                 return
         if not cleaned and transitioned is True:
             try:
-                terminated = await service.terminate_call(
+                terminated = await coordinator._terminate_call(
                     call_id,
                     "transfer_cleanup_failed",
                     _initiating_task=self.workflow_task,
@@ -463,11 +493,11 @@ class OwnerTransferRun:
                     exc_info=True,
                 )
             if not terminated:
-                await service._complete_conference_or_schedule(call)
+                await coordinator._complete_conference_or_schedule(call)
         elif self.owner_call_sid is not None and (transitioned is None or not cleaned):
             # SQLite state is ambiguous. Conference completion is the only
             # DB-independent guarantee that the owner leg cannot keep billing.
-            await service._complete_conference_or_schedule(call)
+            await coordinator._complete_conference_or_schedule(call)
 
     async def _fail_promoted_owner_transfer(
         self,
@@ -476,12 +506,12 @@ class OwnerTransferRun:
         failure: str,
         failure_reason: str,
     ) -> None:
-        service = self._service
+        coordinator = self._coordinator
         call = self.call
         call_id = self.call_id
         transitioned: bool | None
         try:
-            transitioned = await service.db.fail_promoted_transfer(
+            transitioned = await coordinator._db.fail_promoted_transfer(
                 call_id,
                 expected,
                 failure,
@@ -503,7 +533,7 @@ class OwnerTransferRun:
             and self.completed_outcome is not None
         ):
             try:
-                transitioned = await service.db.fail_promoted_transfer(
+                transitioned = await coordinator._db.fail_promoted_transfer(
                     call_id,
                     self.completed_outcome,
                     failure,
@@ -518,7 +548,7 @@ class OwnerTransferRun:
                 )
         if transitioned is True:
             try:
-                finished = await service._finish_claimed_termination(
+                finished = await coordinator._finish_claimed_termination(
                     self.promoted or call,
                     failure_reason,
                     preserve_conference=False,
@@ -536,7 +566,7 @@ class OwnerTransferRun:
                 return
         # A lost/ambiguous CAS must never be interpreted as a successful handoff.
         # Complete the conference without relying on another database read.
-        await service._complete_conference_or_schedule(call)
+        await coordinator._complete_conference_or_schedule(call)
 
     async def _cleanup_owner(self) -> bool:
         if self.owner_call_sid is None:
@@ -565,7 +595,7 @@ class OwnerTransferRun:
         )
 
     async def run(self) -> dict[str, Any]:
-        service = self._service
+        coordinator = self._coordinator
         call = self.call
         call_id = self.call_id
         reason = self.reason
@@ -575,7 +605,7 @@ class OwnerTransferRun:
 
         try:
             create_task = asyncio.create_task(
-                service.twilio.create_owner_participant(
+                coordinator._twilio.create_owner_participant(
                     call_id=call_id,
                     plan_id=call["plan_id"],
                     conference_sid_or_name=self.conference,
@@ -590,7 +620,7 @@ class OwnerTransferRun:
             await self._persist_owner_transfer_sid()
             await asyncio.wait_for(self.event.wait(), timeout=OWNER_JOIN_TIMEOUT_SECONDS)
             self._raise_if_owner_departed()
-            self.promoted = await service.db.promote_transfer(call_id, reason)
+            self.promoted = await coordinator._db.promote_transfer(call_id, reason)
             if self.promoted is None:
                 cleaned = await self._cleanup_owner()
                 await self._fail_joining_and_compensate("failed:termination_won", cleaned)
@@ -604,7 +634,7 @@ class OwnerTransferRun:
             if tool_call_id is not None:
                 try:
                     # A successful tool output must be observable before the AI leg disappears.
-                    await service.realtime.send_tool_result(
+                    await coordinator._realtime().send_tool_result(
                         call_id,
                         tool_call_id,
                         {"accepted": True, "status": "owner_joined"},
@@ -622,7 +652,7 @@ class OwnerTransferRun:
             await self._remove_ai_leg_racing_departure()
 
             self.completed_outcome = f"completed:{reason}"
-            if not await service.db.complete_promoted_transfer(
+            if not await coordinator._db.complete_promoted_transfer(
                 call_id, self.in_progress, self.completed_outcome
             ):
                 raise RuntimeError("owner transfer completion state was lost")
@@ -632,13 +662,15 @@ class OwnerTransferRun:
             # handoff outcome is durably completed. If arming this fails, compensate
             # the transfer rather than leave the callee alone and billing later.
             arm_owner_exit = asyncio.create_task(
-                service.twilio.enable_end_conference_on_exit(self.conference, self.owner_call_sid),
+                coordinator._twilio.enable_end_conference_on_exit(
+                    self.conference, self.owner_call_sid
+                ),
                 name=f"arm-owner-conference-exit:{call_id}",
             )
-            await service._await_network_task(arm_owner_exit)
+            await coordinator._await_network_task(arm_owner_exit)
             self._raise_if_owner_departed()
-            terminalization = service._spawn(
-                service._finish_claimed_termination(
+            terminalization = coordinator._spawn(
+                coordinator._finish_claimed_termination(
                     self.promoted,
                     "transfer_completed",
                     preserve_conference=True,
@@ -648,7 +680,7 @@ class OwnerTransferRun:
                 name=f"terminalize-owner-transfer:{call_id}",
                 must_finish=True,
             )
-            terminalized = await service._await_network_task(terminalization)
+            terminalized = await coordinator._await_network_task(terminalization)
             if not terminalized:
                 cleaned = await self._cleanup_owner()
                 await self._fail_promoted_and_compensate(
@@ -657,7 +689,7 @@ class OwnerTransferRun:
                     "transfer_failed:terminal_cas",
                 )
                 if not cleaned:
-                    await service._complete_conference_or_schedule(call)
+                    await coordinator._complete_conference_or_schedule(call)
                 return {"accepted": False, "error": "transfer teardown requires retry"}
             self.phase = "terminal"
             return {"accepted": True, "status": "transferred"}
@@ -671,7 +703,7 @@ class OwnerTransferRun:
             # its SID before returning so the remote owner leg cannot leak.
             if self.owner_call_sid is None and create_task is not None:
                 try:
-                    participant = await service._await_network_task(create_task)
+                    participant = await coordinator._await_network_task(create_task)
                     self.owner_call_sid = participant.call_sid
                 except Exception:
                     pass

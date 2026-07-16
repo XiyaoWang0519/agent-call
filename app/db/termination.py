@@ -3,16 +3,17 @@ from __future__ import annotations
 from typing import Any
 
 from app.db.engine import _decode_json_columns, _iso_now
-from app.models import CallState
+from app.models import TERMINAL_STATES, CallState
 
 
 class TerminationMixin:
     async def claim_termination(self, call_id: str, reason: str) -> dict[str, Any] | None:
         """Atomically claim and enter termination, returning the claimed current row."""
 
+        placeholders, terminal_states = self._in_clause(state.value for state in TERMINAL_STATES)
         async with self._immediate_transaction() as conn:
             cursor = await conn.execute(
-                """UPDATE calls
+                f"""UPDATE calls
                    SET termination_claimed=1,
                        state=?,
                        termination_reason=?,
@@ -24,11 +25,11 @@ class TerminationMixin:
                        last_event_at=?
                    WHERE call_id=?
                      AND termination_claimed=0
-                     AND state NOT IN ('completed','failed','timed_out','transferred')
+                     AND state NOT IN ({placeholders})
                      AND COALESCE(transfer_outcome, '') NOT LIKE 'in_progress:%'
                      AND COALESCE(transfer_outcome, '') NOT LIKE 'completed:%'
-                   RETURNING *""",
-                (CallState.TERMINATING.value, reason, _iso_now(), call_id),
+                   RETURNING *""",  # noqa: S608
+                (CallState.TERMINATING.value, reason, _iso_now(), call_id, *terminal_states),
             )
             row = await cursor.fetchone()
         return _decode_json_columns(dict(row)) if row else None
@@ -48,23 +49,24 @@ class TerminationMixin:
             if completed_transfer
             else ("failed:startup_recovery" if expected_transfer_outcome is not None else None)
         )
+        placeholders, terminal_states = self._in_clause(state.value for state in TERMINAL_STATES)
         async with self._immediate_transaction() as conn:
             if expected_transfer_outcome is None:
                 cursor = await conn.execute(
-                    """UPDATE calls
+                    f"""UPDATE calls
                        SET termination_claimed=1,
                            state='terminating',
                            termination_reason=?,
                            last_event_at=?
                        WHERE call_id=?
                          AND transfer_outcome IS NULL
-                         AND state NOT IN ('completed','failed','timed_out','transferred')
-                       RETURNING *""",
-                    (reason, _iso_now(), call_id),
+                         AND state NOT IN ({placeholders})
+                       RETURNING *""",  # noqa: S608
+                    (reason, _iso_now(), call_id, *terminal_states),
                 )
             else:
                 cursor = await conn.execute(
-                    """UPDATE calls
+                    f"""UPDATE calls
                        SET termination_claimed=1,
                            state='terminating',
                            termination_reason=?,
@@ -72,14 +74,15 @@ class TerminationMixin:
                            last_event_at=?
                        WHERE call_id=?
                          AND transfer_outcome=?
-                         AND state NOT IN ('completed','failed','timed_out','transferred')
-                       RETURNING *""",
+                         AND state NOT IN ({placeholders})
+                       RETURNING *""",  # noqa: S608
                     (
                         reason,
                         replacement,
                         _iso_now(),
                         call_id,
                         expected_transfer_outcome,
+                        *terminal_states,
                     ),
                 )
             row = await cursor.fetchone()
@@ -119,8 +122,9 @@ class TerminationMixin:
         )
 
     async def reset_termination_claim(self, call_id: str) -> None:
+        placeholders, terminal_states = self._in_clause(state.value for state in TERMINAL_STATES)
         await self.execute(
-            """UPDATE calls SET termination_claimed=0
-               WHERE call_id=? AND state NOT IN ('completed','failed','timed_out','transferred')""",
-            (call_id,),
+            f"""UPDATE calls SET termination_claimed=0
+               WHERE call_id=? AND state NOT IN ({placeholders})""",  # noqa: S608
+            (call_id, *terminal_states),
         )

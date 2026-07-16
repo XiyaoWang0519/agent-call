@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
-from app.db.deployment import DEPLOYMENT_LOCK_TTL, DeploymentLockedError
+from app.db.deployment import DeploymentLockedError, _lock_is_active
 from app.db.engine import _iso_now
 from app.models import CallState
 
@@ -44,8 +44,7 @@ class PlansMixin:
             )
             lock = await cursor.fetchone()
             if lock and lock["locked"]:
-                locked_at = datetime.fromisoformat(lock["locked_at"])
-                if datetime.now(UTC) - locked_at < DEPLOYMENT_LOCK_TTL:
+                if _lock_is_active(lock["locked_at"]):
                     await conn.rollback()
                     raise DeploymentLockedError("deployment is in progress")
                 await conn.execute(

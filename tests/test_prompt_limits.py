@@ -51,6 +51,27 @@ def test_normal_context_uses_compact_approved_json(packet: ContextPacket):
     assert len(instructions.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
 
 
+def test_realtime_instructions_render_at_max_context_packet_size(packet: ContextPacket):
+    """Regression: a legal ContextPacket right at CONTEXT_PACKET_MAX_BYTES (approved at
+    plan-approval time) must still render realtime instructions without raising. The
+    instructions budget must have headroom for the full context budget plus the fixed
+    template (including the optional ask_poke guidance), not just whatever the base
+    template happened to measure at when the constant was last picked."""
+    data = packet.model_dump(mode="json")
+    data["relevant_facts"] = [""]
+    baseline = ContextPacket.model_validate(data)
+    baseline_size = len(baseline.approved_context_json().encode("utf-8"))
+
+    filler = "x" * (CONTEXT_PACKET_MAX_BYTES - baseline_size)
+    data["relevant_facts"] = [filler]
+    max_packet = ContextPacket.model_validate(data)
+    assert len(max_packet.approved_context_json().encode("utf-8")) == CONTEXT_PACKET_MAX_BYTES
+
+    instructions = realtime_instructions(max_packet, ask_poke_enabled=True)
+
+    assert len(instructions.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
+
+
 def test_ending_instructions_gate_on_callee_engagement(packet: ContextPacket):
     """Regression: the model once armed end_call while the callee's request (a joke) was
     still pending, folding the answer into the goodbye. Ending must require both a complete

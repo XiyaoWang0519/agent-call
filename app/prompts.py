@@ -6,7 +6,11 @@ from app.models import ContextPacket
 
 logger = logging.getLogger(__name__)
 
-REALTIME_INSTRUCTIONS_MAX_BYTES = 20 * 1024
+REALTIME_INSTRUCTIONS_MAX_BYTES = 24 * 1024
+"""Fixed template text is ~5.9KB with ask_poke guidance included; CONTEXT_PACKET_MAX_BYTES
+(app.models) adds up to 16KB of approved-context JSON on top. 24KB keeps comfortable headroom
+above that ~22KB worst case so a legal approved context can never overflow the instructions
+budget by construction."""
 
 ASK_POKE_TOOL_GUIDANCE = (
     "Use ask_poke for facts only the owner or their assistant would know (account details already "

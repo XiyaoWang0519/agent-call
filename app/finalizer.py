@@ -157,7 +157,10 @@ class Finalizer:
     async def _extract(
         self, call: dict[str, Any], plan: dict[str, Any], transcript: list[Any]
     ) -> ExtractedCallResult:
-        evidence_ids = {turn.turn_id for turn in transcript}
+        # Normalize (but do not case-fold) turn_ids so an extractor citation padded with
+        # incidental whitespace still validates; a matching stripped id is canonicalized
+        # back to the exact transcript turn_id before being persisted.
+        evidence_ids_by_stripped = {turn.turn_id.strip(): turn.turn_id for turn in transcript}
         payload = {
             "approved_plan": ContextPacket.model_validate(plan["context"]).model_dump(mode="json"),
             "termination_reason": call.get("termination_reason"),
@@ -178,7 +181,7 @@ class Finalizer:
             if last_unknown:
                 instructions += (
                     "\nYour previous attempt cited turn_ids that do not exist in the "
-                    f"transcript: {', '.join(last_unknown)}. Cite only exact turn_id "
+                    f"transcript: {json.dumps(last_unknown)}. Cite only exact turn_id "
                     "values that appear in the provided transcript entries."
                 )
             try:
@@ -193,17 +196,22 @@ class Finalizer:
                 parsed = response.output_parsed
                 if parsed is None:
                     raise ValueError("extractor returned no parsed output")
-                unknown = {
-                    turn_id
-                    for group in (
-                        parsed.commitments,
-                        parsed.confirmation_numbers,
-                        parsed.follow_ups,
-                    )
-                    for item in group
-                    for turn_id in item.evidence_turn_ids
-                    if turn_id not in evidence_ids
-                }
+                unknown: set[str] = set()
+                for group in (
+                    parsed.commitments,
+                    parsed.confirmation_numbers,
+                    parsed.follow_ups,
+                ):
+                    for item in group:
+                        canonical_ids = []
+                        for turn_id in item.evidence_turn_ids:
+                            canonical = evidence_ids_by_stripped.get(turn_id.strip())
+                            if canonical is None:
+                                unknown.add(turn_id)
+                                canonical_ids.append(turn_id)
+                            else:
+                                canonical_ids.append(canonical)
+                        item.evidence_turn_ids = canonical_ids
                 if unknown:
                     raise UnknownEvidenceError(unknown)
                 return parsed
