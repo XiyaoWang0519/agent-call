@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import app.call_state as call_state_module
+import app.owner_transfer as owner_transfer_module
 from app.exa_search import ExaSearchError
 from app.models import CallState
 from app.twilio_bridge import ParticipantInfo
@@ -519,7 +520,7 @@ async def test_owner_join_timeout_cleanup_failure_completes_conference(
         attempts.append(participant_call_sid)
         raise RuntimeError("Twilio cleanup failed")
 
-    monkeypatch.setattr(call_state_module, "OWNER_JOIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(owner_transfer_module, "OWNER_JOIN_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(service._test_twilio, "remove_participant", failed_remove)
     result = await service.transfer_to_owner(call_id, "owner needed")
 
@@ -1072,7 +1073,7 @@ async def test_shutdown_cancellation_cannot_interrupt_transfer_compensation(
         await release_failure_write.wait()
         return await original_fail(*args, **kwargs)
 
-    monkeypatch.setattr(call_state_module, "OWNER_JOIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(owner_transfer_module, "OWNER_JOIN_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(service._test_twilio, "remove_participant", failed_owner_remove)
     monkeypatch.setattr(service.db, "fail_joining_transfer", blocked_failure_write)
 

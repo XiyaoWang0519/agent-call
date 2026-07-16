@@ -16,7 +16,6 @@ from openai import AsyncOpenAI
 
 from app.call_activity import CallActivityTracker
 from app.db import (
-    TRANSFER_ELIGIBLE_STATES,
     Database,
     DeploymentLockedError,
     LatencyMark,
@@ -39,6 +38,7 @@ from app.models import (
 )
 from app.openai_client import create_openai_client
 from app.openai_realtime import REALTIME_SEND_TIMEOUT_SECONDS, RealtimeBridge
+from app.owner_transfer import OwnerTransferCoordinator
 from app.poke_push import push_message_to_poke
 from app.policy import validate_context
 from app.settings import Settings
@@ -46,7 +46,6 @@ from app.twilio_bridge import TwilioBridge
 
 logger = logging.getLogger(__name__)
 
-OWNER_JOIN_TIMEOUT_SECONDS = 30
 # Over SIP, response.done marks the end of audio *generation*; playback to the phone lags
 # behind because OpenAI drains a server-side output buffer in real time. Termination after a
 # final spoken turn (voice-initiated end_call goodbye, voicemail) must wait for
@@ -92,10 +91,6 @@ ASSISTANT_SPEECH_EVENT_TYPES = frozenset(
 )
 
 
-class OwnerTransferDeparted(RuntimeError):
-    """The owner leg became terminal before the AI handoff finished."""
-
-
 class CallService:
     def __init__(
         self,
@@ -132,13 +127,7 @@ class CallService:
         self._must_finish_background: set[asyncio.Task[Any]] = set()
         self._conference_retry_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         self._stopping = False
-        self._owner_join_events: dict[str, asyncio.Event] = {}
-        self._owner_departure_events: dict[str, asyncio.Event] = {}
-        self._owner_expected_sids: dict[str, str] = {}
-        self._owner_joined_sids: dict[str, str | None] = {}
-        self._owner_failures: dict[str, tuple[str | None, str]] = {}
-        self._owner_transfer_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._owner_transfer_locks: dict[str, asyncio.Lock] = {}
+        self._owner_transfer = OwnerTransferCoordinator(self)
         self._opening_transition_locks: dict[str, asyncio.Lock] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
@@ -186,48 +175,57 @@ class CallService:
     def _opening_transition_lock(self, call_id: str) -> asyncio.Lock:
         return self._opening_transition_locks.setdefault(call_id, asyncio.Lock())
 
+    # -- Legacy owner-transfer delegators -----------------------------------
+    # Kept under their original names because tests call/patch these directly.
+    # Internal call sites in this class use self._owner_transfer.<method> instead
+    # of routing back through these.
+
     def _owner_transfer_lock(self, call_id: str) -> asyncio.Lock:
-        return self._owner_transfer_locks.setdefault(call_id, asyncio.Lock())
+        return self._owner_transfer.lock(call_id)
 
     def _owner_sid_matches(self, call_id: str, call_sid: str | None) -> bool:
-        expected = self._owner_expected_sids.get(call_id)
-        return expected is None or call_sid is None or call_sid == expected
+        return self._owner_transfer.owner_sid_matches(call_id, call_sid)
 
     def _record_owner_join(self, call_id: str, call_sid: str | None) -> None:
-        event = self._owner_join_events.get(call_id)
-        if event is None or not self._owner_sid_matches(call_id, call_sid):
-            return
-        self._owner_joined_sids[call_id] = call_sid
-        event.set()
+        self._owner_transfer.record_owner_join(call_id, call_sid)
 
     def _record_owner_failure(self, call_id: str, call_sid: str | None, reason: str) -> None:
-        event = self._owner_join_events.get(call_id)
-        if event is None or not self._owner_sid_matches(call_id, call_sid):
-            return
-        self._owner_failures[call_id] = (call_sid, reason)
-        self._owner_departure_events.setdefault(call_id, asyncio.Event()).set()
-        event.set()
+        self._owner_transfer.record_owner_failure(call_id, call_sid, reason)
 
     def _track_owner_transfer(self, call_id: str, task: asyncio.Task[dict[str, Any]]) -> None:
-        self._owner_transfer_tasks[call_id] = task
+        self._owner_transfer.track(call_id, task)
 
-        def finished(completed: asyncio.Task[dict[str, Any]]) -> None:
-            if self._owner_transfer_tasks.get(call_id) is completed:
-                self._owner_transfer_tasks.pop(call_id, None)
-            if completed.cancelled():
-                return
-            try:
-                error = completed.exception()
-            except asyncio.CancelledError:
-                return
-            if error is not None:
-                logger.error(
-                    "owner transfer task failed call_id=%s",
-                    call_id,
-                    exc_info=(type(error), error, error.__traceback__),
-                )
+    # -- Legacy owner-transfer attribute properties --------------------------
+    # Forward to the coordinator so external code (mainly tests) that reads or
+    # mutates-in-place these dict attributes on the service keeps working.
 
-        task.add_done_callback(finished)
+    @property
+    def _owner_join_events(self) -> dict[str, asyncio.Event]:
+        return self._owner_transfer.join_events
+
+    @property
+    def _owner_departure_events(self) -> dict[str, asyncio.Event]:
+        return self._owner_transfer.departure_events
+
+    @property
+    def _owner_expected_sids(self) -> dict[str, str]:
+        return self._owner_transfer.expected_sids
+
+    @property
+    def _owner_joined_sids(self) -> dict[str, str | None]:
+        return self._owner_transfer.joined_sids
+
+    @property
+    def _owner_failures(self) -> dict[str, tuple[str | None, str]]:
+        return self._owner_transfer.failures
+
+    @property
+    def _owner_transfer_tasks(self) -> dict[str, asyncio.Task[dict[str, Any]]]:
+        return self._owner_transfer.tasks
+
+    @property
+    def _owner_transfer_locks(self) -> dict[str, asyncio.Lock]:
+        return self._owner_transfer.locks
 
     # -- Legacy call-activity delegators -----------------------------------
     # Kept under their original names because RealtimeBridge wiring
@@ -1730,72 +1728,7 @@ class CallService:
         *,
         tool_call_id: str | None,
     ) -> tuple[asyncio.Task[dict[str, Any]] | None, str | None]:
-        if self._stopping:
-            return None, "service is stopping"
-        call = await self.db.get_call(call_id)
-        if call is None:
-            return None, "call not found"
-        plan = await self.db.get_plan(call["plan_id"])
-        if plan is None:
-            return None, "call plan not found"
-        packet = ContextPacket.model_validate(plan["context"])
-        if packet.escalation.mode != "transfer_to_owner":
-            return None, "owner transfer is not authorized"
-
-        async def claim_and_spawn() -> tuple[asyncio.Task[dict[str, Any]] | None, str | None]:
-            async with self._owner_transfer_lock(call_id):
-                if call_id in self._owner_transfer_tasks:
-                    return None, "owner transfer already in progress"
-                if self._stopping:
-                    return None, "service is stopping"
-                joining = f"joining:{reason}"
-                claim_error: Exception | None = None
-                try:
-                    claimed = await self.db.claim_transfer_joining(call_id, reason)
-                except Exception as exc:
-                    claimed = False
-                    claim_error = exc
-                claimed_call = call
-                if not claimed:
-                    current = await self.db.get_call(call_id)
-                    exact_joining = bool(
-                        current
-                        and current.get("state") in TRANSFER_ELIGIBLE_STATES
-                        and not current.get("termination_claimed")
-                        and current.get("transfer_outcome") == joining
-                    )
-                    if not exact_joining:
-                        if claim_error is not None:
-                            raise claim_error
-                        return None, "owner transfer already attempted or call is ending"
-                    claimed_call = current
-                    logger.warning("reconciled ambiguous owner transfer claim call_id=%s", call_id)
-                if self._stopping:
-                    await self.db.fail_joining_transfer(call_id, joining, "failed:service_stopping")
-                    return None, "service is stopping"
-                # Install callback-visible state before dialing can emit owner status.
-                self._owner_join_events.setdefault(call_id, asyncio.Event())
-                self._owner_departure_events.setdefault(call_id, asyncio.Event())
-                task = self._spawn(
-                    self._owner_transfer_workflow(
-                        claimed_call,
-                        packet,
-                        reason,
-                        tool_call_id=tool_call_id,
-                    ),
-                    name=f"owner-transfer:{call_id}",
-                )
-                self._track_owner_transfer(call_id, task)
-                return task, None
-
-        # Cancellation after SQLite commits but before this caller observes the result
-        # must not leave durable joining without a registered cleanup workflow.
-        claim = self._spawn(
-            claim_and_spawn(),
-            name=f"claim-owner-transfer:{call_id}",
-            must_finish=True,
-        )
-        return await self._await_network_task(claim)
+        return await self._owner_transfer.start(call_id, reason, tool_call_id=tool_call_id)
 
     @staticmethod
     async def _await_network_task(
@@ -1940,552 +1873,6 @@ class CallService:
                 exc_info=True,
             )
         return True
-
-    async def _spawn_and_await_compensation(self, coro: Any, *, name: str) -> None:
-        """Run a must-finish owner-transfer compensation coroutine via _spawn so caller
-        cancellation cannot abandon it mid-flight, then wait for it to settle."""
-        compensation = self._spawn(coro, name=name, must_finish=True)
-        await self._await_network_task(compensation)
-
-    async def _remove_owner_transfer_leg(
-        self, call_id: str, conference: str | None, owner_call_sid: str
-    ) -> bool:
-        cleanup = asyncio.create_task(
-            self.twilio.remove_participant(conference, owner_call_sid),
-            name=f"remove-owner:{call_id}",
-        )
-        try:
-            await self._await_network_task(cleanup)
-            return True
-        except Exception:
-            # The primary transfer/termination outcome must survive cleanup failure.
-            # Full conference teardown is the remaining compensation path.
-            logger.warning(
-                "failed to clean up owner transfer leg call_id=%s", call_id, exc_info=True
-            )
-            return False
-
-    def _owner_transfer_failure_reason(
-        self, call_id: str, owner_call_sid: str | None
-    ) -> str | None:
-        failure = self._owner_failures.get(call_id)
-        if failure is None:
-            return None
-        failure_sid, failure_reason = failure
-        if owner_call_sid and failure_sid and failure_sid != owner_call_sid:
-            return None
-        return failure_reason
-
-    def _raise_if_owner_departed(
-        self, call_id: str, owner_call_sid: str | None, departure_event: asyncio.Event
-    ) -> None:
-        failure = self._owner_transfer_failure_reason(call_id, owner_call_sid)
-        if failure is not None or departure_event.is_set():
-            raise OwnerTransferDeparted(failure or "owner_departed")
-
-    def _reconcile_owner_transfer_callbacks(
-        self,
-        call_id: str,
-        owner_call_sid: str | None,
-        event: asyncio.Event,
-        departure_event: asyncio.Event,
-    ) -> None:
-        """Drop pre-create callbacks that belong to a different owner leg."""
-
-        event_was_set = event.is_set()
-        had_join = call_id in self._owner_joined_sids
-        had_failure = call_id in self._owner_failures
-        joined_sid = self._owner_joined_sids.get(call_id)
-        failure = self._owner_failures.get(call_id)
-        if had_join and joined_sid is not None and joined_sid != owner_call_sid:
-            self._owner_joined_sids.pop(call_id, None)
-            had_join = False
-        if (
-            had_failure
-            and failure is not None
-            and failure[0] is not None
-            and failure[0] != owner_call_sid
-        ):
-            self._owner_failures.pop(call_id, None)
-            had_failure = False
-
-        event.clear()
-        departure_event.clear()
-        # Tests and legacy callback senders may signal a join without a SID.
-        if had_join or had_failure or (event_was_set and not (had_join or had_failure)):
-            event.set()
-        if had_failure:
-            departure_event.set()
-
-    async def _send_owner_transfer_failure(
-        self, call_id: str, tool_call_id: str | None, error: str
-    ) -> None:
-        if tool_call_id is None:
-            return
-        try:
-            await self.realtime.send_tool_result(
-                call_id,
-                tool_call_id,
-                {"accepted": False, "error": error},
-            )
-        except asyncio.CancelledError:
-            logger.warning("transfer failure output was cancelled call_id=%s", call_id)
-        except Exception:
-            logger.warning(
-                "transfer failure output could not be delivered call_id=%s",
-                call_id,
-                exc_info=True,
-            )
-
-    async def _persist_owner_transfer_sid(
-        self, call: dict[str, Any], joining: str, owner_call_sid: str
-    ) -> None:
-        """Persist the freshly created owner leg's SID onto the joining transfer row.
-
-        Raises if persistence cannot be confirmed even after reconciling an ambiguous
-        write against the current row.
-        """
-        call_id = call["call_id"]
-        owner_sid_error: Exception | None = None
-        try:
-            owner_sid_persisted = await self.db.record_transfer_owner_sid(
-                call_id, joining, owner_call_sid
-            )
-        except Exception as exc:
-            owner_sid_persisted = False
-            owner_sid_error = exc
-        if not owner_sid_persisted:
-            current = await self.db.get_call(call_id)
-            exact_owner_sid = bool(
-                current
-                and current.get("state") in TRANSFER_ELIGIBLE_STATES
-                and not current.get("termination_claimed")
-                and current.get("transfer_outcome") == joining
-                and current.get("twilio_owner_call_sid") == owner_call_sid
-            )
-            if not exact_owner_sid:
-                if owner_sid_error is not None:
-                    raise owner_sid_error
-                raise RuntimeError("owner transfer SID could not be persisted")
-            logger.warning("reconciled ambiguous owner SID persistence call_id=%s", call_id)
-        call["twilio_owner_call_sid"] = owner_call_sid
-
-    async def _remove_ai_leg_racing_departure(
-        self,
-        call_id: str,
-        conference: str | None,
-        ai_call_sid: str | None,
-        owner_call_sid: str | None,
-        departure_event: asyncio.Event,
-    ) -> None:
-        """Remove the AI leg once the owner has joined, racing the owner's departure.
-
-        A departure observed first still waits for removal to finish (or fail) before
-        raising OwnerTransferDeparted, so cleanup never races the outcome it reports.
-        """
-        remove_ai = asyncio.create_task(
-            self.twilio.remove_participant(conference, ai_call_sid),
-            name=f"remove-ai:{call_id}",
-        )
-        departure_wait = asyncio.create_task(
-            departure_event.wait(), name=f"wait-owner-departure:{call_id}"
-        )
-        try:
-            done, _ = await asyncio.wait(
-                {remove_ai, departure_wait}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if departure_wait in done:
-                try:
-                    await self._await_network_task(remove_ai)
-                except Exception:
-                    logger.warning(
-                        "AI removal also failed after owner departure call_id=%s",
-                        call_id,
-                        exc_info=True,
-                    )
-                self._raise_if_owner_departed(call_id, owner_call_sid, departure_event)
-            remove_ai.result()
-        except asyncio.CancelledError:
-            try:
-                await self._await_network_task(remove_ai)
-            except Exception:
-                logger.warning(
-                    "AI removal failed while transfer was cancelled call_id=%s",
-                    call_id,
-                    exc_info=True,
-                )
-            raise
-        finally:
-            departure_wait.cancel()
-            await asyncio.gather(departure_wait, return_exceptions=True)
-        self._raise_if_owner_departed(call_id, owner_call_sid, departure_event)
-
-    async def _fail_joining_owner_transfer(
-        self,
-        call: dict[str, Any],
-        *,
-        joining: str,
-        in_progress: str,
-        failure: str,
-        cleaned: bool,
-        owner_call_sid: str | None,
-        workflow_task: asyncio.Task[Any] | None,
-    ) -> None:
-        call_id = call["call_id"]
-        transitioned: bool | None
-        try:
-            transitioned = await self.db.fail_joining_transfer(call_id, joining, failure)
-        except Exception:
-            transitioned = None
-            logger.warning(
-                "joining transfer failure could not be persisted call_id=%s",
-                call_id,
-                exc_info=True,
-            )
-        if transitioned is not True:
-            # The promotion UPDATE may have committed even if awaiting it raised.
-            # Probe the exact in-progress value with a guarded CAS; this adopts
-            # teardown ownership without a fresh read or a false transferred result.
-            suffix = failure.removeprefix("failed:") or "owner_transfer"
-            failure_reason = f"transfer_failed:{suffix}"
-            try:
-                promoted_transition = await self.db.fail_promoted_transfer(
-                    call_id,
-                    in_progress,
-                    failure,
-                    failure_reason,
-                )
-            except Exception:
-                promoted_transition = None
-                logger.warning(
-                    "ambiguous transfer promotion could not be adopted call_id=%s",
-                    call_id,
-                    exc_info=True,
-                )
-            if promoted_transition is True:
-                try:
-                    finished = await self._finish_claimed_termination(
-                        call,
-                        failure_reason,
-                        preserve_conference=False,
-                        await_finalizer=False,
-                        expected_transfer_outcome=failure,
-                    )
-                except Exception:
-                    finished = False
-                    logger.warning(
-                        "adopted transfer termination failed call_id=%s",
-                        call_id,
-                        exc_info=True,
-                    )
-                if finished:
-                    return
-                await self._complete_conference_or_schedule(call)
-                return
-            if promoted_transition is None:
-                await self._complete_conference_or_schedule(call)
-                return
-        if not cleaned and transitioned is True:
-            try:
-                terminated = await self.terminate_call(
-                    call_id,
-                    "transfer_cleanup_failed",
-                    _initiating_task=workflow_task,
-                )
-            except Exception:
-                terminated = False
-                logger.warning(
-                    "owner cleanup termination failed call_id=%s",
-                    call_id,
-                    exc_info=True,
-                )
-            if not terminated:
-                await self._complete_conference_or_schedule(call)
-        elif owner_call_sid is not None and (transitioned is None or not cleaned):
-            # SQLite state is ambiguous. Conference completion is the only
-            # DB-independent guarantee that the owner leg cannot keep billing.
-            await self._complete_conference_or_schedule(call)
-
-    async def _fail_promoted_owner_transfer(
-        self,
-        call: dict[str, Any],
-        promoted: dict[str, Any] | None,
-        *,
-        in_progress: str,
-        completed_outcome: str | None,
-        expected: str,
-        failure: str,
-        failure_reason: str,
-    ) -> None:
-        call_id = call["call_id"]
-        transitioned: bool | None
-        try:
-            transitioned = await self.db.fail_promoted_transfer(
-                call_id,
-                expected,
-                failure,
-                failure_reason,
-            )
-        except Exception:
-            transitioned = None
-            logger.warning(
-                "promoted transfer failure could not be persisted call_id=%s",
-                call_id,
-                exc_info=True,
-            )
-        # Completing the promoted transfer can also commit before its await raises.
-        # If in-progress no longer matches, adopt the exact completed value before
-        # resorting to DB-independent conference compensation.
-        if transitioned is not True and expected == in_progress and completed_outcome is not None:
-            try:
-                transitioned = await self.db.fail_promoted_transfer(
-                    call_id,
-                    completed_outcome,
-                    failure,
-                    failure_reason,
-                )
-            except Exception:
-                transitioned = None
-                logger.warning(
-                    "ambiguous transfer completion could not be adopted call_id=%s",
-                    call_id,
-                    exc_info=True,
-                )
-        if transitioned is True:
-            try:
-                finished = await self._finish_claimed_termination(
-                    promoted or call,
-                    failure_reason,
-                    preserve_conference=False,
-                    await_finalizer=False,
-                    expected_transfer_outcome=failure,
-                )
-            except Exception:
-                finished = False
-                logger.warning(
-                    "promoted transfer termination failed call_id=%s",
-                    call_id,
-                    exc_info=True,
-                )
-            if finished:
-                return
-        # A lost/ambiguous CAS must never be interpreted as a successful handoff.
-        # Complete the conference without relying on another database read.
-        await self._complete_conference_or_schedule(call)
-
-    async def _owner_transfer_workflow(
-        self,
-        call: dict[str, Any],
-        packet: ContextPacket,
-        reason: str,
-        *,
-        tool_call_id: str | None,
-    ) -> dict[str, Any]:
-        call_id = call["call_id"]
-        joining = f"joining:{reason}"
-        in_progress = f"in_progress:{reason}"
-        conference = call.get("conference_sid") or call["conference_name"]
-        event = self._owner_join_events.setdefault(call_id, asyncio.Event())
-        departure_event = self._owner_departure_events.setdefault(call_id, asyncio.Event())
-        owner_call_sid: str | None = None
-        owner_cleanup_started = False
-        create_task: asyncio.Task[Any] | None = None
-        promoted: dict[str, Any] | None = None
-        phase = "joining"
-        completed_outcome: str | None = None
-        workflow_task = asyncio.current_task()
-
-        async def cleanup_owner() -> bool:
-            nonlocal owner_cleanup_started
-            if owner_call_sid is None:
-                return True
-            if owner_cleanup_started:
-                return False
-            owner_cleanup_started = True
-            return await self._remove_owner_transfer_leg(call_id, conference, owner_call_sid)
-
-        async def fail_joining_and_compensate(failure: str, cleaned: bool) -> None:
-            await self._spawn_and_await_compensation(
-                self._fail_joining_owner_transfer(
-                    call,
-                    joining=joining,
-                    in_progress=in_progress,
-                    failure=failure,
-                    cleaned=cleaned,
-                    owner_call_sid=owner_call_sid,
-                    workflow_task=workflow_task,
-                ),
-                name=f"compensate-joining-transfer:{call_id}",
-            )
-
-        async def fail_promoted_and_compensate(
-            expected: str, failure: str, failure_reason: str
-        ) -> None:
-            await self._spawn_and_await_compensation(
-                self._fail_promoted_owner_transfer(
-                    call,
-                    promoted,
-                    in_progress=in_progress,
-                    completed_outcome=completed_outcome,
-                    expected=expected,
-                    failure=failure,
-                    failure_reason=failure_reason,
-                ),
-                name=f"compensate-promoted-transfer:{call_id}",
-            )
-
-        try:
-            create_task = asyncio.create_task(
-                self.twilio.create_owner_participant(
-                    call_id=call_id,
-                    plan_id=call["plan_id"],
-                    conference_sid_or_name=conference,
-                    owner_phone=packet.escalation.owner_phone,
-                ),
-                name=f"create-owner:{call_id}",
-            )
-            participant = await asyncio.shield(create_task)
-            owner_call_sid = participant.call_sid
-            self._owner_expected_sids[call_id] = owner_call_sid
-            self._reconcile_owner_transfer_callbacks(
-                call_id, owner_call_sid, event, departure_event
-            )
-            await self._persist_owner_transfer_sid(call, joining, owner_call_sid)
-            await asyncio.wait_for(event.wait(), timeout=OWNER_JOIN_TIMEOUT_SECONDS)
-            self._raise_if_owner_departed(call_id, owner_call_sid, departure_event)
-            promoted = await self.db.promote_transfer(call_id, reason)
-            if promoted is None:
-                cleaned = await cleanup_owner()
-                await fail_joining_and_compensate("failed:termination_won", cleaned)
-                await self._send_owner_transfer_failure(
-                    call_id, tool_call_id, "call ended before owner transfer completed"
-                )
-                return {"accepted": False, "error": "call ended during owner transfer"}
-            phase = "promoted"
-            self._raise_if_owner_departed(call_id, owner_call_sid, departure_event)
-
-            if tool_call_id is not None:
-                try:
-                    # A successful tool output must be observable before the AI leg disappears.
-                    await self.realtime.send_tool_result(
-                        call_id,
-                        tool_call_id,
-                        {"accepted": True, "status": "owner_joined"},
-                    )
-                except asyncio.CancelledError:
-                    logger.warning("transfer tool output was cancelled call_id=%s", call_id)
-                except Exception:
-                    logger.warning(
-                        "transfer tool output could not be delivered call_id=%s",
-                        call_id,
-                        exc_info=True,
-                    )
-            self._raise_if_owner_departed(call_id, owner_call_sid, departure_event)
-
-            await self._remove_ai_leg_racing_departure(
-                call_id,
-                conference,
-                call.get("twilio_ai_call_sid"),
-                owner_call_sid,
-                departure_event,
-            )
-
-            completed_outcome = f"completed:{reason}"
-            if not await self.db.complete_promoted_transfer(
-                call_id, in_progress, completed_outcome
-            ):
-                raise RuntimeError("owner transfer completion state was lost")
-            phase = "completed"
-            self._raise_if_owner_departed(call_id, owner_call_sid, departure_event)
-            # The owner becomes responsible for conference lifetime only after the
-            # handoff outcome is durably completed. If arming this fails, compensate
-            # the transfer rather than leave the callee alone and billing later.
-            arm_owner_exit = asyncio.create_task(
-                self.twilio.enable_end_conference_on_exit(conference, owner_call_sid),
-                name=f"arm-owner-conference-exit:{call_id}",
-            )
-            await self._await_network_task(arm_owner_exit)
-            self._raise_if_owner_departed(call_id, owner_call_sid, departure_event)
-            terminalization = self._spawn(
-                self._finish_claimed_termination(
-                    promoted,
-                    "transfer_completed",
-                    preserve_conference=True,
-                    await_finalizer=False,
-                    expected_transfer_outcome=completed_outcome,
-                ),
-                name=f"terminalize-owner-transfer:{call_id}",
-                must_finish=True,
-            )
-            terminalized = await self._await_network_task(terminalization)
-            if not terminalized:
-                cleaned = await cleanup_owner()
-                await fail_promoted_and_compensate(
-                    completed_outcome,
-                    "failed:terminal_cas",
-                    "transfer_failed:terminal_cas",
-                )
-                if not cleaned:
-                    await self._complete_conference_or_schedule(call)
-                return {"accepted": False, "error": "transfer teardown requires retry"}
-            phase = "terminal"
-            return {"accepted": True, "status": "transferred"}
-        except TimeoutError:
-            cleaned = await cleanup_owner()
-            await fail_joining_and_compensate("failed:owner_join_timeout", cleaned)
-            await self._send_owner_transfer_failure(call_id, tool_call_id, "owner did not join")
-            return {"accepted": False, "error": "owner did not join"}
-        except asyncio.CancelledError:
-            # If creation completed in its worker thread after cancellation, recover
-            # its SID before returning so the remote owner leg cannot leak.
-            if owner_call_sid is None and create_task is not None:
-                try:
-                    participant = await self._await_network_task(create_task)
-                    owner_call_sid = participant.call_sid
-                except Exception:
-                    pass
-            cleaned = await cleanup_owner()
-            if phase == "promoted":
-                failure_reason = "transfer_failed:CancelledError"
-                failure = "failed:CancelledError"
-                await fail_promoted_and_compensate(
-                    in_progress,
-                    failure,
-                    failure_reason,
-                )
-            elif phase == "completed" and completed_outcome is not None:
-                await fail_promoted_and_compensate(
-                    completed_outcome,
-                    "failed:CancelledError",
-                    "transfer_failed:CancelledError",
-                )
-            elif phase != "terminal":
-                await fail_joining_and_compensate("failed:CancelledError", cleaned)
-            return {"accepted": False, "error": "owner transfer cancelled"}
-        except Exception as exc:
-            logger.exception("owner transfer failed call_id=%s", call_id)
-            cleaned = await cleanup_owner()
-            error_type = type(exc).__name__
-            failure_reason = f"transfer_failed:{error_type}"
-            failure = f"failed:{error_type}"
-            if phase == "promoted":
-                await fail_promoted_and_compensate(
-                    in_progress,
-                    failure,
-                    failure_reason,
-                )
-            elif phase == "completed" and completed_outcome is not None:
-                await fail_promoted_and_compensate(
-                    completed_outcome,
-                    failure,
-                    failure_reason,
-                )
-            elif phase != "terminal":
-                await fail_joining_and_compensate(failure, cleaned)
-                await self._send_owner_transfer_failure(
-                    call_id, tool_call_id, "owner transfer failed"
-                )
-            return {"accepted": False, "error": "owner transfer failed"}
 
     async def terminate_call(
         self,
@@ -2667,13 +2054,7 @@ class CallService:
         terminal in the database and still tracked as in-flight here.
         """
         self._activity.tombstone(call_id)
-        self._owner_join_events.pop(call_id, None)
-        self._owner_departure_events.pop(call_id, None)
-        self._owner_expected_sids.pop(call_id, None)
-        self._owner_joined_sids.pop(call_id, None)
-        self._owner_failures.pop(call_id, None)
-        self._owner_transfer_tasks.pop(call_id, None)
-        self._owner_transfer_locks.pop(call_id, None)
+        self._owner_transfer.clear_call(call_id)
         self._opening_transition_locks.pop(call_id, None)
         self._tool_seen_calls.discard(call_id)
         self._pending_questions.pop(call_id, None)
