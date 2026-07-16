@@ -35,17 +35,10 @@ async def test_realtime_deltas_flush_one_latest_arrival_without_per_event_writes
 
     monkeypatch.setattr(service.db, "touch_calls", record_batch)
     monkeypatch.setattr(service.db, "touch_call", forbid_single_touch)
-    wall_base = datetime.now(UTC) + timedelta(seconds=1)
-    monotonic_base = LatencyMark.now().monotonic_ns
 
-    latest: LatencyMark | None = None
     for sequence in range(125):
-        latest = LatencyMark(
-            occurred_at=(wall_base + timedelta(microseconds=sequence)).isoformat(),
-            monotonic_ns=monotonic_base + sequence,
-        )
-        # Production invokes this on the reader before dispatching the delta.
-        service._note_call_activity(call_id, latest)
+        # Assistant audio deltas note activity in-process; the reader also heartbeats in
+        # production. Either path must coalesce to one durable write.
         await service.handle_realtime_event(
             call_id,
             {"type": "response.audio.delta", "event_id": f"evt_{sequence}"},
@@ -53,9 +46,11 @@ async def test_realtime_deltas_flush_one_latest_arrival_without_per_event_writes
 
     await service._flush_call_activity()
 
-    assert latest is not None
-    assert batches == [[(call_id, latest.occurred_at)]]
-    assert (await service.db.get_call(call_id))["last_event_at"] == latest.occurred_at
+    assert len(batches) == 1
+    assert len(batches[0]) == 1
+    assert batches[0][0][0] == call_id
+    assert (await service.db.get_call(call_id))["last_event_at"] == batches[0][0][1]
+    assert call_id in service._latest_call_activity
 
 
 @pytest.mark.asyncio
@@ -338,3 +333,80 @@ async def test_twilio_callbacks_for_missing_call_leave_no_activity(service):
     assert call_id not in service._dirty_call_activity
     assert call_id not in service._watchdog_claims
     assert call_id not in service._activity_tombstones
+
+
+@pytest.mark.asyncio
+async def test_assistant_speech_events_refresh_activity_and_block_stale_watchdog(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _make_call_stale(service, call_id)
+
+    await service.handle_realtime_event(
+        call_id,
+        {"type": "response.output_audio.delta", "event_id": "evt_speech", "delta": "qq=="},
+    )
+
+    assert call_id in service._latest_call_activity
+    assert call_id in service._dirty_call_activity
+    await service._watchdog_once()
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert call_id not in service._watchdog_claims
+
+
+@pytest.mark.asyncio
+async def test_active_assistant_response_prevents_stale_timeout_without_sideband_frames(
+    service, packet
+):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _make_call_stale(service, call_id)
+    service._active_response_ids[call_id] = "resp_speaking"
+
+    await service._watchdog_once()
+
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert call_id not in service._watchdog_claims
+    assert call_id in service._latest_call_activity
+
+
+@pytest.mark.asyncio
+async def test_sip_output_playback_prevents_stale_timeout(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _make_call_stale(service, call_id)
+
+    await service.handle_realtime_event(
+        call_id, {"type": "output_audio_buffer.started", "event_id": "evt_play"}
+    )
+    assert call_id in service._sip_output_playing
+
+    await service._watchdog_once()
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+
+    await service.handle_realtime_event(
+        call_id, {"type": "output_audio_buffer.stopped", "event_id": "evt_stop"}
+    )
+    assert call_id not in service._sip_output_playing
+
+
+@pytest.mark.asyncio
+async def test_inflight_tool_prevents_stale_timeout(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _make_call_stale(service, call_id)
+    service._inflight_tools.add(call_id)
+
+    await service._watchdog_once()
+
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert call_id not in service._watchdog_claims
+
+
+@pytest.mark.asyncio
+async def test_outbound_realtime_send_refreshes_activity(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _make_call_stale(service, call_id)
+
+    await service.handle_realtime_send(call_id, {"type": "response.create"})
+    await service._flush_call_activity()
+
+    call = await service.db.get_call(call_id)
+    assert datetime.fromisoformat(call["last_event_at"]) > datetime.now(UTC) - timedelta(seconds=5)
+    await service._watchdog_once()
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
