@@ -551,3 +551,94 @@ async def test_redelivered_pending_ask_is_idempotent(ask_service, packet):
     delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_redeliver"]
     assert len(delivered) == 1
     assert delivered[0][2] == {"status": "answered", "answer": "Walgreens"}
+
+
+@pytest.mark.asyncio
+async def test_redelivered_pending_ask_at_question_limit_is_idempotent(ask_service, packet):
+    ask_service.settings.ask_poke_max_questions_per_call = 1
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_quota_redeliver")
+    await wait_background()
+    rows = await ask_service.db.get_questions_after(call_id, 0)
+    question_id = rows[0]["question_id"]
+    before_results = list(ask_service._test_realtime.tool_results)
+
+    await _ask(
+        ask_service,
+        call_id,
+        tool_call_id="tc_quota_redeliver",
+        question="What is the owner's preferred pharmacy?",
+    )
+    await wait_background()
+
+    assert ask_service._test_realtime.tool_results == before_results
+    assert await ask_service.db.count_call_questions(call_id) == 1
+    row = await ask_service.db.get_question(question_id)
+    assert row["status"] == "pending"
+
+    accepted = await ask_service.answer_call_question(call_id, question_id, "Walgreens")
+    await wait_background()
+    assert accepted["status"] == "accepted"
+    delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_quota_redeliver"]
+    assert len(delivered) == 1
+
+
+@pytest.mark.asyncio
+async def test_expiry_does_not_claim_once_call_is_terminating(ask_service, packet):
+    ask_service.settings.ask_poke_answer_timeout_seconds = 0.05
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_expire_term")
+    rows = await ask_service.db.get_questions_after(call_id, 0)
+    question_id = rows[0]["question_id"]
+
+    await ask_service.db.execute(
+        "UPDATE calls SET state=?, termination_claimed=1 WHERE call_id=?",
+        (CallState.TERMINATING.value, call_id),
+    )
+
+    await asyncio.sleep(0.12)
+    await wait_background()
+
+    # Termination owns the call: the deadline must not inject a timeout tool result,
+    # and the row stays pending for cancel_pending_questions to claim.
+    assert not any(r[1] == "tc_expire_term" for r in ask_service._test_realtime.tool_results)
+    row = await ask_service.db.get_question(question_id)
+    assert row["status"] == "pending"
+    assert call_id not in ask_service._pending_questions
+
+    cancelled = await ask_service.db.cancel_pending_questions(call_id)
+    assert [q["question_id"] for q in cancelled] == [question_id]
+    late = await ask_service.answer_call_question(call_id, question_id, "too late")
+    assert late["status"] == "call_ended"
+
+
+@pytest.mark.asyncio
+async def test_failed_answer_delivery_is_retryable(ask_service, packet):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_retry")
+    rows = await ask_service.db.get_questions_after(call_id, 0)
+    question_id = rows[0]["question_id"]
+
+    ask_service._test_realtime.tool_result_failures_remaining = 1
+    first = await ask_service.answer_call_question(call_id, question_id, "CVS on Market")
+    await wait_background()
+
+    assert first["status"] == "accepted"
+    assert not any(r[1] == "tc_retry" for r in ask_service._test_realtime.tool_results)
+    row = await ask_service.db.get_question(question_id)
+    assert row["status"] == "answered"
+
+    retry = await ask_service.answer_call_question(call_id, question_id, "ignored retry text")
+    await wait_background()
+
+    assert retry == {"status": "accepted", "question_id": question_id}
+    delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]
+    assert len(delivered) == 1
+    # The originally claimed answer wins; the retry only re-attempts delivery.
+    assert delivered[0][2] == {"status": "answered", "answer": "CVS on Market"}
+    assert call_id not in ask_service._pending_questions
+
+    third = await ask_service.answer_call_question(call_id, question_id, "again")
+    await wait_background()
+    assert third["status"] == "already_answered"
+    assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]) == 1
