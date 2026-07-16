@@ -13,7 +13,10 @@ from app.models import AnswerCallQuestionRequest, ContextPacket, PreparePhoneCal
 CONTEXT_GUIDANCE = (
     "Assemble only call-relevant facts from Poke memory and integrations. Resolve relative dates "
     "to explicit datetimes in the owner's timezone. Never invent phone numbers or facts. Never "
-    "include passwords, authentication codes, payment credentials, or government identifiers."
+    "include passwords, authentication codes, payment credentials, or government identifiers. "
+    "Write the objective from the agent's perspective as the caller: who the agent calls and what "
+    "the agent, acting for the owner, must achieve. Avoid parentheticals or phrasing that could "
+    "reassign roles between the agent and the callee."
 )
 
 
