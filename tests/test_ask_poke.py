@@ -268,6 +268,25 @@ async def test_watchdog_carve_out_skips_stale_while_question_pending(ask_service
 
 
 @pytest.mark.asyncio
+async def test_watchdog_carve_out_skips_while_question_delivering(ask_service, packet):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    stale = datetime.now(UTC) - timedelta(minutes=1)
+    await ask_service.db.execute(
+        "UPDATE calls SET last_event_at=? WHERE call_id=?",
+        (stale.isoformat(), call_id),
+    )
+    ask_service._pending_questions[call_id] = PendingQuestion(
+        question_id="q_deliver",
+        tool_call_id="tc_deliver",
+        deadline_monotonic=time.monotonic() - WATCHDOG_QUESTION_GRACE_SECONDS - 1.0,
+        delivering=True,
+    )
+
+    await ask_service._watchdog_once()
+    assert (await ask_service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+
+
+@pytest.mark.asyncio
 async def test_ask_poke_while_voice_end_pending_returns_call_ending(ask_service, packet):
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     ask_service._voice_end_pending[call_id] = ("end_tool", None)
@@ -356,6 +375,39 @@ async def test_wait_for_call_event_wakes_on_terminal(ask_service, packet):
     assert result["terminal"] is True
     assert "get_call_result" in result["next_action"]
     assert call_id not in ask_service._event_notifiers
+
+
+@pytest.mark.asyncio
+async def test_wait_for_call_event_terminating_is_not_terminal(ask_service, packet):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.TERMINATING)
+
+    result = await ask_service.wait_for_call_event(call_id, after_sequence=0, timeout_seconds=0.05)
+
+    assert result["terminal"] is False
+    assert result["state"] == CallState.TERMINATING.value
+    assert "get_call_result" not in result["next_action"]
+    assert "re-enter wait_for_call_event" in result["next_action"]
+
+
+@pytest.mark.asyncio
+async def test_answer_rejected_while_call_terminating(ask_service, packet):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_term_race")
+    rows = await ask_service.db.get_questions_after(call_id, 0)
+    question_id = rows[0]["question_id"]
+
+    await ask_service.db.execute(
+        "UPDATE calls SET state=?, termination_claimed=1 WHERE call_id=?",
+        (CallState.TERMINATING.value, call_id),
+    )
+
+    result = await ask_service.answer_call_question(call_id, question_id, "too late")
+    await wait_background()
+
+    assert result["status"] == "call_ended"
+    row = await ask_service.db.get_question(question_id)
+    assert row["status"] == "pending"
+    assert not any(r[1] == "tc_term_race" for r in ask_service._test_realtime.tool_results)
 
 
 @pytest.mark.asyncio
@@ -469,3 +521,33 @@ async def test_duplicate_tool_call_id_reports_duplicate_error(ask_service, packe
     results = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_dup"]
     assert results[-1][2] == {"status": "error", "error": "duplicate_tool_call"}
     assert await ask_service.db.count_call_questions(call_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_redelivered_pending_ask_is_idempotent(ask_service, packet):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_redeliver")
+    await wait_background()
+    rows = await ask_service.db.get_questions_after(call_id, 0)
+    question_id = rows[0]["question_id"]
+    before_results = list(ask_service._test_realtime.tool_results)
+
+    await _ask(
+        ask_service,
+        call_id,
+        tool_call_id="tc_redeliver",
+        question="What is the owner's preferred pharmacy?",
+    )
+    await wait_background()
+
+    assert ask_service._test_realtime.tool_results == before_results
+    assert await ask_service.db.count_call_questions(call_id) == 1
+    assert call_id in ask_service._pending_questions
+    assert ask_service._pending_questions[call_id].question_id == question_id
+
+    accepted = await ask_service.answer_call_question(call_id, question_id, "Walgreens")
+    await wait_background()
+    assert accepted["status"] == "accepted"
+    delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_redeliver"]
+    assert len(delivered) == 1
+    assert delivered[0][2] == {"status": "answered", "answer": "Walgreens"}
