@@ -10,11 +10,11 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from time import monotonic_ns
 from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.call_activity import CallActivityTracker
 from app.db import (
     TRANSFER_ELIGIBLE_STATES,
     Database,
@@ -46,8 +46,6 @@ from app.twilio_bridge import TwilioBridge
 
 logger = logging.getLogger(__name__)
 
-CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS = 15 * 60
-CALL_ACTIVITY_TOMBSTONE_MAX = 4096
 OWNER_JOIN_TIMEOUT_SECONDS = 30
 # Over SIP, response.done marks the end of audio *generation*; playback to the phone lags
 # behind because OpenAI drains a server-side output buffer in real time. Termination after a
@@ -115,10 +113,11 @@ class CallService:
         self._owns_exa_client = exa is None
         self.exa = exa if exa is not None else ExaSearchClient(settings)
         self.twilio = twilio or TwilioBridge(settings)
-        self._latest_call_activity: dict[str, LatencyMark] = {}
-        self._dirty_call_activity: dict[str, LatencyMark] = {}
-        self._watchdog_claims: set[str] = set()
-        self._activity_tombstones: OrderedDict[str, int] = OrderedDict()
+        self._activity = CallActivityTracker(
+            self.db,
+            is_audio_drain_active=lambda call_id: call_id in self._audio_drain_terminations,
+            clear_audio_drain=lambda call_id: self._audio_drain_terminations.pop(call_id, None),
+        )
         self.realtime = RealtimeBridge(
             settings,
             self.openai,
@@ -143,9 +142,6 @@ class CallService:
         self._opening_transition_locks: dict[str, asyncio.Lock] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
-        self._active_response_ids: dict[str, str | None] = {}
-        self._sip_output_playing: set[str] = set()
-        self._inflight_tools: set[str] = set()
         self._tool_seen_calls: set[str] = set()
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
@@ -233,99 +229,68 @@ class CallService:
 
         task.add_done_callback(finished)
 
+    # -- Legacy call-activity delegators -----------------------------------
+    # Kept under their original names because RealtimeBridge wiring
+    # (on_activity=self._note_call_activity) and tests bind/patch these
+    # directly. Internal call sites in this class use self._activity.<method>
+    # instead of routing back through these.
+
     def _note_call_activity(self, call_id: str, mark: LatencyMark | None = None) -> bool:
-        # A watchdog claim is the liveness linearization point. Activity observed
-        # before the claim updates these maps; activity after it cannot resurrect a
-        # call whose timeout teardown has already won.
-        self._prune_activity_tombstones()
-        if call_id in self._watchdog_claims or call_id in self._activity_tombstones:
-            return False
-        observed = mark or LatencyMark.now()
-        latest = self._latest_call_activity.get(call_id)
-        if latest is not None and latest.monotonic_ns >= observed.monotonic_ns:
-            return True
-        self._latest_call_activity[call_id] = observed
-        dirty = self._dirty_call_activity.get(call_id)
-        if dirty is None or dirty.monotonic_ns < observed.monotonic_ns:
-            self._dirty_call_activity[call_id] = observed
-        return True
+        return self._activity.note(call_id, mark)
 
     def _assistant_work_is_live(self, call_id: str) -> bool:
-        """True when the assistant is generating, playing SIP audio, or awaiting a tool.
-
-        The 15s stale watchdog only sees sideband/Twilio heartbeats. SIP media and
-        in-flight tool waits can leave that clock idle while the callee still hears
-        (or is about to hear) the assistant, so those states must count as live.
-        """
-        return (
-            call_id in self._active_response_ids
-            or call_id in self._sip_output_playing
-            or call_id in self._audio_drain_terminations
-            or call_id in self._inflight_tools
-        )
+        return self._activity.assistant_work_is_live(call_id)
 
     def _clear_assistant_work(self, call_id: str) -> None:
-        self._active_response_ids.pop(call_id, None)
-        self._sip_output_playing.discard(call_id)
-        self._audio_drain_terminations.pop(call_id, None)
-        self._inflight_tools.discard(call_id)
+        self._activity.clear_assistant_work(call_id)
 
     def _clear_call_activity(self, call_id: str) -> None:
-        self._latest_call_activity.pop(call_id, None)
-        self._dirty_call_activity.pop(call_id, None)
-        self._watchdog_claims.discard(call_id)
+        self._activity.clear(call_id)
 
     def _tombstone_call_activity(self, call_id: str) -> None:
-        now_ns = monotonic_ns()
-        self._prune_activity_tombstones(now_ns)
-        self._activity_tombstones.pop(call_id, None)
-        self._activity_tombstones[call_id] = now_ns + (
-            CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS * 1_000_000_000
-        )
-        while len(self._activity_tombstones) > CALL_ACTIVITY_TOMBSTONE_MAX:
-            self._activity_tombstones.popitem(last=False)
-        self._clear_assistant_work(call_id)
-        self._clear_call_activity(call_id)
+        self._activity.tombstone(call_id)
 
     def _prune_activity_tombstones(self, now_ns: int | None = None) -> None:
-        cutoff = monotonic_ns() if now_ns is None else now_ns
-        while self._activity_tombstones:
-            _, expires_at = next(iter(self._activity_tombstones.items()))
-            if expires_at > cutoff:
-                break
-            self._activity_tombstones.popitem(last=False)
+        self._activity.prune_tombstones(now_ns)
 
     @staticmethod
     def _call_activity_is_closed(call: dict[str, Any]) -> bool:
-        state = CallState(call["state"])
-        return state == CallState.TERMINATING or state in TERMINAL_STATES
+        return CallActivityTracker.is_closed(call)
 
     async def _flush_call_activity(self) -> None:
-        if not self._dirty_call_activity:
-            return
-        pending = self._dirty_call_activity
-        self._dirty_call_activity = {}
-        try:
-            await self.db.touch_calls(
-                (call_id, mark.occurred_at) for call_id, mark in pending.items()
-            )
-        except BaseException as exc:
-            # Keep the newest observation if more activity arrived while the write
-            # was in flight. A terminal cleanup removes the latest map entry and
-            # therefore prevents a failed flush from re-adding a dead call.
-            for call_id, failed_mark in pending.items():
-                latest = self._latest_call_activity.get(call_id)
-                if latest is None:
-                    continue
-                candidate = (
-                    latest if latest.monotonic_ns >= failed_mark.monotonic_ns else failed_mark
-                )
-                current = self._dirty_call_activity.get(call_id)
-                if current is None or current.monotonic_ns < candidate.monotonic_ns:
-                    self._dirty_call_activity[call_id] = candidate
-            if not isinstance(exc, Exception):
-                raise
-            logger.warning("failed to persist batched call activity", exc_info=True)
+        await self._activity.flush()
+
+    # -- Legacy call-activity attribute properties ---------------------------
+    # Forward to the tracker so external code (mainly tests) that reads or
+    # mutates-in-place these dict/set attributes on the service keeps working.
+
+    @property
+    def _latest_call_activity(self) -> dict[str, LatencyMark]:
+        return self._activity.latest
+
+    @property
+    def _dirty_call_activity(self) -> dict[str, LatencyMark]:
+        return self._activity.dirty
+
+    @property
+    def _watchdog_claims(self) -> set[str]:
+        return self._activity.watchdog_claims
+
+    @property
+    def _activity_tombstones(self) -> OrderedDict[str, int]:
+        return self._activity.tombstones
+
+    @property
+    def _active_response_ids(self) -> dict[str, str | None]:
+        return self._activity.active_response_ids
+
+    @property
+    def _sip_output_playing(self) -> set[str]:
+        return self._activity.sip_output_playing
+
+    @property
+    def _inflight_tools(self) -> set[str]:
+        return self._activity.inflight_tools
 
     async def _record_latency(
         self,
@@ -643,16 +608,16 @@ class CallService:
         bail out (clearing or tombstoning activity as appropriate) if the call is gone,
         already closed, or activity lost the liveness race. Returns the call row to
         keep processing, or None when the caller should return immediately."""
-        if not self._note_call_activity(call_id, received):
+        if not self._activity.note(call_id, received):
             return None
         call = await self.db.get_call(call_id)
         if call is None:
-            self._clear_call_activity(call_id)
+            self._activity.clear(call_id)
             return None
-        if self._call_activity_is_closed(call):
-            self._tombstone_call_activity(call_id)
+        if self._activity.is_closed(call):
+            self._activity.tombstone(call_id)
             return None
-        if not self._note_call_activity(call_id, received):
+        if not self._activity.note(call_id, received):
             return None
         return call
 
@@ -853,7 +818,7 @@ class CallService:
                         # same lock. Otherwise AMD was persisted first and the atomic opening
                         # claim cannot succeed after this voicemail write.
                         if current.get("opening_sent"):
-                            response_id = self._active_response_ids.pop(call_id, None)
+                            response_id = self._activity.active_response_ids.pop(call_id, None)
                             await self.realtime.cancel_response(call_id, response_id)
                         await self.realtime.create_voicemail(call_id)
             finally:
@@ -868,7 +833,7 @@ class CallService:
         # Reader already heartbeats on frame arrival; re-assert here for assistant speech
         # so dispatcher-only paths (and sparse SIP sidebands) still refresh the watchdog.
         if event_type in ASSISTANT_SPEECH_EVENT_TYPES:
-            self._note_call_activity(call_id, received)
+            self._activity.note(call_id, received)
         if event_type in {
             "response.output_audio_transcript.delta",
             "response.output_audio_transcript.done",
@@ -922,7 +887,7 @@ class CallService:
                 await self.db.mark_tool_continuation_observed(call_id)
             response = event.get("response") or {}
             response_id = response.get("id") or event.get("response_id")
-            self._active_response_ids[call_id] = response_id
+            self._activity.active_response_ids[call_id] = response_id
             pending = self._voice_end_pending.get(call_id)
             if pending and pending[1] is None and response_id:
                 self._voice_end_pending[call_id] = (pending[0], response_id)
@@ -931,7 +896,7 @@ class CallService:
             response = event.get("response") or {}
             status = response.get("status")
             if event_type == "response.done":
-                self._active_response_ids.pop(call_id, None)
+                self._activity.active_response_ids.pop(call_id, None)
             if status in {"cancelled", "canceled"}:
                 await self.db.update_call(call_id, interruption_observed=1)
             elif status == "failed":
@@ -952,9 +917,9 @@ class CallService:
                     "voicemail_left",
                 )
         elif event_type == "output_audio_buffer.started":
-            self._sip_output_playing.add(call_id)
+            self._activity.sip_output_playing.add(call_id)
         elif event_type in {"output_audio_buffer.stopped", "output_audio_buffer.cleared"}:
-            self._sip_output_playing.discard(call_id)
+            self._activity.sip_output_playing.discard(call_id)
             self._handle_output_audio_drained(call_id, event)
         elif event_type in {"session.ended", "call.ended"}:
             self._spawn(
@@ -977,7 +942,7 @@ class CallService:
         sent = LatencyMark.now()
         # Outbound control (response.create, tool results) is proof the call is live even
         # when the SIP sideband is quiet between assistant audio frames.
-        self._note_call_activity(call_id, sent)
+        self._activity.note(call_id, sent)
         event_type = event.get("type")
         if event_type == "response.create":
             self._queue_latency(call_id, LatencyStage.FIRST_RESPONSE_CREATE, sent)
@@ -1148,8 +1113,8 @@ class CallService:
             LatencyMark.now(),
             event_key=event_key,
         )
-        self._inflight_tools.add(call_id)
-        self._note_call_activity(call_id)
+        self._activity.inflight_tools.add(call_id)
+        self._activity.note(call_id)
         try:
             result = await self.exa.search(request.query)
             output = result.output
@@ -1170,8 +1135,8 @@ class CallService:
             logger.exception("unexpected Exa search failure call_id=%s", call_id)
             output = {"ok": False, "error": "search_unavailable"}
         finally:
-            self._inflight_tools.discard(call_id)
-            self._note_call_activity(call_id)
+            self._activity.inflight_tools.discard(call_id)
+            self._activity.note(call_id)
             self._queue_latency(
                 call_id,
                 LatencyStage.EXA_SEARCH_COMPLETED,
@@ -1470,9 +1435,9 @@ class CallService:
         # An out-of-band function_call_output + response.create must not collide with a
         # VAD-triggered response already in flight: OpenAI rejects the create and the
         # generic error branch would terminate the call.
-        if call_id not in self._active_response_ids:
+        if call_id not in self._activity.active_response_ids:
             return
-        response_id = self._active_response_ids.pop(call_id, None)
+        response_id = self._activity.active_response_ids.pop(call_id, None)
         try:
             await self.realtime.cancel_response(call_id, response_id)
         except Exception:
@@ -1520,7 +1485,7 @@ class CallService:
             LatencyMark.now(),
             event_key=str(question_row["question_id"]),
         )
-        self._note_call_activity(call_id)
+        self._activity.note(call_id)
         self._clear_pending_question(call_id, question_row["question_id"])
         self._notify_call_event(call_id)
 
@@ -1565,7 +1530,7 @@ class CallService:
             LatencyMark.now(),
             event_key=question_id,
         )
-        self._note_call_activity(call_id)
+        self._activity.note(call_id)
         self._clear_pending_question(call_id, question_id)
         self._notify_call_event(call_id)
 
@@ -1669,7 +1634,7 @@ class CallService:
         if status == "cancelled":
             return {"status": "call_ended"}
         call = await self.db.get_call(call_id)
-        if call is None or self._call_activity_is_closed(call):
+        if call is None or self._activity.is_closed(call):
             return {"status": "call_ended"}
         # Pending claim lost to a concurrent race without a readable winner — treat as
         # already handled so Poke can advance rather than retry forever.
@@ -2595,11 +2560,11 @@ class CallService:
         if call is None:
             current = await self.db.get_call(call_id)
             if current is None:
-                self._clear_call_activity(call_id)
+                self._activity.clear(call_id)
             elif CallState(current["state"]) in TERMINAL_STATES or current.get(
                 "termination_claimed"
             ):
-                self._tombstone_call_activity(call_id)
+                self._activity.tombstone(call_id)
             return False
 
         # An ordinary termination can only claim a pre-promotion transfer. Stop its
@@ -2701,7 +2666,7 @@ class CallService:
         Must run with no intervening await so nothing can observe a call as both
         terminal in the database and still tracked as in-flight here.
         """
-        self._tombstone_call_activity(call_id)
+        self._activity.tombstone(call_id)
         self._owner_join_events.pop(call_id, None)
         self._owner_departure_events.pop(call_id, None)
         self._owner_expected_sids.pop(call_id, None)
@@ -2734,7 +2699,7 @@ class CallService:
         # These two clears run before any media teardown I/O so the call stops looking
         # live to the watchdog/activity trackers immediately, not only once the (slow)
         # teardown below finishes.
-        self._tombstone_call_activity(call_id)
+        self._activity.tombstone(call_id)
         self._voice_end_pending.pop(call_id, None)
         conference_failed = await self._teardown_call_media(
             call, preserve_conference=preserve_conference
@@ -3068,7 +3033,7 @@ class CallService:
                     task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             await asyncio.sleep(0)
-        await self._flush_call_activity()
+        await self._activity.flush()
         try:
             if self._owns_exa_client:
                 await self.exa.close()
@@ -3082,7 +3047,7 @@ class CallService:
             await self._watchdog_once()
 
     async def _watchdog_once(self) -> None:
-        await self._flush_call_activity()
+        await self._activity.flush()
         now = LatencyMark.now()
         cutoff = datetime.fromisoformat(now.occurred_at) - timedelta(
             seconds=self.settings.watchdog_stale_seconds
@@ -3091,8 +3056,8 @@ class CallService:
         calls = await self.db.list_nonterminal_calls()
         for call in calls:
             call_id = call["call_id"]
-            if self._call_activity_is_closed(call):
-                self._tombstone_call_activity(call_id)
+            if self._activity.is_closed(call):
+                self._activity.tombstone(call_id)
                 continue
             pending = self._pending_questions.get(call_id)
             if pending is not None and (
@@ -3104,12 +3069,12 @@ class CallService:
                 continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue
-            if self._assistant_work_is_live(call_id):
+            if self._activity.assistant_work_is_live(call_id):
                 # SIP playback / tool waits can exceed the heartbeat gap without sideband
                 # frames. Refresh liveness so durable last_event_at stays aligned.
-                self._note_call_activity(call_id, now)
+                self._activity.note(call_id, now)
                 continue
-            activity_before = self._latest_call_activity.get(call_id)
+            activity_before = self._activity.latest.get(call_id)
             if (
                 activity_before is not None
                 and now.monotonic_ns - activity_before.monotonic_ns <= stale_ns
@@ -3120,17 +3085,17 @@ class CallService:
             # Re-read both durable and in-memory liveness before claiming timeout.
             current = await self.db.get_call(call_id)
             if current is None:
-                self._clear_call_activity(call_id)
+                self._activity.clear(call_id)
                 continue
-            if self._call_activity_is_closed(current):
-                self._tombstone_call_activity(call_id)
+            if self._activity.is_closed(current):
+                self._activity.tombstone(call_id)
                 continue
             if datetime.fromisoformat(current["last_event_at"]) >= cutoff:
                 continue
-            if self._assistant_work_is_live(call_id):
-                self._note_call_activity(call_id, now)
+            if self._activity.assistant_work_is_live(call_id):
+                self._activity.note(call_id, now)
                 continue
-            activity_after = self._latest_call_activity.get(call_id)
+            activity_after = self._activity.latest.get(call_id)
             if activity_after is not None:
                 changed = (
                     activity_before is None
@@ -3142,10 +3107,10 @@ class CallService:
 
             # No await is allowed between the final monotonic check and this claim.
             # That makes all pre-claim activity win and all post-claim activity lose.
-            self._watchdog_claims.add(call_id)
+            self._activity.watchdog_claims.add(call_id)
             terminated = False
             try:
                 terminated = await self.terminate_call(call_id, "watchdog_stale")
             finally:
                 if not terminated:
-                    self._watchdog_claims.discard(call_id)
+                    self._activity.watchdog_claims.discard(call_id)

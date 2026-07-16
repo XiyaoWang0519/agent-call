@@ -324,10 +324,10 @@ async def test_twilio_arrival_blocked_on_read_prevents_watchdog_timeout(
 async def test_activity_tombstones_are_bounded_expire_and_safely_reform(
     service, packet, monkeypatch
 ):
-    monkeypatch.setattr("app.call_state.CALL_ACTIVITY_TOMBSTONE_MAX", 2)
-    monkeypatch.setattr("app.call_state.CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS", 1)
+    monkeypatch.setattr("app.call_activity.CALL_ACTIVITY_TOMBSTONE_MAX", 2)
+    monkeypatch.setattr("app.call_activity.CALL_ACTIVITY_TOMBSTONE_TTL_SECONDS", 1)
     clock = [100]
-    monkeypatch.setattr("app.call_state.monotonic_ns", lambda: clock[0])
+    monkeypatch.setattr("app.call_activity.monotonic_ns", lambda: clock[0])
     call_ids = [f"call_tombstone_{index}" for index in range(3)]
 
     for index, call_id in enumerate(call_ids):
