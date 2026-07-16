@@ -1,6 +1,43 @@
 # Poke Phone-Call Bridge
 
-Single-user FastAPI + FastMCP service that lets Poke prepare, confirm, start, monitor, and end outbound phone calls for Irvin. Twilio originates an OpenAI SIP agent leg into a private conference, the service accepts and prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then dials the callee. SQLite stores plans, state, ordered transcripts, and deterministic final results.
+<p align="center">
+  <a href="https://poke.com"><img src="docs/images/poke-og.jpg" alt="Poke" width="720"/></a>
+</p>
+
+<p align="center">
+  <img src="docs/images/poke-icon.png" alt="Poke" height="64"/>
+</p>
+
+Single-user FastAPI + FastMCP service that lets [Poke](https://poke.com) prepare, confirm, start, monitor, and end outbound phone calls for Irvin. [Twilio](https://www.twilio.com) originates an [OpenAI](https://openai.com) SIP agent leg into a private conference, the service accepts and prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then dials the callee. SQLite stores plans, state, ordered transcripts, and deterministic final results.
+
+## Built with
+
+Official art from the sites this bridge calls out to:
+
+<p align="center">
+  <a href="https://developers.openai.com/api/docs/guides/realtime-sip"><img src="docs/images/openai-realtime-sip.png" alt="OpenAI Realtime API with SIP" width="49%"/></a>
+  <a href="https://developers.openai.com"><img src="docs/images/openai-developers-og.png" alt="OpenAI Developers" width="49%"/></a>
+</p>
+
+<p align="center">
+  <a href="https://www.twilio.com"><img src="docs/images/twilio-og.png" alt="Twilio" width="32%"/></a>
+  <a href="https://exa.ai"><img src="docs/images/exa-og.png" alt="Exa" width="32%"/></a>
+  <a href="https://fly.io"><img src="docs/images/fly-og.jpg" alt="Fly.io" width="32%"/></a>
+</p>
+
+<p align="center">
+  <a href="https://fastapi.tiangolo.com"><img src="docs/images/fastapi-logo.png" alt="FastAPI" height="48"/></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://astral.sh"><img src="docs/images/astral-og.jpg" alt="Astral" height="48"/></a>
+</p>
+
+- **[Poke](https://poke.com)** — MCP client, call intent, optional push
+- **[OpenAI Realtime SIP](https://developers.openai.com/api/docs/guides/realtime-sip)** — voice agent, accept, sideband control
+- **[Twilio](https://www.twilio.com)** — conference, callee dial, AMD
+- **[Exa](https://exa.ai)** — in-call public-web search
+- **[FastAPI](https://fastapi.tiangolo.com) + FastMCP** — HTTP surface and MCP tools
+- **[Fly.io](https://fly.io)** — production host and volume-backed SQLite
+- **[Astral uv / Ruff](https://astral.sh)** — package lock and lint
 
 ## Safety and operating model
 
@@ -156,3 +193,7 @@ Live-schema deviations from the original contract are intentional:
 Telephony state and extraction state remain separate. A successful phone call whose extractor fails stays `call_status=completed`, gets `finalization_status=failed`, `outcome=unknown`, retains its raw transcript, and tells the owner to review it. The service saves a telephony-only result and transcript transactionally before making the external Responses API extraction request. Only transient connection, timeout, or rate-limit failures receive one retry.
 
 Optional Poke push remains disabled by default. A push failure is logged and never changes call state or polling availability.
+
+---
+
+Brand images in `docs/images/` were fetched from official sites ([poke.com](https://poke.com), [developers.openai.com](https://developers.openai.com), [twilio.com](https://www.twilio.com), [exa.ai](https://exa.ai), [fly.io](https://fly.io), [fastapi.tiangolo.com](https://fastapi.tiangolo.com), [astral.sh](https://astral.sh)). Marks belong to their respective owners.
