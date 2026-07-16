@@ -1223,8 +1223,8 @@ class CallService:
             received=received,
             event_key=event_key,
             continuation_instructions=(
-                "The call is now ending. Briefly confirm the outcome or next step if useful, "
-                "then say one concise, natural goodbye. Do not call any function."
+                "The call is now ending. Say one short, natural goodbye and nothing else. "
+                "Do not recap details already confirmed. Do not call any function."
             ),
         )
 

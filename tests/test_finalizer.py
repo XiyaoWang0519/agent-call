@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -117,18 +118,105 @@ async def test_extractor_rejects_unknown_evidence_and_preserves_raw_transcript(
         follow_ups=[],
         confidence=0.9,
     )
-    finalizer = Finalizer(
-        settings,
-        service.db,
-        SimpleNamespace(responses=FakeResponses(parsed=parsed)),
-    )
+    responses = FakeResponses(parsed=parsed)
+    finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=responses))
     result = await finalizer.finalize(call_id)
+    assert responses.calls == 2
     assert result.call_status == "completed"
     assert result.finalization_status == "failed"
     assert result.outcome == "unknown"
     assert result.result_source == "extraction_failed"
     assert result.raw_transcript_available is True
     assert (await service.db.get_transcript(call_id))[0].text == "Reference ABC-123."
+
+
+@pytest.mark.asyncio
+async def test_extractor_unknown_evidence_retry_carries_feedback_and_can_recover(
+    settings, service, packet
+):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.add_transcript_turn(
+        call_id=call_id,
+        turn_id="turn_real",
+        speaker="callee",
+        text="Reference ABC-123.",
+        source_event_type="transcription.completed",
+        source_event_id="evt_real",
+    )
+    bad = ExtractedCallResult(
+        outcome="completed",
+        summary="Completed.",
+        commitments=[],
+        confirmation_numbers=[{"value": "ABC-123", "evidence_turn_ids": ["evt_real"]}],
+        follow_ups=[],
+        confidence=0.9,
+    )
+    good = ExtractedCallResult(
+        outcome="completed",
+        summary="Completed.",
+        commitments=[],
+        confirmation_numbers=[{"value": "ABC-123", "evidence_turn_ids": ["turn_real"]}],
+        follow_ups=[],
+        confidence=0.9,
+    )
+
+    class BadThenGood(FakeResponses):
+        def __init__(self):
+            super().__init__()
+            self.instructions_seen: list[str] = []
+
+        async def parse(inner_self, **kwargs):
+            inner_self.calls += 1
+            inner_self.instructions_seen.append(kwargs["instructions"])
+            return SimpleNamespace(output_parsed=bad if inner_self.calls == 1 else good)
+
+    responses = BadThenGood()
+    result = await Finalizer(settings, service.db, SimpleNamespace(responses=responses)).finalize(
+        call_id
+    )
+
+    assert responses.calls == 2
+    assert "evt_real" in responses.instructions_seen[1]
+    assert result.finalization_status == "succeeded"
+    assert result.result_source == "post_call_extractor"
+
+
+@pytest.mark.asyncio
+async def test_extractor_payload_exposes_only_citable_turn_fields(settings, service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.add_transcript_turn(
+        call_id=call_id,
+        turn_id="item_abc",
+        speaker="callee",
+        text="Confirmed for 7 PM.",
+        source_event_type="transcription.completed",
+        source_event_id="event_xyz",
+    )
+    parsed = ExtractedCallResult(
+        outcome="completed",
+        summary="Completed.",
+        commitments=[],
+        confirmation_numbers=[],
+        follow_ups=[],
+        confidence=0.9,
+    )
+
+    class CapturingResponses(FakeResponses):
+        def __init__(self, parsed):
+            super().__init__(parsed=parsed)
+            self.inputs: list[str] = []
+
+        async def parse(inner_self, **kwargs):
+            inner_self.inputs.append(kwargs["input"])
+            return await super().parse(**kwargs)
+
+    responses = CapturingResponses(parsed)
+    await Finalizer(settings, service.db, SimpleNamespace(responses=responses)).finalize(call_id)
+
+    payload = json.loads(responses.inputs[0])
+    assert payload["transcript"] == [
+        {"turn_id": "item_abc", "speaker": "callee", "text": "Confirmed for 7 PM."}
+    ]
 
 
 @pytest.mark.asyncio
