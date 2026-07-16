@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from openai import AsyncOpenAI
+from openai.types.webhooks import UnwrapWebhookEvent
 
 from app.call_activity import CallActivityTracker
 from app.db import (
@@ -33,6 +34,7 @@ from app.models import (
     PreparePhoneCallInput,
     PreparePhoneCallOutput,
     StartPhoneCallOutput,
+    TranscriptTurn,
     VoiceEndCallRequest,
     WebSearchRequest,
 )
@@ -2220,6 +2222,49 @@ class CallService:
                 "result": result.model_dump(mode="json"),
             }
         return {"call_id": call_id, "state": snapshot.state, "result": None}
+
+    # -- Transport-facing delegators -----------------------------------------
+    # Thin wrappers so routes never reach through the service into self.db /
+    # self.openai directly; each preserves the exact args/return/exceptions of
+    # the underlying call.
+
+    def unwrap_openai_webhook(self, payload: bytes, headers: Any) -> UnwrapWebhookEvent:
+        return self.openai.webhooks.unwrap(
+            payload,
+            headers,
+            secret=Settings.reveal(self.settings.openai_webhook_secret),
+        )
+
+    async def record_webhook_once(self, webhook_id: str) -> bool:
+        return await self.db.record_webhook_once(webhook_id)
+
+    async def resolve_webhook_call(self, call_id: str, plan_id: str) -> dict[str, Any] | None:
+        """Look up a Twilio-webhook call and confirm it maps to the given plan.
+
+        Returns the call row when it exists and matches ``plan_id``, otherwise None.
+        """
+        call = await self.db.get_call(call_id)
+        if call is None or call["plan_id"] != plan_id:
+            return None
+        return call
+
+    async def get_call_record(self, call_id: str) -> dict[str, Any] | None:
+        return await self.db.get_call(call_id)
+
+    async def get_transcript_records(self, call_id: str) -> list[TranscriptTurn]:
+        return await self.db.get_transcript(call_id)
+
+    async def get_latency_event_records(self, call_id: str) -> list[dict[str, Any]]:
+        return await self.db.get_latency_events(call_id)
+
+    async def list_call_records(self, limit: int = 100) -> list[dict[str, Any]]:
+        return await self.db.list_calls(limit)
+
+    async def acquire_deployment_lock(self) -> int:
+        return await self.db.acquire_deployment_lock()
+
+    async def release_deployment_lock(self) -> None:
+        await self.db.release_deployment_lock()
 
     async def _setup_deadline(self, call_id: str) -> None:
         await asyncio.sleep(self.settings.setup_deadline_seconds)
