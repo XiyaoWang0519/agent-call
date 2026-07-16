@@ -177,7 +177,7 @@ async def test_voicemail_prompt_does_not_script_identity_or_callback_wording(set
     assert "callback" not in instructions
 
 
-def test_session_prompt_leaves_opening_identity_and_wording_to_poke(settings, packet):
+def test_session_prompt_anchors_caller_role_without_scripting_wording(settings, packet):
     instructions = (
         RealtimeBridge(
             settings,
@@ -190,8 +190,9 @@ def test_session_prompt_leaves_opening_identity_and_wording_to_poke(settings, pa
         .instructions
     )
 
-    assert "Choose how to open the call from the approved context" in instructions
-    assert "# Identity and disclosure" not in instructions
+    assert "# Role" in instructions
+    assert "You are always the caller" in instructions
+    assert "# Opening" in instructions
     assert "Always identify yourself" not in instructions
     assert "You are Poke" not in instructions
     assert "Am I speaking with" not in instructions
