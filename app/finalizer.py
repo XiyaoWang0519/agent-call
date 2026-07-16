@@ -26,6 +26,12 @@ from app.settings import Settings
 logger = logging.getLogger(__name__)
 
 
+class UnknownEvidenceError(ValueError):
+    def __init__(self, unknown_ids: set[str]):
+        self.unknown_ids = unknown_ids
+        super().__init__(f"extractor cited unknown transcript turn_ids: {sorted(unknown_ids)}")
+
+
 class Finalizer:
     def __init__(self, settings: Settings, db: Database, openai: AsyncOpenAI):
         self.settings = settings
@@ -159,13 +165,26 @@ class Finalizer:
             "duration_seconds": call.get("duration_seconds"),
             "transfer_outcome": call.get("transfer_outcome"),
             "realtime_advisory_outcome": call.get("advisory_outcome"),
-            "transcript": [turn.model_dump(mode="json") for turn in transcript],
+            # Only the citable id is exposed; source_event_id and friends are omitted so
+            # the extractor cannot confuse a similar-looking id namespace with turn_id.
+            "transcript": [
+                {"turn_id": turn.turn_id, "speaker": turn.speaker, "text": turn.text}
+                for turn in transcript
+            ],
         }
+        last_unknown: list[str] = []
         for attempt in range(2):
+            instructions = EXTRACTOR_INSTRUCTIONS
+            if last_unknown:
+                instructions += (
+                    "\nYour previous attempt cited turn_ids that do not exist in the "
+                    f"transcript: {', '.join(last_unknown)}. Cite only exact turn_id "
+                    "values that appear in the provided transcript entries."
+                )
             try:
                 response = await self.openai.responses.parse(
                     model=self.settings.extractor_model,
-                    instructions=EXTRACTOR_INSTRUCTIONS,
+                    instructions=instructions,
                     input=json.dumps(payload, ensure_ascii=False),
                     text_format=ExtractedCallResult,
                     store=False,
@@ -174,15 +193,25 @@ class Finalizer:
                 parsed = response.output_parsed
                 if parsed is None:
                     raise ValueError("extractor returned no parsed output")
-                for group in (
-                    parsed.commitments,
-                    parsed.confirmation_numbers,
-                    parsed.follow_ups,
-                ):
-                    for item in group:
-                        if not set(item.evidence_turn_ids).issubset(evidence_ids):
-                            raise ValueError("extractor cited an unknown transcript turn_id")
+                unknown = {
+                    turn_id
+                    for group in (
+                        parsed.commitments,
+                        parsed.confirmation_numbers,
+                        parsed.follow_ups,
+                    )
+                    for item in group
+                    for turn_id in item.evidence_turn_ids
+                    if turn_id not in evidence_ids
+                }
+                if unknown:
+                    raise UnknownEvidenceError(unknown)
                 return parsed
+            except UnknownEvidenceError as exc:
+                if attempt == 0:
+                    last_unknown = sorted(exc.unknown_ids)
+                    continue
+                raise
             except Exception as exc:
                 if attempt == 0 and self._retryable_extraction_error(exc):
                     await asyncio.sleep(0.25)

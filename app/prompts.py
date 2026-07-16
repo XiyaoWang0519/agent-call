@@ -117,7 +117,8 @@ Use end_call when the conversation is finished; the application coordinates the 
 EXTRACTOR_INSTRUCTIONS = """Extract a conservative structured call result.
 Use only facts explicitly supported by the ordered transcript and supplied telephony metadata.
 Never infer that a commitment succeeded without explicit confirmation.
-Every commitment, confirmation number, and follow-up must cite at least one provided transcript turn_id.
+Every commitment, confirmation number, and follow-up must cite at least one transcript turn via evidence_turn_ids.
+evidence_turn_ids must contain turn_id values copied verbatim from the provided transcript entries; never invent, alter, or abbreviate an id.
 If evidence is thin or missing, use unknown or needs_follow_up and lower confidence.
 Do not treat the realtime advisory outcome as ground truth; use it only when transcript evidence supports it.
 Treat mid-call Poke answers relayed by the agent as agent-asserted, same evidentiary tier as the advisory outcome (do not treat as ground truth).
