@@ -13,6 +13,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastmcp import FastMCP
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+# Bound in-memory probe retention so a long-running process cannot grow without limit.
+MAX_PROBES = 50
+PROBE_TTL_SECONDS = 3600.0
+
 
 @dataclass
 class Probe:
@@ -54,7 +58,31 @@ class BearerAuthMiddleware:
         await send({"type": "http.response.body", "body": b'{"detail":"unauthorized"}'})
 
 
+def _prune_probes(now: float | None = None) -> None:
+    """Drop stale/completed probes and enforce a hard cap on retained entries."""
+    clock = time.monotonic() if now is None else now
+    stale = [
+        probe_id
+        for probe_id, probe in PROBES.items()
+        if clock - probe.started_at > PROBE_TTL_SECONDS
+        or (
+            probe.answer_received_at is not None
+            and clock - probe.answer_received_at > PROBE_TTL_SECONDS
+        )
+    ]
+    for probe_id in stale:
+        PROBES.pop(probe_id, None)
+    if len(PROBES) <= MAX_PROBES:
+        return
+    overflow = sorted(PROBES.values(), key=lambda probe: probe.started_at)[
+        : len(PROBES) - MAX_PROBES
+    ]
+    for probe in overflow:
+        PROBES.pop(probe.probe_id, None)
+
+
 def require_probe(probe_id: str) -> Probe:
+    _prune_probes()
     probe = PROBES.get(probe_id)
     if probe is None:
         raise ValueError("unknown probe_id")
@@ -87,12 +115,13 @@ async def start_ask_poke_probe(question: str, delay_seconds: float = 5.0) -> dic
         raise ValueError("question must contain 1-500 characters")
     if not 1 <= delay_seconds <= 25:
         raise ValueError("delay_seconds must be between 1 and 25")
+    _prune_probes()
     probe_id = uuid4().hex
     PROBES[probe_id] = Probe(
         probe_id=probe_id,
         question=" ".join(question.split()),
         delay_seconds=delay_seconds,
-        started_at=time.time(),
+        started_at=time.monotonic(),
     )
     return {
         "status": "started",
@@ -117,19 +146,19 @@ async def wait_for_ask_poke_probe(probe_id: str, timeout_seconds: float = 20.0) 
     if probe.answer_received_at is not None:
         return {"status": "answered", "probe_id": probe_id, "timing": timing(probe)}
     if probe.wait_entered_at is None:
-        probe.wait_entered_at = time.time()
+        probe.wait_entered_at = time.monotonic()
     timeout_seconds = min(max(timeout_seconds, 0.0), 25.0)
     ready_at = probe.started_at + probe.delay_seconds
-    remaining = max(0.0, ready_at - time.time())
+    remaining = max(0.0, ready_at - time.monotonic())
     await asyncio.sleep(min(remaining, timeout_seconds))
-    if time.time() < ready_at:
+    if time.monotonic() < ready_at:
         return {
             "status": "idle",
             "probe_id": probe_id,
             "next_action": "Call wait_for_ask_poke_probe again with the same probe_id.",
         }
     if probe.question_returned_at is None:
-        probe.question_returned_at = time.time()
+        probe.question_returned_at = time.monotonic()
     return {
         "status": "question",
         "probe_id": probe_id,
@@ -152,7 +181,7 @@ async def submit_ask_poke_probe_answer(probe_id: str, answer: str) -> dict:
     if not answer.strip() or len(answer) > 4096:
         raise ValueError("answer must contain 1-4096 characters")
     if probe.answer_received_at is None:
-        probe.answer_received_at = time.time()
+        probe.answer_received_at = time.monotonic()
         probe.answer = " ".join(answer.split())
     return {
         "status": "completed",
@@ -196,6 +225,7 @@ async def probe_results(request: Request) -> dict:
     supplied = request.headers.get("authorization", "")
     if not secrets.compare_digest(supplied, f"Bearer {BEARER_TOKEN}"):
         raise HTTPException(status_code=401, detail="unauthorized")
+    _prune_probes()
     return {
         "probes": [{"probe": asdict(probe), "timing": timing(probe)} for probe in PROBES.values()]
     }

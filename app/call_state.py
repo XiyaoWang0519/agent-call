@@ -1860,9 +1860,10 @@ class CallService:
         if row is None:
             # Lost the claim (answered, cancelled, or termination owns the call and
             # will cancel it); drop a stale watchdog carve-out entry left behind if
-            # resolution raced our registration.
+            # resolution raced our registration. Not a cancellation — the winner
+            # already owns the final status.
             logger.info(
-                "ask_poke question cancelled call_id=%s question_id=%s "
+                "ask_poke question expiry claim lost call_id=%s question_id=%s "
                 "reason=expiry_claim_lost_race",
                 call_id,
                 question_id,
@@ -2106,7 +2107,13 @@ class CallService:
                 call_id,
                 question_id,
             )
-            return {"status": "already_answered"}
+            return {
+                "status": "already_answered",
+                "next_action": (
+                    "Question already answered. Resume polling: call wait_for_call_event "
+                    f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                ),
+            }
         if status == "expired":
             logger.info(
                 "answer_call_question expired call_id=%s question_id=%s",
@@ -2116,6 +2123,10 @@ class CallService:
             return {
                 "status": "expired",
                 "detail": "timeout already sent to the agent",
+                "next_action": (
+                    "Answer window already expired. Resume polling: call wait_for_call_event "
+                    f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                ),
             }
         if status == "cancelled":
             logger.info(
@@ -2141,7 +2152,13 @@ class CallService:
             call_id,
             question_id,
         )
-        return {"status": "already_answered"}
+        return {
+            "status": "already_answered",
+            "next_action": (
+                "Question already handled. Resume polling: call wait_for_call_event "
+                f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+            ),
+        }
 
     async def _handle_voice_end_response_done(self, call_id: str, event: dict[str, Any]) -> None:
         pending = self._voice_end_pending.get(call_id)

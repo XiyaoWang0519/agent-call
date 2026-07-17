@@ -124,6 +124,8 @@ async def test_timeout_exactly_once_then_answer_is_expired(ask_service, packet):
     late = await ask_service.answer_call_question(call_id, question_id, "too late")
     await wait_background()
     assert late["status"] == "expired"
+    assert "wait_for_call_event" in late["next_action"]
+    assert f"after_sequence={row['sequence_number']}" in late["next_action"]
     assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_timeout"]) == 1
 
 
@@ -161,6 +163,8 @@ async def test_duplicate_answer_idempotent_and_unknown_question_errors(ask_servi
     await wait_background()
     assert first["status"] == "accepted"
     assert second["status"] == "already_answered"
+    assert "wait_for_call_event" in second["next_action"]
+    assert f"after_sequence={rows[0]['sequence_number']}" in second["next_action"]
     assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_1"]) == 1
 
     with pytest.raises(LookupError, match="unknown question"):
@@ -656,6 +660,7 @@ async def test_failed_answer_delivery_is_retryable(ask_service, packet):
     third = await ask_service.answer_call_question(call_id, question_id, "again")
     await wait_background()
     assert third["status"] == "already_answered"
+    assert "wait_for_call_event" in third["next_action"]
     assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]) == 1
 
 
