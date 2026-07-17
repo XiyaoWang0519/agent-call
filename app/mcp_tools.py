@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 
 from fastmcp import FastMCP
@@ -9,6 +10,8 @@ from pydantic import ValidationError
 
 from app.call_state import CallService
 from app.models import AnswerCallQuestionRequest, ContextPacket, PreparePhoneCallInput
+
+logger = logging.getLogger(__name__)
 
 CONTEXT_GUIDANCE = (
     "Assemble only call-relevant facts from Poke memory and integrations. Resolve relative dates "
@@ -115,18 +118,43 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         after_sequence: int = 0,
         timeout_seconds: float = 20.0,
     ) -> dict:
+        logger.info(
+            "mcp tool wait_for_call_event call_id=%s after_sequence=%s timeout_seconds=%s",
+            call_id,
+            after_sequence,
+            timeout_seconds,
+        )
         try:
-            return await get_service().wait_for_call_event(
+            result = await get_service().wait_for_call_event(
                 call_id,
                 after_sequence=after_sequence,
                 timeout_seconds=timeout_seconds,
             )
         except LookupError as exc:
+            logger.info(
+                "mcp tool wait_for_call_event call_not_found call_id=%s",
+                call_id,
+            )
             raise ToolError(json.dumps({"code": "call_not_found", "message": str(exc)})) from exc
         except ValueError as exc:
+            logger.info(
+                "mcp tool wait_for_call_event invalid_call_state call_id=%s error=%s",
+                call_id,
+                exc,
+            )
             raise ToolError(
                 json.dumps({"code": "invalid_call_state", "message": str(exc)})
             ) from exc
+        logger.info(
+            "mcp tool wait_for_call_event completed call_id=%s state=%s terminal=%s "
+            "event_count=%s next_after_sequence=%s",
+            call_id,
+            result.get("state"),
+            result.get("terminal"),
+            len(result.get("events") or ()),
+            result.get("next_after_sequence"),
+        )
+        return result
 
     @mcp.tool(
         name="answer_call_question",
@@ -137,6 +165,12 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         ),
     )
     async def answer_call_question(call_id: str, question_id: str, answer: str) -> dict:
+        logger.info(
+            "mcp tool answer_call_question call_id=%s question_id=%s answer_chars=%s",
+            call_id,
+            question_id,
+            len(answer),
+        )
         try:
             request = AnswerCallQuestionRequest(
                 call_id=call_id,
@@ -144,16 +178,40 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
                 answer=answer,
             )
         except ValidationError as exc:
+            logger.info(
+                "mcp tool answer_call_question invalid_request call_id=%s question_id=%s",
+                call_id,
+                question_id,
+            )
             raise ToolError(str(exc)) from exc
         try:
-            return await get_service().answer_call_question(
+            result = await get_service().answer_call_question(
                 request.call_id,
                 request.question_id,
                 request.answer,
             )
         except LookupError as exc:
+            logger.info(
+                "mcp tool answer_call_question unknown_question call_id=%s question_id=%s",
+                call_id,
+                question_id,
+            )
             raise ToolError("unknown question") from exc
         except ValueError as exc:
+            logger.info(
+                "mcp tool answer_call_question invalid_call_state call_id=%s "
+                "question_id=%s error=%s",
+                call_id,
+                question_id,
+                exc,
+            )
             raise ToolError(
                 json.dumps({"code": "invalid_call_state", "message": str(exc)})
             ) from exc
+        logger.info(
+            "mcp tool answer_call_question completed call_id=%s question_id=%s status=%s",
+            call_id,
+            question_id,
+            result.get("status"),
+        )
+        return result

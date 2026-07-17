@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from fastmcp import FastMCP
 
 from app.call_state import WATCHDOG_QUESTION_GRACE_SECONDS, PendingQuestion
+from app.mcp_tools import register_tools
 from app.models import CallState, StartPhoneCallOutput
 from app.openai_realtime import RealtimeBridge
 from tests.conftest import seed_call, wait_background
@@ -33,7 +37,6 @@ async def _ask(
     payload = {"question": question}
     if reason is not None:
         payload["reason"] = reason
-    import json
 
     await service.handle_realtime_event(
         call_id,
@@ -642,3 +645,111 @@ async def test_failed_answer_delivery_is_retryable(ask_service, packet):
     await wait_background()
     assert third["status"] == "already_answered"
     assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]) == 1
+
+
+def _messages(caplog: pytest.LogCaptureFixture, *, logger_name: str) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == logger_name]
+
+
+@pytest.mark.asyncio
+async def test_ask_poke_lifecycle_emits_trace_logs(ask_service, packet, caplog):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+
+    with caplog.at_level(logging.INFO, logger="app.call_state"):
+        await _ask(ask_service, call_id, tool_call_id="tc_log")
+        await wait_background()
+        rows = await ask_service.db.get_questions_after(call_id, 0)
+        question_id = rows[0]["question_id"]
+        waited = await ask_service.wait_for_call_event(
+            call_id, after_sequence=0, timeout_seconds=0.05
+        )
+        answered = await ask_service.answer_call_question(
+            call_id, question_id, "CVS on Market Street"
+        )
+        await wait_background()
+
+    assert waited["events"]
+    assert answered["status"] == "accepted"
+    messages = _messages(caplog, logger_name="app.call_state")
+    assert any("ask_poke asked" in message and question_id in message for message in messages)
+    assert any("wait_for_call_event returned" in message for message in messages)
+    assert any("answer_call_question received" in message for message in messages)
+    assert any("answer_call_question accepted" in message for message in messages)
+    assert any("ask_poke answer delivered" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_ask_poke_reject_and_timeout_emit_trace_logs(ask_service, packet, caplog):
+    ask_service.settings.ask_poke_answer_timeout_seconds = 0.05
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+
+    with caplog.at_level(logging.INFO, logger="app.call_state"):
+        await _ask(ask_service, call_id, tool_call_id="tc_timeout_log")
+        await wait_background()
+        await asyncio.sleep(0.12)
+        await wait_background()
+
+        ask_service.settings.ask_poke_answer_timeout_seconds = 30.0
+        await _ask(
+            ask_service,
+            call_id,
+            tool_call_id="tc_pending_log",
+            question="What is the account number on file?",
+        )
+        await wait_background()
+        await _ask(
+            ask_service,
+            call_id,
+            tool_call_id="tc_pending_log_2",
+            question="What is the billing zip code?",
+        )
+        await wait_background()
+
+    messages = _messages(caplog, logger_name="app.call_state")
+    assert any("ask_poke timed out" in message for message in messages)
+    assert any(
+        "ask_poke rejected" in message and "question_pending" in message for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_ask_poke_tools_emit_invocation_logs(ask_service, packet, caplog):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_mcp_log")
+    await wait_background()
+    rows = await ask_service.db.get_questions_after(call_id, 0)
+    question_id = rows[0]["question_id"]
+
+    mcp = FastMCP("test-ask-poke-logging")
+    register_tools(mcp, lambda: ask_service)
+
+    with caplog.at_level(logging.INFO, logger="app.mcp_tools"):
+        wait_result = await mcp.call_tool(
+            "wait_for_call_event",
+            {"call_id": call_id, "after_sequence": 0, "timeout_seconds": 0.05},
+        )
+        answer_result = await mcp.call_tool(
+            "answer_call_question",
+            {
+                "call_id": call_id,
+                "question_id": question_id,
+                "answer": "CVS on Market Street",
+            },
+        )
+        await wait_background()
+
+    assert wait_result.is_error is False
+    assert answer_result.is_error is False
+    wait_payload = wait_result.structured_content or {}
+    answer_payload = answer_result.structured_content or {}
+    assert wait_payload["events"]
+    assert answer_payload["status"] == "accepted"
+
+    messages = _messages(caplog, logger_name="app.mcp_tools")
+    assert any("mcp tool wait_for_call_event call_id=" in message for message in messages)
+    assert any("mcp tool wait_for_call_event completed" in message for message in messages)
+    assert any("mcp tool answer_call_question call_id=" in message for message in messages)
+    assert any(
+        "mcp tool answer_call_question completed" in message and "status=accepted" in message
+        for message in messages
+    )
