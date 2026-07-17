@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import time
 from collections import OrderedDict
@@ -14,8 +15,10 @@ from typing import Any
 
 from openai import AsyncOpenAI
 from openai.types.webhooks import UnwrapWebhookEvent
+from twilio.base.exceptions import TwilioRestException
 
 from app.call_activity import CallActivityTracker
+from app.costs import compute_call_cost
 from app.db import (
     Database,
     DeploymentLockedError,
@@ -33,6 +36,7 @@ from app.models import (
     ContextPacket,
     PreparePhoneCallInput,
     PreparePhoneCallOutput,
+    SendDtmfRequest,
     StartPhoneCallOutput,
     TranscriptTurn,
     VoiceEndCallRequest,
@@ -69,6 +73,22 @@ class PendingQuestion:
     tool_call_id: str
     deadline_monotonic: float
     delivering: bool = False
+
+
+@dataclass(slots=True)
+class HoldState:
+    started_monotonic: float
+
+
+# Classic hold/queue announcements only (hold music cues, IVR queue messages) — deliberately
+# narrow so ordinary conversational "hang on a sec" from the callee does not mute the agent.
+HOLD_PHRASE_PATTERN = re.compile(
+    r"(please hold|hold the line|stay on the line|remain on the line|"
+    r"placed? you on hold|puts? you on hold|put you on (a brief )?hold|"
+    r"your call is (very )?important|next available (agent|representative|operator|team member)|"
+    r"call volume|currently (assisting|helping) other|in the order (it was|they were) received)",
+    re.IGNORECASE,
+)
 
 
 # Assistant speech / SIP playback evidence. On SIP sidebands, RTP carries the media, so
@@ -155,6 +175,10 @@ class CallService:
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
+        self._hold_state: dict[str, HoldState] = {}
+        # Answered questions whose tool result never reached the sideband; a Poke retry
+        # of answer_call_question re-attempts delivery instead of reporting already_answered.
+        self._undelivered_answers: dict[str, set[str]] = {}
         self._event_notifiers: dict[str, asyncio.Event] = {}
 
     def _spawn(self, coroutine, *, name: str, must_finish: bool = False) -> asyncio.Task[Any]:
@@ -262,6 +286,8 @@ class CallService:
 
     def _tombstone_call_activity(self, call_id: str) -> None:
         self._activity.tombstone(call_id)
+        self._undelivered_answers.pop(call_id, None)
+        self._hold_state.pop(call_id, None)
 
     def _prune_activity_tombstones(self, now_ns: int | None = None) -> None:
         self._activity.prune_tombstones(now_ns)
@@ -730,8 +756,10 @@ class CallService:
         elif leg == "callee" and status in {"completed", "failed", "busy", "no-answer", "canceled"}:
             duration = int(form.get("CallDuration") or 0)
             reason = "callee_call_completed" if status == "completed" else f"callee_{status}"
-            if status == "completed" and duration >= self.settings.max_call_seconds:
-                reason = "time_limit"
+            if status == "completed":
+                if duration >= self.settings.max_call_seconds:
+                    reason = "time_limit"
+                await self.db.update_call(call_id, twilio_reported_duration_seconds=duration)
             await self.terminate_call(call_id, reason)
         elif leg == "agent" and status in {"completed", "failed"}:
             await self.terminate_call(call_id, "agent_call_completed")
@@ -872,6 +900,15 @@ class CallService:
                     source_event_type=event_type,
                     source_event_id=event_id,
                 )
+                if self.settings.hold_detection_enabled:
+                    if call_id in self._hold_state:
+                        if HOLD_PHRASE_PATTERN.search(text):
+                            # Still on hold (re-announcement); just refresh liveness.
+                            self._note_call_activity(call_id)
+                        elif len(text) >= 3:
+                            await self._exit_hold(call_id, heard_text=text)
+                    elif HOLD_PHRASE_PATTERN.search(text):
+                        await self._enter_hold(call_id, trigger="transcript")
         elif event_type in {
             "response.output_audio_transcript.done",
             "response.audio_transcript.done",
@@ -910,6 +947,7 @@ class CallService:
             status = response.get("status")
             if event_type == "response.done":
                 self._activity.active_response_ids.pop(call_id, None)
+                await self._record_realtime_usage(call_id, response)
             if status in {"cancelled", "canceled"}:
                 await self.db.update_call(call_id, interruption_observed=1)
             elif status == "failed":
@@ -951,6 +989,40 @@ class CallService:
                 name=f"terminate:{call_id}:openai-error",
             )
 
+    async def _record_realtime_usage(self, call_id: str, response: dict[str, Any]) -> None:
+        # A cancelled response still bills for the tokens it consumed, so this runs
+        # regardless of response status.
+        usage = response.get("usage") or {}
+        input_details = usage.get("input_token_details") or {}
+        cached = input_details.get("cached_tokens_details") or {}
+        output_details = usage.get("output_token_details") or {}
+        input_text_tokens = int(input_details.get("text_tokens") or 0)
+        input_audio_tokens = int(input_details.get("audio_tokens") or 0)
+        input_cached_text_tokens = int(cached.get("text_tokens") or 0)
+        input_cached_audio_tokens = int(cached.get("audio_tokens") or 0)
+        output_text_tokens = int(output_details.get("text_tokens") or 0)
+        output_audio_tokens = int(output_details.get("audio_tokens") or 0)
+        if not any(
+            (
+                input_text_tokens,
+                input_audio_tokens,
+                input_cached_text_tokens,
+                input_cached_audio_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+            )
+        ):
+            return
+        await self.db.add_realtime_usage(
+            call_id,
+            input_text_tokens=input_text_tokens,
+            input_audio_tokens=input_audio_tokens,
+            input_cached_text_tokens=input_cached_text_tokens,
+            input_cached_audio_tokens=input_cached_audio_tokens,
+            output_text_tokens=output_text_tokens,
+            output_audio_tokens=output_audio_tokens,
+        )
+
     async def handle_realtime_send(self, call_id: str, event: dict[str, Any]) -> None:
         sent = LatencyMark.now()
         # Outbound control (response.create, tool results) is proof the call is live even
@@ -975,17 +1047,20 @@ class CallService:
         tool_call_id: str,
         output: dict[str, Any],
         *,
+        continue_response: bool = True,
         continuation_instructions: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Swallow benign teardown races (e.g. "sideband is not open") so they cannot
         escalate into a fatal error and redundant termination. CancelledError must still
-        propagate so the dispatcher stays cancellable."""
+        propagate so the dispatcher stays cancellable. Returns False when delivery
+        failed, so callers that must retry (question answers) can record that."""
 
         try:
             await self.realtime.send_tool_result(
                 call_id,
                 tool_call_id,
                 output,
+                continue_response=continue_response,
                 continuation_instructions=continuation_instructions,
             )
         except asyncio.CancelledError:
@@ -997,6 +1072,8 @@ class CallService:
                 call_id,
                 exc_info=True,
             )
+            return False
+        return True
 
     async def _send_nontransfer_tool_result(
         self,
@@ -1007,6 +1084,7 @@ class CallService:
         received: LatencyMark,
         event_key: str,
         advisory_outcome: dict[str, Any] | None = None,
+        continue_response: bool = True,
         continuation_instructions: str | None = None,
     ) -> None:
         # Begin the one durable tool write before yielding to the WebSocket, but do not
@@ -1042,6 +1120,7 @@ class CallService:
                 call_id,
                 tool_call_id,
                 output,
+                continue_response=continue_response,
                 continuation_instructions=continuation_instructions,
             )
             return
@@ -1050,6 +1129,7 @@ class CallService:
                 call_id,
                 tool_call_id,
                 output,
+                continue_response=continue_response,
                 continuation_instructions=continuation_instructions,
             )
         finally:
@@ -1075,6 +1155,77 @@ class CallService:
             await self._tool_search_web(
                 call_id, tool_call_id, arguments, received=received, event_key=event_key
             )
+        elif name == "send_dtmf":
+            try:
+                request = SendDtmfRequest.model_validate(arguments)
+            except Exception:
+                logger.info("invalid send_dtmf tool arguments call_id=%s", call_id)
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "invalid_dtmf_request"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+
+            call = await self.db.get_call(call_id)
+            if call is None or call["state"] != CallState.ACTIVE.value:
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "call_not_ready"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+            conference = call.get("conference_sid") or call.get("conference_name")
+            callee_sid = call.get("twilio_callee_call_sid")
+            if not conference or not callee_sid:
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "call_not_ready"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+
+            self._note_call_activity(call_id)
+            self._inflight_tools.add(call_id)
+            try:
+                await self.twilio.send_dtmf(
+                    conference,
+                    callee_sid,
+                    call_id=call_id,
+                    plan_id=call["plan_id"],
+                    digits=request.digits,
+                )
+                output = {"ok": True, "digits": request.digits}
+            except TwilioRestException:
+                logger.warning(
+                    "send_dtmf Twilio call failed call_id=%s digits=%s", call_id, request.digits
+                )
+                output = {"ok": False, "error": "dtmf_failed"}
+            except Exception:
+                logger.exception("unexpected send_dtmf failure call_id=%s", call_id)
+                output = {"ok": False, "error": "dtmf_failed"}
+            finally:
+                self._inflight_tools.discard(call_id)
+                self._note_call_activity(call_id)
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                output,
+                received=received,
+                event_key=event_key,
+                continuation_instructions=(
+                    "The keypad tones were sent. Stay silent and listen to how the menu "
+                    "responds before speaking or sending more digits."
+                )
+                if output.get("ok")
+                else None,
+            )
         elif name == "record_call_outcome":
             await self._tool_record_call_outcome(
                 call_id, tool_call_id, arguments, received=received, event_key=event_key
@@ -1092,6 +1243,13 @@ class CallService:
                 call_id,
                 tool_call_id,
                 arguments,
+                received=received,
+                event_key=event_key,
+            )
+        elif name == "report_hold":
+            await self._handle_report_hold(
+                call_id,
+                tool_call_id,
                 received=received,
                 event_key=event_key,
             )
@@ -1141,6 +1299,7 @@ class CallService:
                 result.output_bytes,
                 result.cost_dollars,
             )
+            await self.db.record_exa_search(call_id, cost_dollars=result.cost_dollars or 0.0)
         except ExaSearchError as exc:
             logger.warning("Exa search failed call_id=%s code=%s", call_id, exc.code)
             output = {"ok": False, "error": exc.code}
@@ -1393,26 +1552,20 @@ class CallService:
                 call_id, tool_call_id, "call_ending", received=received, event_key=event_key
             )
             return
-        asked_count = await self.db.count_call_questions(call_id)
-        if asked_count >= self.settings.ask_poke_max_questions_per_call:
-            await self._reject_ask_poke(
-                call_id,
-                tool_call_id,
-                "question_limit_reached",
-                received=received,
-                event_key=event_key,
-            )
-            return
 
         deadline_at = (
             datetime.now(UTC) + timedelta(seconds=self.settings.ask_poke_answer_timeout_seconds)
         ).isoformat()
+        # The question quota is enforced inside create_question, after its duplicate
+        # tool_call_id check, so a redelivered ask_poke at the limit reuses the pending
+        # row instead of closing the still-open function call with question_limit_reached.
         row, error = await self.db.create_question(
             call_id,
             tool_call_id=tool_call_id,
             question=request.question,
             reason=request.reason,
             deadline_at=deadline_at,
+            max_questions=self.settings.ask_poke_max_questions_per_call,
         )
         if error is not None or row is None:
             await self._reject_ask_poke(
@@ -1439,6 +1592,30 @@ class CallService:
         )
         # Leave the OpenAI function call open — answer/timeout deliver out-of-band.
 
+    async def _handle_report_hold(
+        self,
+        call_id: str,
+        tool_call_id: str,
+        *,
+        received: LatencyMark,
+        event_key: str,
+    ) -> None:
+        # Side effect (entering hold) before the tool result, matching end_call's
+        # convention of acting first and reporting the outcome second.
+        entered = await self._enter_hold(call_id, trigger="model_tool")
+        if entered:
+            output = {"status": "holding"}
+        else:
+            output = {"status": "not_on_hold"}
+        await self._send_nontransfer_tool_result(
+            call_id,
+            tool_call_id,
+            output,
+            received=received,
+            event_key=event_key,
+            continue_response=not entered,
+        )
+
     def _notify_call_event(self, call_id: str) -> None:
         ev = self._event_notifiers.pop(call_id, None)
         if ev is not None:
@@ -1459,6 +1636,61 @@ class CallService:
                 call_id,
                 exc_info=True,
             )
+
+    async def _enter_hold(self, call_id: str, *, trigger: str) -> bool:
+        if not self.settings.hold_detection_enabled or call_id in self._hold_state:
+            return False
+        call = await self.db.get_call(call_id)
+        if call is None or CallState(call["state"]) != CallState.ACTIVE:
+            return False
+        # Record hold state before the suspend-responses round trip so a concurrent
+        # detection (transcript race with the model tool) cannot double-enter.
+        self._hold_state[call_id] = HoldState(started_monotonic=time.monotonic())
+        await self._cancel_active_response(call_id)
+        try:
+            await self.realtime.suspend_automatic_responses(call_id)
+        except Exception:
+            logger.warning(
+                "failed to suspend automatic responses for hold call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+            # The call stays live rather than half-held: no suppressed responses without
+            # a confirmed session update.
+            self._hold_state.pop(call_id, None)
+            return False
+        self._note_call_activity(call_id, LatencyMark.now())
+        logger.info("call entered hold call_id=%s trigger=%s", call_id, trigger)
+        return True
+
+    async def _exit_hold(self, call_id: str, *, heard_text: str) -> None:
+        # Pop first, deterministically: if re-enabling automatic responses fails below,
+        # the stale watchdog reaps the call instead of leaving it muted forever.
+        self._hold_state.pop(call_id, None)
+        try:
+            await self.realtime.enable_automatic_responses(call_id)
+        except Exception:
+            logger.warning(
+                "failed to resume automatic responses after hold call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+            return
+        truncated = heard_text[:200]
+        instructions = (
+            f"The other party has returned after a hold. They just said: {truncated!r}. "
+            "Re-engage naturally and continue pursuing the approved objective."
+        )
+        try:
+            await self.realtime.request_response(call_id, instructions=instructions)
+        except Exception:
+            # Automatic responses are already back on; a missed nudge just costs one
+            # beat of dead air, not a stuck-muted call, so this must not raise into
+            # the event dispatcher.
+            logger.warning("failed to send hold resume nudge call_id=%s", call_id, exc_info=True)
+            return
+        self._note_call_activity(call_id, LatencyMark.now())
+        logger.info("call exited hold call_id=%s", call_id)
 
     def _clear_pending_question(self, call_id: str, question_id: str | None = None) -> None:
         pending = self._pending_questions.get(call_id)
@@ -1483,7 +1715,7 @@ class CallService:
         self._mark_question_delivering(call_id, question_row["question_id"])
         await self._cancel_active_response(call_id)
         output = {"status": "answered", "answer": question_row["answer"]}
-        await self._guarded_send_tool_result(
+        delivered = await self._guarded_send_tool_result(
             call_id,
             question_row["tool_call_id"],
             output,
@@ -1492,13 +1724,24 @@ class CallService:
                 "in one or two sentences. Do not read metadata or mention Poke by name."
             ),
         )
-        self._queue_latency(
-            call_id,
-            LatencyStage.ASK_POKE_RESOLVED,
-            LatencyMark.now(),
-            event_key=str(question_row["question_id"]),
-        )
-        self._activity.note(call_id)
+        if delivered:
+            undelivered = self._undelivered_answers.get(call_id)
+            if undelivered is not None:
+                undelivered.discard(question_row["question_id"])
+                if not undelivered:
+                    self._undelivered_answers.pop(call_id, None)
+            self._queue_latency(
+                call_id,
+                LatencyStage.ASK_POKE_RESOLVED,
+                LatencyMark.now(),
+                event_key=str(question_row["question_id"]),
+            )
+            self._activity.note(call_id)
+        else:
+            # The question is durably 'answered' but the model never saw the output.
+            # Remember it so a Poke retry re-attempts delivery instead of stopping at
+            # already_answered with the function call still open.
+            self._undelivered_answers.setdefault(call_id, set()).add(question_row["question_id"])
         self._clear_pending_question(call_id, question_row["question_id"])
         self._notify_call_event(call_id)
 
@@ -1518,8 +1761,9 @@ class CallService:
             self._notify_call_event(call_id)
             return
         if row is None:
-            # Lost the claim (answered or cancelled); drop a stale watchdog carve-out
-            # entry left behind if resolution raced our registration.
+            # Lost the claim (answered, cancelled, or termination owns the call and
+            # will cancel it); drop a stale watchdog carve-out entry left behind if
+            # resolution raced our registration.
             self._clear_pending_question(call_id, question_id)
             return
         await self._cancel_active_response(call_id)
@@ -1638,6 +1882,30 @@ class CallService:
             raise LookupError("unknown question")
         status = existing.get("status")
         if status == "answered":
+            undelivered = self._undelivered_answers.get(call_id)
+            if undelivered is not None and question_id in undelivered:
+                # Claim the retry before awaiting so a concurrent retry cannot also
+                # spawn delivery; the first answer text (already stored) wins.
+                undelivered.discard(question_id)
+                if not undelivered:
+                    self._undelivered_answers.pop(call_id, None)
+                call = await self.db.get_call(call_id)
+                if call is None or self._call_activity_is_closed(call):
+                    return {"status": "call_ended"}
+                if call_id not in self._pending_questions:
+                    # Restore the watchdog carve-out for the re-delivery window.
+                    self._pending_questions[call_id] = PendingQuestion(
+                        question_id=question_id,
+                        tool_call_id=existing["tool_call_id"],
+                        deadline_monotonic=time.monotonic(),
+                        delivering=True,
+                    )
+                self._spawn(
+                    self._deliver_question_answer(call_id, existing),
+                    name=f"deliver-question:{call_id}:{question_id}",
+                    must_finish=True,
+                )
+                return {"status": "accepted", "question_id": question_id}
             return {"status": "already_answered"}
         if status == "expired":
             return {
@@ -2048,7 +2316,7 @@ class CallService:
         """Map a termination reason to the durable terminal CallState it produces."""
         if reason == "transfer_completed":
             return CallState.TRANSFERRED
-        if reason in {"time_limit", "setup_deadline", "watchdog_stale"}:
+        if reason in {"time_limit", "setup_deadline", "watchdog_stale", "hold_timeout"}:
             return CallState.TIMED_OUT
         if reason in {
             "callee_participant_leave",
@@ -2068,7 +2336,7 @@ class CallService:
         Must run with no intervening await so nothing can observe a call as both
         terminal in the database and still tracked as in-flight here.
         """
-        self._activity.tombstone(call_id)
+        self._tombstone_call_activity(call_id)
         self._owner_transfer.clear_call(call_id)
         self._opening_transition_locks.pop(call_id, None)
         self._tool_seen_calls.discard(call_id)
@@ -2095,7 +2363,7 @@ class CallService:
         # These two clears run before any media teardown I/O so the call stops looking
         # live to the watchdog/activity trackers immediately, not only once the (slow)
         # teardown below finishes.
-        self._activity.tombstone(call_id)
+        self._tombstone_call_activity(call_id)
         self._voice_end_pending.pop(call_id, None)
         conference_failed = await self._teardown_call_media(
             call, preserve_conference=preserve_conference
@@ -2220,21 +2488,33 @@ class CallService:
             answer_handling=call.get("answer_handling"),
             duration_seconds=call.get("duration_seconds"),
             result=result,
+            cost=compute_call_cost(call, self.settings),
         )
 
     async def get_result(self, call_id: str) -> dict[str, Any]:
         snapshot = await self.get_snapshot(call_id)
+        cost = snapshot.cost
         if snapshot.state in TERMINAL_STATES:
             result = snapshot.result
             if result is None or result.finalization_status == "telephony_only":
                 # Telephony is terminal; never report in_progress while finalization catches up.
                 result = await self.finalizer.finalize(call_id)
+                # Finalization may have just persisted extractor token usage; refresh cost.
+                call = await self.db.get_call(call_id)
+                if call is not None:
+                    cost = compute_call_cost(call, self.settings)
             return {
                 "call_id": call_id,
                 "state": snapshot.state,
                 "result": result.model_dump(mode="json"),
+                "cost": cost.model_dump(mode="json") if cost else None,
             }
-        return {"call_id": call_id, "state": snapshot.state, "result": None}
+        return {
+            "call_id": call_id,
+            "state": snapshot.state,
+            "result": None,
+            "cost": cost.model_dump(mode="json") if cost else None,
+        }
 
     # -- Transport-facing delegators -----------------------------------------
     # Thin wrappers so routes never reach through the service into self.db /
@@ -2505,6 +2785,20 @@ class CallService:
             ):
                 # Outstanding ask_poke: silence is expected until answer/deadline delivery
                 # finishes (delivering) or deadline+grace (covers cancel+send bounds).
+                continue
+            hold = self._hold_state.get(call_id)
+            if hold is not None:
+                if time.monotonic() - hold.started_monotonic >= self.settings.hold_max_seconds:
+                    # Hold elapsed is monotonic and one-way, so no re-check dance is needed
+                    # between this decision and the claim; reuse the stale-path protocol.
+                    self._watchdog_claims.add(call_id)
+                    terminated = False
+                    try:
+                        terminated = await self.terminate_call(call_id, "hold_timeout")
+                    finally:
+                        if not terminated:
+                            self._watchdog_claims.discard(call_id)
+                # else: silence is expected while on hold, within budget.
                 continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue

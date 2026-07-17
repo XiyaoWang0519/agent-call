@@ -21,6 +21,7 @@ class QuestionsMixin:
         question: str,
         reason: str | None,
         deadline_at: str,
+        max_questions: int,
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Insert a pending question. Returns (row, None) or (None, error_code)."""
 
@@ -58,6 +59,15 @@ class QuestionsMixin:
             if await cursor.fetchone() is not None:
                 await conn.rollback()
                 return None, "question_pending"
+            # Quota is enforced after the same-tool_call_id reuse check so a redelivered
+            # ask_poke at the limit is treated as the original ask, not a new rejection.
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM call_questions WHERE call_id=?",
+                (call_id,),
+            )
+            if (await cursor.fetchone())[0] >= max_questions:
+                await conn.rollback()
+                return None, "question_limit_reached"
             cursor = await conn.execute(
                 "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM call_questions WHERE call_id=?",
                 (call_id,),
@@ -124,8 +134,22 @@ class QuestionsMixin:
         return dict(row)
 
     async def claim_question_expiry(self, question_id: str) -> dict[str, Any] | None:
-        async with self._immediate_transaction() as conn:
-            resolved_at = _iso_now()
+        resolved_at = _iso_now()
+        async with self._write_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            # Only active calls may expire questions: once termination claims the call,
+            # cancel_pending_questions must win so late answers report call_ended and no
+            # timeout tool result is injected into a sideband being torn down.
+            cursor = await conn.execute(
+                """SELECT c.state FROM call_questions q
+                   JOIN calls c ON c.call_id = q.call_id
+                   WHERE q.question_id=?""",
+                (question_id,),
+            )
+            call_row = await cursor.fetchone()
+            if call_row is None or call_row[0] != CallState.ACTIVE.value:
+                await conn.rollback()
+                return None
             cursor = await conn.execute(
                 """UPDATE call_questions
                    SET status='expired', resolved_at=?
@@ -134,7 +158,11 @@ class QuestionsMixin:
                 (resolved_at, question_id),
             )
             row = await cursor.fetchone()
-        return dict(row) if row else None
+            if row is None:
+                await conn.rollback()
+                return None
+            await conn.commit()
+        return dict(row)
 
     async def cancel_pending_questions(self, call_id: str) -> list[dict[str, Any]]:
         async with self._immediate_transaction() as conn:

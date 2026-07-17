@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     ask_poke_enabled: bool = False
     ask_poke_answer_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     ask_poke_max_questions_per_call: int = Field(default=5, ge=1, le=20)
+    hold_detection_enabled: bool = False
+    hold_max_seconds: float = Field(default=300.0, gt=0, le=600)
     wait_for_call_event_max_seconds: float = Field(default=20.0, gt=0, le=25)
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])
     input_transcription_model: str = "gpt-realtime-whisper"
@@ -69,6 +71,17 @@ class Settings(BaseSettings):
     plan_ttl_seconds: Literal[600] = 600
     max_call_seconds: Literal[600] = 600
     owner_timezone: str = "America/Los_Angeles"
+
+    # Cost tracking (estimated pricing, USD per 1M tokens unless noted)
+    realtime_text_input_price_per_1m: float = Field(default=4.00, ge=0)
+    realtime_audio_input_price_per_1m: float = Field(default=32.00, ge=0)
+    realtime_cached_text_input_price_per_1m: float = Field(default=0.40, ge=0)
+    realtime_cached_audio_input_price_per_1m: float = Field(default=0.40, ge=0)
+    realtime_text_output_price_per_1m: float = Field(default=16.00, ge=0)
+    realtime_audio_output_price_per_1m: float = Field(default=64.00, ge=0)
+    extractor_input_price_per_1m: float = Field(default=0.05, ge=0)
+    extractor_output_price_per_1m: float = Field(default=0.40, ge=0)
+    twilio_voice_price_per_minute: float = Field(default=0.014, ge=0)
 
     @field_validator("allowed_country_codes", mode="before")
     @classmethod

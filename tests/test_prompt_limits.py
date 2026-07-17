@@ -111,6 +111,14 @@ def test_realtime_instructions_bound_web_search_behavior(packet: ContextPacket):
     assert "never invent a current fact" in flattened
 
 
+def test_realtime_instructions_bound_send_dtmf_behavior(packet: ContextPacket):
+    flattened = realtime_instructions(packet).replace("\n", " ")
+
+    assert "send_dtmf" in flattened
+    assert "automated phone menu" in flattened
+    assert "Never enter payment card numbers, PINs, passwords" in flattened
+
+
 def test_realtime_instructions_gate_ask_poke_guidance(packet: ContextPacket):
     disabled = realtime_instructions(packet, ask_poke_enabled=False)
     enabled = realtime_instructions(packet, ask_poke_enabled=True)

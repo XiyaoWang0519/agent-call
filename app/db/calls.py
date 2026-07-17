@@ -31,6 +31,7 @@ _UPDATE_CALL_ALLOWED_COLUMNS = frozenset(
         "interruption_observed",
         "answered_at",
         "last_event_at",
+        "twilio_reported_duration_seconds",
     }
 )
 
@@ -122,6 +123,57 @@ class CallsMixin:
         ]
         params.append(call_id)
         return await self._execute_cas(f"UPDATE calls SET {columns} WHERE call_id=?", params)
+
+    async def add_realtime_usage(
+        self,
+        call_id: str,
+        *,
+        input_text_tokens: int,
+        input_audio_tokens: int,
+        input_cached_text_tokens: int,
+        input_cached_audio_tokens: int,
+        output_text_tokens: int,
+        output_audio_tokens: int,
+    ) -> None:
+        await self.execute(
+            """UPDATE calls
+               SET realtime_input_text_tokens = realtime_input_text_tokens + ?,
+                   realtime_input_audio_tokens = realtime_input_audio_tokens + ?,
+                   realtime_input_cached_text_tokens = realtime_input_cached_text_tokens + ?,
+                   realtime_input_cached_audio_tokens = realtime_input_cached_audio_tokens + ?,
+                   realtime_output_text_tokens = realtime_output_text_tokens + ?,
+                   realtime_output_audio_tokens = realtime_output_audio_tokens + ?
+               WHERE call_id = ?""",
+            (
+                input_text_tokens,
+                input_audio_tokens,
+                input_cached_text_tokens,
+                input_cached_audio_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+                call_id,
+            ),
+        )
+
+    async def add_extractor_usage(
+        self, call_id: str, *, input_tokens: int, output_tokens: int
+    ) -> None:
+        await self.execute(
+            """UPDATE calls
+               SET extractor_input_tokens = extractor_input_tokens + ?,
+                   extractor_output_tokens = extractor_output_tokens + ?
+               WHERE call_id = ?""",
+            (input_tokens, output_tokens, call_id),
+        )
+
+    async def record_exa_search(self, call_id: str, *, cost_dollars: float) -> None:
+        await self.execute(
+            """UPDATE calls
+               SET exa_search_count = exa_search_count + 1,
+                   exa_cost_dollars = exa_cost_dollars + ?
+               WHERE call_id = ?""",
+            (cost_dollars, call_id),
+        )
 
     async def cas_state(self, call_id: str, expected: CallState, replacement: CallState) -> bool:
         return await self._execute_cas(

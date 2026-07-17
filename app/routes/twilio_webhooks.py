@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.datastructures import FormData
 
+from app.models import DTMF_DIGITS_PATTERN
 from app.security import verify_twilio_request
 
 router = APIRouter(prefix="/webhooks/twilio", tags=["twilio-webhooks"])
@@ -53,3 +54,19 @@ async def participant_status_callback(
         raise HTTPException(status_code=400, detail="invalid participant leg")
     await request.app.state.call_service.handle_participant_status(call_id, leg, _form_dict(form))
     return Response(status_code=204)
+
+
+@router.post("/announce-dtmf")
+async def announce_dtmf(
+    request: Request, form: FormData = Depends(verify_twilio_request)
+) -> Response:
+    await _validated_call_id(request)
+    digits = request.query_params.get("digits")
+    if not digits or not DTMF_DIGITS_PATTERN.match(digits):
+        raise HTTPException(status_code=400, detail="invalid dtmf digits")
+    return Response(
+        content=(
+            f'<?xml version="1.0" encoding="UTF-8"?><Response><Play digits="{digits}"/></Response>'
+        ),
+        media_type="text/xml",
+    )

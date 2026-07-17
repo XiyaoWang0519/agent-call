@@ -70,7 +70,18 @@ CREATE TABLE IF NOT EXISTS calls (
     started_at TEXT,
     answered_at TEXT,
     ended_at TEXT,
-    duration_seconds INTEGER
+    duration_seconds INTEGER,
+    realtime_input_text_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_input_audio_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_input_cached_text_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_input_cached_audio_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_output_text_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_output_audio_tokens INTEGER NOT NULL DEFAULT 0,
+    extractor_input_tokens INTEGER NOT NULL DEFAULT 0,
+    extractor_output_tokens INTEGER NOT NULL DEFAULT 0,
+    exa_search_count INTEGER NOT NULL DEFAULT 0,
+    exa_cost_dollars REAL NOT NULL DEFAULT 0,
+    twilio_reported_duration_seconds INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS calls_state_idx ON calls(state);
@@ -249,6 +260,17 @@ class DatabaseEngine:
             "opening_sent": "INTEGER NOT NULL DEFAULT 0",
             "twilio_owner_call_sid": "TEXT",
             "conference_cleanup_pending": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_text_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_audio_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_cached_text_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_cached_audio_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_output_text_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_output_audio_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "extractor_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "extractor_output_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "exa_search_count": "INTEGER NOT NULL DEFAULT 0",
+            "exa_cost_dollars": "REAL NOT NULL DEFAULT 0",
+            "twilio_reported_duration_seconds": "INTEGER",
         }
         for name, definition in migrations.items():
             if name not in existing:

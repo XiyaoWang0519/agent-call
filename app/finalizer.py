@@ -25,6 +25,47 @@ from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+_OUTCOME_LABELS: dict[str, str] = {
+    "completed": "Done",
+    "partially_completed": "Partially done",
+    "needs_follow_up": "Needs follow-up",
+    "declined": "Declined",
+    "voicemail_left": "Voicemail left",
+    "wrong_number": "Wrong number",
+    "transferred": "Transferred to a human",
+    "failed": "Call failed",
+    "unknown": "Outcome unknown",
+}
+
+
+def format_owner_summary(result: StoredCallResult) -> str:
+    """Short owner-facing text for the post-call Poke push."""
+    lines: list[str] = []
+    summary = result.summary.strip()
+    label = _OUTCOME_LABELS.get(result.outcome, "Outcome unknown")
+    if result.outcome == "completed" and summary:
+        lines.append(f"📞 {summary}")
+    elif summary:
+        lines.append(f"📞 {label}: {summary}")
+    else:
+        lines.append(f"📞 {label}.")
+    if result.confirmation_numbers:
+        values = [item.value for item in result.confirmation_numbers]
+        if len(values) == 1:
+            lines.append(f"Confirmation #{values[0]}")
+        else:
+            lines.append("Confirmations: " + ", ".join(f"#{v}" for v in values))
+    confirmed = [c.value for c in result.commitments if c.status == "confirmed"]
+    if confirmed:
+        lines.append("Confirmed: " + "; ".join(confirmed))
+    actions = [f.value for f in result.follow_ups if f.owner_action_required]
+    if actions:
+        lines.append("Action needed: " + "; ".join(actions))
+    if result.finalization_status != "succeeded":
+        lines.append("Automatic extraction had problems; the full transcript is saved.")
+    lines.append(f"(call {result.call_id} — details via get_call_result)")
+    return "\n".join(lines)
+
 
 class UnknownEvidenceError(ValueError):
     def __init__(self, unknown_ids: set[str]):
@@ -112,7 +153,9 @@ class Finalizer:
         await self.db.save_result_with_transcript(call_id, fallback, transcript)
 
         try:
-            extracted = await self._extract(call, plan, transcript)
+            extracted, (extractor_input_tokens, extractor_output_tokens) = await self._extract(
+                call, plan, transcript
+            )
         except Exception:
             logger.exception("post-call extraction failed for %s", call_id)
             turn_ids = [turn.turn_id for turn in transcript]
@@ -150,13 +193,19 @@ class Finalizer:
             transcript_complete=transcript_complete,
             raw_transcript_available=True,
         )
+        if extractor_input_tokens or extractor_output_tokens:
+            await self.db.add_extractor_usage(
+                call_id,
+                input_tokens=extractor_input_tokens,
+                output_tokens=extractor_output_tokens,
+            )
         await self.db.save_result_with_transcript(call_id, result, transcript)
         await self._maybe_push(result)
         return result
 
     async def _extract(
         self, call: dict[str, Any], plan: dict[str, Any], transcript: list[Any]
-    ) -> ExtractedCallResult:
+    ) -> tuple[ExtractedCallResult, tuple[int, int]]:
         # Normalize (but do not case-fold) turn_ids so an extractor citation padded with
         # incidental whitespace still validates; a matching stripped id is canonicalized
         # back to the exact transcript turn_id before being persisted.
@@ -176,6 +225,8 @@ class Finalizer:
             ],
         }
         last_unknown: list[str] = []
+        total_input_tokens = 0
+        total_output_tokens = 0
         for attempt in range(2):
             instructions = EXTRACTOR_INSTRUCTIONS
             if last_unknown:
@@ -193,6 +244,9 @@ class Finalizer:
                     store=False,
                     timeout=self.settings.openai_extraction_timeout_seconds,
                 )
+                usage = getattr(response, "usage", None)
+                total_input_tokens += getattr(usage, "input_tokens", 0) or 0
+                total_output_tokens += getattr(usage, "output_tokens", 0) or 0
                 parsed = response.output_parsed
                 if parsed is None:
                     raise ValueError("extractor returned no parsed output")
@@ -214,7 +268,7 @@ class Finalizer:
                         item.evidence_turn_ids = canonical_ids
                 if unknown:
                     raise UnknownEvidenceError(unknown)
-                return parsed
+                return parsed, (total_input_tokens, total_output_tokens)
             except UnknownEvidenceError as exc:
                 if attempt == 0:
                     last_unknown = sorted(exc.unknown_ids)
@@ -230,4 +284,4 @@ class Finalizer:
     async def _maybe_push(self, result: StoredCallResult) -> None:
         from app.poke_push import push_message_to_poke
 
-        await push_message_to_poke(self.settings, result.model_dump(mode="json"))
+        await push_message_to_poke(self.settings, format_owner_summary(result))

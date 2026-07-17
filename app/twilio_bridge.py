@@ -205,3 +205,29 @@ class TwilioBridge:
             ).update(muted=False)
 
         await asyncio.to_thread(unmute)
+
+    async def send_dtmf(
+        self,
+        conference_sid_or_name: str,
+        participant_call_sid: str,
+        *,
+        call_id: str,
+        plan_id: str,
+        digits: str,
+    ) -> None:
+        """Play DTMF tones into the callee leg only, via a signed announce webhook.
+
+        Twilio's participant update has no digit-sending parameter, and updating the
+        callee's call directly with TwiML would pull it out of the conference. An
+        announce_url plays TwiML into just that participant's leg instead.
+        """
+        url = self._callback(
+            "/webhooks/twilio/announce-dtmf", call_id=call_id, plan_id=plan_id, digits=digits
+        )
+
+        def announce() -> None:
+            self.client.conferences(conference_sid_or_name).participants(
+                participant_call_sid
+            ).update(announce_url=url, announce_method="POST")
+
+        await asyncio.to_thread(announce)
