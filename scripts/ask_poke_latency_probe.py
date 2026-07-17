@@ -58,8 +58,16 @@ class BearerAuthMiddleware:
         await send({"type": "http.response.body", "body": b'{"detail":"unauthorized"}'})
 
 
+def _probe_is_complete(probe: Probe) -> bool:
+    return probe.answer_received_at is not None
+
+
 def _prune_probes(now: float | None = None) -> None:
-    """Drop stale/completed probes and enforce a hard cap on retained entries."""
+    """Drop TTL-expired probes, then evict oldest completed ones down to MAX_PROBES.
+
+    In-flight probes are never evicted by the capacity cap — a new start must fail
+    instead when every retained slot is still active.
+    """
     clock = time.monotonic() if now is None else now
     stale = [
         probe_id
@@ -72,12 +80,14 @@ def _prune_probes(now: float | None = None) -> None:
     ]
     for probe_id in stale:
         PROBES.pop(probe_id, None)
-    if len(PROBES) <= MAX_PROBES:
+    overflow = len(PROBES) - MAX_PROBES
+    if overflow <= 0:
         return
-    overflow = sorted(PROBES.values(), key=lambda probe: probe.started_at)[
-        : len(PROBES) - MAX_PROBES
-    ]
-    for probe in overflow:
+    completed = sorted(
+        (probe for probe in PROBES.values() if _probe_is_complete(probe)),
+        key=lambda probe: probe.started_at,
+    )
+    for probe in completed[:overflow]:
         PROBES.pop(probe.probe_id, None)
 
 
@@ -116,6 +126,18 @@ async def start_ask_poke_probe(question: str, delay_seconds: float = 5.0) -> dic
     if not 1 <= delay_seconds <= 25:
         raise ValueError("delay_seconds must be between 1 and 25")
     _prune_probes()
+    if len(PROBES) >= MAX_PROBES:
+        completed = sorted(
+            (probe for probe in PROBES.values() if _probe_is_complete(probe)),
+            key=lambda probe: probe.started_at,
+        )
+        needed = len(PROBES) - MAX_PROBES + 1
+        if len(completed) < needed:
+            raise ValueError(
+                f"too many active probes (max {MAX_PROBES}); wait for one to finish or expire"
+            )
+        for probe in completed[:needed]:
+            PROBES.pop(probe.probe_id, None)
     probe_id = uuid4().hex
     PROBES[probe_id] = Probe(
         probe_id=probe_id,
