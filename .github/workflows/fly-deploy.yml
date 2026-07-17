@@ -31,12 +31,12 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --frozen
+        run: uv sync --all-groups --frozen
 
       - name: Verify application
         run: |
-          uv run ruff format --check app tests
-          uv run ruff check app tests
+          uv run ruff format --check app tests scripts
+          uv run ruff check app tests scripts
           uv run pytest -q
 
       - name: Install flyctl
