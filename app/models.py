@@ -112,8 +112,13 @@ class StartPhoneCallOutput(BaseModel):
     state: CallState
     poll_after_seconds: int = 2
     next_action: str = (
-        "Call wait_for_call_event. Answer pending questions with answer_call_question and continue "
-        "waiting with next_after_sequence; when terminal, call get_call_result."
+        "The call has started. Immediately begin calling wait_for_call_event in a loop "
+        "with the returned next_after_sequence, and keep calling it again NOW after every "
+        "response until the call reaches a terminal state. Answer pending questions with "
+        "answer_call_question, then resume the wait_for_call_event loop. Do not end your "
+        "turn and do not stop polling until the call is terminal — if you stop, mid-call "
+        "questions from the phone agent (ask_poke) will time out and the call may fail its "
+        "objective. When terminal, call get_call_result."
     )
 
 

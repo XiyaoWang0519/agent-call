@@ -54,9 +54,15 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         name="start_phone_call",
         description=(
             "Start only a valid, unexpired prepared plan after explicit owner confirmation. "
-            "Pass the confirmation text that was read back. Then call wait_for_call_event; answer "
-            "pending questions with answer_call_question, continue waiting with the returned cursor, "
-            "and call get_call_result once the call is terminal. " + CONTEXT_GUIDANCE
+            "Pass the confirmation text that was read back. Then IMMEDIATELY begin calling "
+            "wait_for_call_event in a loop, calling it again right after every response, "
+            "until the call reaches a terminal state; answer pending questions with "
+            "answer_call_question, continue waiting with the returned cursor, and call "
+            "get_call_result once the call is terminal. Do not end your turn between calls: "
+            "this tool starts a live phone call, and the phone agent on the call may ask a "
+            "question (via ask_poke) at any moment that only YOU can answer by staying in the "
+            "wait_for_call_event loop — if you stop polling, that question times out and the "
+            "call can fail its objective. " + CONTEXT_GUIDANCE
         ),
     )
     async def start_phone_call(
@@ -111,7 +117,14 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         description=(
             "Long-poll for mid-call questions or terminal state after a sequence cursor. "
             "Returns immediately when events exist; on idle timeout returns an empty events list "
-            "(never an error). Re-enter with next_after_sequence. " + CONTEXT_GUIDANCE
+            "(never an error) — this is NOT a stopping condition. Re-enter with "
+            "next_after_sequence immediately, in a loop, for as long as the call is "
+            "non-terminal; read and follow the response's next_action field every time, which "
+            "tells you exactly what to do next. Never end your turn while the call is "
+            "non-terminal: the phone agent can raise a mid-call question (ask_poke) at any "
+            "moment, and if nothing is polling, that question times out and the call can fail "
+            "its objective. Only stop once a response reports terminal=true, then call "
+            "get_call_result. " + CONTEXT_GUIDANCE
         ),
     )
     async def wait_for_call_event(
@@ -160,9 +173,11 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
     @mcp.tool(
         name="answer_call_question",
         description=(
-            "Answer one pending mid-call question from the voice agent. Exactly-once: a second "
-            "answer returns already_answered; late answers after timeout return expired. "
-            + CONTEXT_GUIDANCE
+            "Answer one pending mid-call question from the voice agent, as soon as it arrives "
+            "from wait_for_call_event — the callee is waiting live on the phone. Exactly-once: "
+            "a second answer returns already_answered; late answers after timeout return "
+            "expired. After answering, immediately resume the wait_for_call_event loop until "
+            "the call is terminal; do not end your turn. " + CONTEXT_GUIDANCE
         ),
     )
     async def answer_call_question(call_id: str, question_id: str, answer: str) -> dict[str, Any]:
