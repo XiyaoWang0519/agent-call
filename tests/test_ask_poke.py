@@ -87,7 +87,9 @@ async def test_answer_delivers_correlated_output_and_continuation(ask_service, p
     result = await ask_service.answer_call_question(call_id, question_id, "CVS on Market Street")
     await wait_background()
 
-    assert result == {"status": "accepted", "question_id": question_id}
+    assert result["status"] == "accepted"
+    assert result["question_id"] == question_id
+    assert "wait_for_call_event" in result["next_action"]
     assert ask_service._test_realtime.tool_results[-1] == (
         call_id,
         "tc_1",
@@ -122,6 +124,8 @@ async def test_timeout_exactly_once_then_answer_is_expired(ask_service, packet):
     late = await ask_service.answer_call_question(call_id, question_id, "too late")
     await wait_background()
     assert late["status"] == "expired"
+    assert "wait_for_call_event" in late["next_action"]
+    assert f"after_sequence={row['sequence_number']}" in late["next_action"]
     assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_timeout"]) == 1
 
 
@@ -159,6 +163,8 @@ async def test_duplicate_answer_idempotent_and_unknown_question_errors(ask_servi
     await wait_background()
     assert first["status"] == "accepted"
     assert second["status"] == "already_answered"
+    assert "wait_for_call_event" in second["next_action"]
+    assert f"after_sequence={rows[0]['sequence_number']}" in second["next_action"]
     assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_1"]) == 1
 
     with pytest.raises(LookupError, match="unknown question"):
@@ -389,7 +395,9 @@ async def test_wait_for_call_event_terminating_is_not_terminal(ask_service, pack
     assert result["terminal"] is False
     assert result["state"] == CallState.TERMINATING.value
     assert "get_call_result" not in result["next_action"]
-    assert "re-enter wait_for_call_event" in result["next_action"]
+    assert "Call wait_for_call_event again NOW" in result["next_action"]
+    assert "do not stop polling" in result["next_action"]
+    assert "ask_poke" in result["next_action"]
 
 
 @pytest.mark.asyncio
@@ -423,6 +431,12 @@ async def test_wait_for_call_event_timeout_returns_empty_events(ask_service, pac
     assert result["events"] == []
     assert result["terminal"] is False
     assert result["state"] == CallState.ACTIVE.value
+    # The idle-timeout response must still drive Poke to keep polling — an empty
+    # events list is not a stopping condition (see the ask_poke keep-polling incident).
+    assert "Call wait_for_call_event again NOW" in result["next_action"]
+    assert "after_sequence=0" in result["next_action"]
+    assert "do not stop polling" in result["next_action"]
+    assert "ask_poke" in result["next_action"]
 
 
 @pytest.mark.asyncio
@@ -634,7 +648,9 @@ async def test_failed_answer_delivery_is_retryable(ask_service, packet):
     retry = await ask_service.answer_call_question(call_id, question_id, "ignored retry text")
     await wait_background()
 
-    assert retry == {"status": "accepted", "question_id": question_id}
+    assert retry["status"] == "accepted"
+    assert retry["question_id"] == question_id
+    assert "wait_for_call_event" in retry["next_action"]
     delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]
     assert len(delivered) == 1
     # The originally claimed answer wins; the retry only re-attempts delivery.
@@ -644,6 +660,7 @@ async def test_failed_answer_delivery_is_retryable(ask_service, packet):
     third = await ask_service.answer_call_question(call_id, question_id, "again")
     await wait_background()
     assert third["status"] == "already_answered"
+    assert "wait_for_call_event" in third["next_action"]
     assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]) == 1
 
 
