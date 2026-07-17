@@ -197,7 +197,5 @@ async def probe_results(request: Request) -> dict:
     if not secrets.compare_digest(supplied, f"Bearer {BEARER_TOKEN}"):
         raise HTTPException(status_code=401, detail="unauthorized")
     return {
-        "probes": [
-            {"probe": asdict(probe), "timing": timing(probe)} for probe in PROBES.values()
-        ]
+        "probes": [{"probe": asdict(probe), "timing": timing(probe)} for probe in PROBES.values()]
     }
