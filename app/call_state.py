@@ -13,6 +13,7 @@ from time import monotonic_ns
 from typing import Any
 
 from openai import AsyncOpenAI
+from twilio.base.exceptions import TwilioRestException
 
 from app.costs import compute_call_cost
 from app.db import (
@@ -33,6 +34,7 @@ from app.models import (
     ContextPacket,
     PreparePhoneCallInput,
     PreparePhoneCallOutput,
+    SendDtmfRequest,
     StartPhoneCallOutput,
     VoiceEndCallRequest,
     WebSearchRequest,
@@ -1188,6 +1190,77 @@ class CallService:
                 output,
                 received=received,
                 event_key=event_key,
+            )
+        elif name == "send_dtmf":
+            try:
+                request = SendDtmfRequest.model_validate(arguments)
+            except Exception:
+                logger.info("invalid send_dtmf tool arguments call_id=%s", call_id)
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "invalid_dtmf_request"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+
+            call = await self.db.get_call(call_id)
+            if call is None or call["state"] != CallState.ACTIVE.value:
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "call_not_ready"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+            conference = call.get("conference_sid") or call.get("conference_name")
+            callee_sid = call.get("twilio_callee_call_sid")
+            if not conference or not callee_sid:
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "call_not_ready"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+
+            self._note_call_activity(call_id)
+            self._inflight_tools.add(call_id)
+            try:
+                await self.twilio.send_dtmf(
+                    conference,
+                    callee_sid,
+                    call_id=call_id,
+                    plan_id=call["plan_id"],
+                    digits=request.digits,
+                )
+                output = {"ok": True, "digits": request.digits}
+            except TwilioRestException:
+                logger.warning(
+                    "send_dtmf Twilio call failed call_id=%s digits=%s", call_id, request.digits
+                )
+                output = {"ok": False, "error": "dtmf_failed"}
+            except Exception:
+                logger.exception("unexpected send_dtmf failure call_id=%s", call_id)
+                output = {"ok": False, "error": "dtmf_failed"}
+            finally:
+                self._inflight_tools.discard(call_id)
+                self._note_call_activity(call_id)
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                output,
+                received=received,
+                event_key=event_key,
+                continuation_instructions=(
+                    "The keypad tones were sent. Stay silent and listen to how the menu "
+                    "responds before speaking or sending more digits."
+                )
+                if output.get("ok")
+                else None,
             )
         elif name == "record_call_outcome":
             advisory_outcome: dict[str, Any] | None = None

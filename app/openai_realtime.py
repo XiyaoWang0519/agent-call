@@ -134,6 +134,32 @@ class RealtimeBridge:
                     "additionalProperties": False,
                 },
             },
+            {
+                "type": "function",
+                "name": "send_dtmf",
+                "description": (
+                    "Send keypad tones to navigate an automated phone menu (IVR), such as "
+                    "'press 2 for reservations'. The tones reach only the other party (the "
+                    "callee leg), not the human user on this call."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "digits": {
+                            "type": "string",
+                            "pattern": "^[0-9*#w]{1,32}$",
+                            "minLength": 1,
+                            "maxLength": 32,
+                            "description": (
+                                "Keypad digits to send (0-9, *, #). Use 'w' for a half-second "
+                                "pause. Send one short sequence at a time."
+                            ),
+                        }
+                    },
+                    "required": ["digits"],
+                    "additionalProperties": False,
+                },
+            },
         ]
         if self.settings.ask_poke_enabled:
             tools.append(
