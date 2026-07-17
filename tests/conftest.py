@@ -143,6 +143,9 @@ class FakeRealtime:
         self.tool_result_continuation_texts: list[str | None] = []
         self.tool_result_failures_remaining = 0
         self.accepts: list[tuple[str, str]] = []
+        self.suspend_calls: list[str] = []
+        self.suspend_failures_remaining = 0
+        self.request_response_calls: list[tuple[str, str | None]] = []
         self.update_event = {
             "type": "session.updated",
             "session": {
@@ -182,6 +185,18 @@ class FakeRealtime:
     async def enable_automatic_responses(self, call_id: str):
         self.events.append(("session.update", call_id))
         return self.update_event
+
+    async def suspend_automatic_responses(self, call_id: str):
+        if self.suspend_failures_remaining > 0:
+            self.suspend_failures_remaining -= 1
+            raise RuntimeError("injected suspend failure")
+        self.suspend_calls.append(call_id)
+        self.events.append(("session.update", call_id))
+        return self.initial_update_event
+
+    async def request_response(self, call_id: str, *, instructions: str | None = None) -> None:
+        self.request_response_calls.append((call_id, instructions))
+        self.events.append(("opening", call_id))
 
     async def accept_and_connect(
         self, *, call_id: str, openai_call_id: str, packet: ContextPacket

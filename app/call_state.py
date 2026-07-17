@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import time
 from collections import OrderedDict
@@ -72,6 +73,22 @@ class PendingQuestion:
     tool_call_id: str
     deadline_monotonic: float
     delivering: bool = False
+
+
+@dataclass(slots=True)
+class HoldState:
+    started_monotonic: float
+
+
+# Classic hold/queue announcements only (hold music cues, IVR queue messages) — deliberately
+# narrow so ordinary conversational "hang on a sec" from the callee does not mute the agent.
+HOLD_PHRASE_PATTERN = re.compile(
+    r"(please hold|hold the line|stay on the line|remain on the line|"
+    r"placed? you on hold|puts? you on hold|put you on (a brief )?hold|"
+    r"your call is (very )?important|next available (agent|representative|operator|team member)|"
+    r"call volume|currently (assisting|helping) other|in the order (it was|they were) received)",
+    re.IGNORECASE,
+)
 
 
 # Assistant speech / SIP playback evidence. On SIP sidebands, RTP carries the media, so
@@ -152,6 +169,7 @@ class CallService:
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
+        self._hold_state: dict[str, HoldState] = {}
         # Answered questions whose tool result never reached the sideband; a Poke retry
         # of answer_call_question re-attempts delivery instead of reporting already_answered.
         self._undelivered_answers: dict[str, set[str]] = {}
@@ -292,6 +310,7 @@ class CallService:
         self._clear_assistant_work(call_id)
         self._clear_call_activity(call_id)
         self._undelivered_answers.pop(call_id, None)
+        self._hold_state.pop(call_id, None)
 
     def _prune_activity_tombstones(self, now_ns: int | None = None) -> None:
         cutoff = monotonic_ns() if now_ns is None else now_ns
@@ -896,6 +915,15 @@ class CallService:
                     source_event_type=event_type,
                     source_event_id=event_id,
                 )
+                if self.settings.hold_detection_enabled:
+                    if call_id in self._hold_state:
+                        if HOLD_PHRASE_PATTERN.search(text):
+                            # Still on hold (re-announcement); just refresh liveness.
+                            self._note_call_activity(call_id)
+                        elif len(text) >= 3:
+                            await self._exit_hold(call_id, heard_text=text)
+                    elif HOLD_PHRASE_PATTERN.search(text):
+                        await self._enter_hold(call_id, trigger="transcript")
         elif event_type in {
             "response.output_audio_transcript.done",
             "response.audio_transcript.done",
@@ -1034,6 +1062,7 @@ class CallService:
         tool_call_id: str,
         output: dict[str, Any],
         *,
+        continue_response: bool = True,
         continuation_instructions: str | None = None,
     ) -> bool:
         """Swallow benign teardown races (e.g. "sideband is not open") so they cannot
@@ -1046,6 +1075,7 @@ class CallService:
                 call_id,
                 tool_call_id,
                 output,
+                continue_response=continue_response,
                 continuation_instructions=continuation_instructions,
             )
         except asyncio.CancelledError:
@@ -1069,6 +1099,7 @@ class CallService:
         received: LatencyMark,
         event_key: str,
         advisory_outcome: dict[str, Any] | None = None,
+        continue_response: bool = True,
         continuation_instructions: str | None = None,
     ) -> None:
         # Begin the one durable tool write before yielding to the WebSocket, but do not
@@ -1104,6 +1135,7 @@ class CallService:
                 call_id,
                 tool_call_id,
                 output,
+                continue_response=continue_response,
                 continuation_instructions=continuation_instructions,
             )
             return
@@ -1112,6 +1144,7 @@ class CallService:
                 call_id,
                 tool_call_id,
                 output,
+                continue_response=continue_response,
                 continuation_instructions=continuation_instructions,
             )
         finally:
@@ -1351,6 +1384,13 @@ class CallService:
                 received=received,
                 event_key=event_key,
             )
+        elif name == "report_hold":
+            await self._handle_report_hold(
+                call_id,
+                tool_call_id,
+                received=received,
+                event_key=event_key,
+            )
         else:
             await self._send_nontransfer_tool_result(
                 call_id,
@@ -1480,6 +1520,30 @@ class CallService:
         )
         # Leave the OpenAI function call open — answer/timeout deliver out-of-band.
 
+    async def _handle_report_hold(
+        self,
+        call_id: str,
+        tool_call_id: str,
+        *,
+        received: LatencyMark,
+        event_key: str,
+    ) -> None:
+        # Side effect (entering hold) before the tool result, matching end_call's
+        # convention of acting first and reporting the outcome second.
+        entered = await self._enter_hold(call_id, trigger="model_tool")
+        if entered:
+            output = {"status": "holding"}
+        else:
+            output = {"status": "not_on_hold"}
+        await self._send_nontransfer_tool_result(
+            call_id,
+            tool_call_id,
+            output,
+            received=received,
+            event_key=event_key,
+            continue_response=not entered,
+        )
+
     def _notify_call_event(self, call_id: str) -> None:
         ev = self._event_notifiers.pop(call_id, None)
         if ev is not None:
@@ -1500,6 +1564,61 @@ class CallService:
                 call_id,
                 exc_info=True,
             )
+
+    async def _enter_hold(self, call_id: str, *, trigger: str) -> bool:
+        if not self.settings.hold_detection_enabled or call_id in self._hold_state:
+            return False
+        call = await self.db.get_call(call_id)
+        if call is None or CallState(call["state"]) != CallState.ACTIVE:
+            return False
+        # Record hold state before the suspend-responses round trip so a concurrent
+        # detection (transcript race with the model tool) cannot double-enter.
+        self._hold_state[call_id] = HoldState(started_monotonic=time.monotonic())
+        await self._cancel_active_response(call_id)
+        try:
+            await self.realtime.suspend_automatic_responses(call_id)
+        except Exception:
+            logger.warning(
+                "failed to suspend automatic responses for hold call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+            # The call stays live rather than half-held: no suppressed responses without
+            # a confirmed session update.
+            self._hold_state.pop(call_id, None)
+            return False
+        self._note_call_activity(call_id, LatencyMark.now())
+        logger.info("call entered hold call_id=%s trigger=%s", call_id, trigger)
+        return True
+
+    async def _exit_hold(self, call_id: str, *, heard_text: str) -> None:
+        # Pop first, deterministically: if re-enabling automatic responses fails below,
+        # the stale watchdog reaps the call instead of leaving it muted forever.
+        self._hold_state.pop(call_id, None)
+        try:
+            await self.realtime.enable_automatic_responses(call_id)
+        except Exception:
+            logger.warning(
+                "failed to resume automatic responses after hold call_id=%s",
+                call_id,
+                exc_info=True,
+            )
+            return
+        truncated = heard_text[:200]
+        instructions = (
+            f"The other party has returned after a hold. They just said: {truncated!r}. "
+            "Re-engage naturally and continue pursuing the approved objective."
+        )
+        try:
+            await self.realtime.request_response(call_id, instructions=instructions)
+        except Exception:
+            # Automatic responses are already back on; a missed nudge just costs one
+            # beat of dead air, not a stuck-muted call, so this must not raise into
+            # the event dispatcher.
+            logger.warning("failed to send hold resume nudge call_id=%s", call_id, exc_info=True)
+            return
+        self._note_call_activity(call_id, LatencyMark.now())
+        logger.info("call exited hold call_id=%s", call_id)
 
     def _clear_pending_question(self, call_id: str, question_id: str | None = None) -> None:
         pending = self._pending_questions.get(call_id)
@@ -2662,7 +2781,7 @@ class CallService:
         duration = max(0, int((ended_at - started_at).total_seconds()))
         if reason == "transfer_completed":
             terminal = CallState.TRANSFERRED
-        elif reason in {"time_limit", "setup_deadline", "watchdog_stale"}:
+        elif reason in {"time_limit", "setup_deadline", "watchdog_stale", "hold_timeout"}:
             terminal = CallState.TIMED_OUT
         elif reason in {
             "callee_participant_leave",
@@ -3036,6 +3155,20 @@ class CallService:
             ):
                 # Outstanding ask_poke: silence is expected until answer/deadline delivery
                 # finishes (delivering) or deadline+grace (covers cancel+send bounds).
+                continue
+            hold = self._hold_state.get(call_id)
+            if hold is not None:
+                if time.monotonic() - hold.started_monotonic >= self.settings.hold_max_seconds:
+                    # Hold elapsed is monotonic and one-way, so no re-check dance is needed
+                    # between this decision and the claim; reuse the stale-path protocol.
+                    self._watchdog_claims.add(call_id)
+                    terminated = False
+                    try:
+                        terminated = await self.terminate_call(call_id, "hold_timeout")
+                    finally:
+                        if not terminated:
+                            self._watchdog_claims.discard(call_id)
+                # else: silence is expected while on hold, within budget.
                 continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue

@@ -188,6 +188,26 @@ class RealtimeBridge:
                     },
                 }
             )
+        if self.settings.hold_detection_enabled:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "report_hold",
+                    "description": (
+                        "Call this when you have been placed on hold, hear hold music, or an "
+                        "automated message asks you to wait on the line. After calling it, stay "
+                        "silent until a human returns."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {"type": "string", "maxLength": 200},
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                }
+            )
         tools.append(
             {
                 "type": "function",
@@ -221,7 +241,9 @@ class RealtimeBridge:
         )
         return AcceptPayload(
             instructions=realtime_instructions(
-                packet, ask_poke_enabled=self.settings.ask_poke_enabled
+                packet,
+                ask_poke_enabled=self.settings.ask_poke_enabled,
+                hold_detection_enabled=self.settings.hold_detection_enabled,
             ),
             audio={
                 "input": self._input_audio_config(create_response=False, interrupt_response=False),
@@ -579,14 +601,17 @@ class RealtimeBridge:
             self._input_audio_config(create_response=True, interrupt_response=True),
         )
 
-    async def create_opening(self, call_id: str) -> None:
-        await self.send(
+    async def suspend_automatic_responses(self, call_id: str) -> dict[str, Any]:
+        # Stop the model from generating responses on its own (that is where hold-time
+        # cost comes from) while leaving semantic VAD and input transcription active, so
+        # a human returning from hold is still transcribed and can be detected.
+        return await self._update_session(
             call_id,
-            {
-                "type": "response.create",
-                "response": {"output_modalities": ["audio"]},
-            },
+            self._input_audio_config(create_response=False, interrupt_response=False),
         )
+
+    async def create_opening(self, call_id: str) -> None:
+        await self.request_response(call_id)
 
     async def cancel_response(self, call_id: str, response_id: str | None = None) -> None:
         event: dict[str, Any] = {"type": "response.cancel"}
@@ -595,19 +620,19 @@ class RealtimeBridge:
         await self.send(call_id, event)
 
     async def create_voicemail(self, call_id: str) -> None:
-        await self.send(
+        await self.request_response(
             call_id,
-            {
-                "type": "response.create",
-                "response": {
-                    "output_modalities": ["audio"],
-                    "instructions": (
-                        "Leave one concise voicemail that advances the approved objective using only "
-                        "the approved context. Do not ask questions."
-                    ),
-                },
-            },
+            instructions=(
+                "Leave one concise voicemail that advances the approved objective using only "
+                "the approved context. Do not ask questions."
+            ),
         )
+
+    async def request_response(self, call_id: str, *, instructions: str | None = None) -> None:
+        response: dict[str, Any] = {"output_modalities": ["audio"]}
+        if instructions:
+            response["instructions"] = instructions
+        await self.send(call_id, {"type": "response.create", "response": response})
 
     async def send_tool_result(
         self,
