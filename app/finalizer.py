@@ -153,7 +153,9 @@ class Finalizer:
         await self.db.save_result_with_transcript(call_id, fallback, transcript)
 
         try:
-            extracted = await self._extract(call, plan, transcript)
+            extracted, (extractor_input_tokens, extractor_output_tokens) = await self._extract(
+                call, plan, transcript
+            )
         except Exception:
             logger.exception("post-call extraction failed for %s", call_id)
             turn_ids = [turn.turn_id for turn in transcript]
@@ -191,13 +193,19 @@ class Finalizer:
             transcript_complete=transcript_complete,
             raw_transcript_available=True,
         )
+        if extractor_input_tokens or extractor_output_tokens:
+            await self.db.add_extractor_usage(
+                call_id,
+                input_tokens=extractor_input_tokens,
+                output_tokens=extractor_output_tokens,
+            )
         await self.db.save_result_with_transcript(call_id, result, transcript)
         await self._maybe_push(result)
         return result
 
     async def _extract(
         self, call: dict[str, Any], plan: dict[str, Any], transcript: list[Any]
-    ) -> ExtractedCallResult:
+    ) -> tuple[ExtractedCallResult, tuple[int, int]]:
         evidence_ids = {turn.turn_id for turn in transcript}
         payload = {
             "approved_plan": ContextPacket.model_validate(plan["context"]).model_dump(mode="json"),
@@ -214,6 +222,8 @@ class Finalizer:
             ],
         }
         last_unknown: list[str] = []
+        total_input_tokens = 0
+        total_output_tokens = 0
         for attempt in range(2):
             instructions = EXTRACTOR_INSTRUCTIONS
             if last_unknown:
@@ -231,6 +241,9 @@ class Finalizer:
                     store=False,
                     timeout=self.settings.openai_extraction_timeout_seconds,
                 )
+                usage = getattr(response, "usage", None)
+                total_input_tokens += getattr(usage, "input_tokens", 0) or 0
+                total_output_tokens += getattr(usage, "output_tokens", 0) or 0
                 parsed = response.output_parsed
                 if parsed is None:
                     raise ValueError("extractor returned no parsed output")
@@ -247,7 +260,7 @@ class Finalizer:
                 }
                 if unknown:
                     raise UnknownEvidenceError(unknown)
-                return parsed
+                return parsed, (total_input_tokens, total_output_tokens)
             except UnknownEvidenceError as exc:
                 if attempt == 0:
                     last_unknown = sorted(exc.unknown_ids)
