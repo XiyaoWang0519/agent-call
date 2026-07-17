@@ -66,7 +66,18 @@ CREATE TABLE IF NOT EXISTS calls (
     started_at TEXT,
     answered_at TEXT,
     ended_at TEXT,
-    duration_seconds INTEGER
+    duration_seconds INTEGER,
+    realtime_input_text_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_input_audio_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_input_cached_text_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_input_cached_audio_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_output_text_tokens INTEGER NOT NULL DEFAULT 0,
+    realtime_output_audio_tokens INTEGER NOT NULL DEFAULT 0,
+    extractor_input_tokens INTEGER NOT NULL DEFAULT 0,
+    extractor_output_tokens INTEGER NOT NULL DEFAULT 0,
+    exa_search_count INTEGER NOT NULL DEFAULT 0,
+    exa_cost_dollars REAL NOT NULL DEFAULT 0,
+    twilio_reported_duration_seconds INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS calls_state_idx ON calls(state);
@@ -308,6 +319,17 @@ class Database:
             "opening_sent": "INTEGER NOT NULL DEFAULT 0",
             "twilio_owner_call_sid": "TEXT",
             "conference_cleanup_pending": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_text_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_audio_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_cached_text_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_input_cached_audio_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_output_text_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "realtime_output_audio_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "extractor_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "extractor_output_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "exa_search_count": "INTEGER NOT NULL DEFAULT 0",
+            "exa_cost_dollars": "REAL NOT NULL DEFAULT 0",
+            "twilio_reported_duration_seconds": "INTEGER",
         }
         for name, definition in migrations.items():
             if name not in existing:
@@ -650,6 +672,57 @@ class Database:
         ]
         params.append(call_id)
         return await self.execute(f"UPDATE calls SET {columns} WHERE call_id=?", params) == 1
+
+    async def add_realtime_usage(
+        self,
+        call_id: str,
+        *,
+        input_text_tokens: int,
+        input_audio_tokens: int,
+        input_cached_text_tokens: int,
+        input_cached_audio_tokens: int,
+        output_text_tokens: int,
+        output_audio_tokens: int,
+    ) -> None:
+        await self.execute(
+            """UPDATE calls
+               SET realtime_input_text_tokens = realtime_input_text_tokens + ?,
+                   realtime_input_audio_tokens = realtime_input_audio_tokens + ?,
+                   realtime_input_cached_text_tokens = realtime_input_cached_text_tokens + ?,
+                   realtime_input_cached_audio_tokens = realtime_input_cached_audio_tokens + ?,
+                   realtime_output_text_tokens = realtime_output_text_tokens + ?,
+                   realtime_output_audio_tokens = realtime_output_audio_tokens + ?
+               WHERE call_id = ?""",
+            (
+                input_text_tokens,
+                input_audio_tokens,
+                input_cached_text_tokens,
+                input_cached_audio_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+                call_id,
+            ),
+        )
+
+    async def add_extractor_usage(
+        self, call_id: str, *, input_tokens: int, output_tokens: int
+    ) -> None:
+        await self.execute(
+            """UPDATE calls
+               SET extractor_input_tokens = extractor_input_tokens + ?,
+                   extractor_output_tokens = extractor_output_tokens + ?
+               WHERE call_id = ?""",
+            (input_tokens, output_tokens, call_id),
+        )
+
+    async def record_exa_search(self, call_id: str, *, cost_dollars: float) -> None:
+        await self.execute(
+            """UPDATE calls
+               SET exa_search_count = exa_search_count + 1,
+                   exa_cost_dollars = exa_cost_dollars + ?
+               WHERE call_id = ?""",
+            (cost_dollars, call_id),
+        )
 
     async def cas_state(self, call_id: str, expected: CallState, replacement: CallState) -> bool:
         return (

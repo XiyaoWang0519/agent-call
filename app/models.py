@@ -357,6 +357,31 @@ class VoiceEndCallRequest(BaseModel):
     ]
 
 
+class CallUsage(BaseModel):
+    realtime_input_text_tokens: int = 0
+    realtime_input_audio_tokens: int = 0
+    realtime_input_cached_text_tokens: int = 0
+    realtime_input_cached_audio_tokens: int = 0
+    realtime_output_text_tokens: int = 0
+    realtime_output_audio_tokens: int = 0
+    extractor_input_tokens: int = 0
+    extractor_output_tokens: int = 0
+    exa_search_count: int = 0
+    twilio_reported_duration_seconds: int | None = None
+    billable_duration_seconds: int | None = None
+
+
+class CallCost(BaseModel):
+    currency: str = "USD"
+    estimated: bool = True
+    usage: CallUsage
+    realtime_cost_usd: float
+    extractor_cost_usd: float
+    twilio_cost_usd: float
+    exa_cost_usd: float
+    total_cost_usd: float
+
+
 class CallSnapshot(BaseModel):
     call_id: str
     state: CallState
@@ -368,6 +393,7 @@ class CallSnapshot(BaseModel):
     answer_handling: str | None = None
     duration_seconds: int | None = None
     result: StoredCallResult | None = None
+    cost: CallCost | None = None
 
 
 class ToolErrorBody(BaseModel):

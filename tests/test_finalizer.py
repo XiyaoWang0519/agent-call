@@ -16,9 +16,10 @@ from tests.conftest import seed_call
 
 
 class FakeResponses:
-    def __init__(self, parsed=None, error=None):
+    def __init__(self, parsed=None, error=None, usage=None):
         self.parsed = parsed
         self.error = error
+        self.usage = usage
         self.calls = 0
         self.timeouts: list[float] = []
 
@@ -27,7 +28,7 @@ class FakeResponses:
         self.timeouts.append(kwargs["timeout"])
         if self.error:
             raise self.error
-        return SimpleNamespace(output_parsed=self.parsed)
+        return SimpleNamespace(output_parsed=self.parsed, usage=self.usage)
 
 
 def _stored_result(**overrides) -> StoredCallResult:
@@ -365,7 +366,9 @@ async def test_optional_push_sends_owner_summary_text(settings, service, packet)
         source_event_type="transcription.completed",
         source_event_id="evt_1",
     )
-    finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=FakeResponses(parsed=parsed)))
+    finalizer = Finalizer(
+        settings, service.db, SimpleNamespace(responses=FakeResponses(parsed=parsed))
+    )
 
     result = await finalizer.finalize(call_id)
 
@@ -430,6 +433,30 @@ async def test_extractor_retries_one_server_error(settings, service, packet):
 
     assert responses.calls == 2
     assert result.finalization_status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_extractor_usage_is_persisted_to_calls_row(settings, service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    parsed = ExtractedCallResult(
+        outcome="completed",
+        summary="Completed.",
+        commitments=[],
+        confirmation_numbers=[],
+        follow_ups=[],
+        confidence=0.9,
+    )
+    responses = FakeResponses(
+        parsed=parsed, usage=SimpleNamespace(input_tokens=123, output_tokens=45)
+    )
+    finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=responses))
+
+    result = await finalizer.finalize(call_id)
+
+    assert result.finalization_status == "succeeded"
+    call = await service.db.get_call(call_id)
+    assert call["extractor_input_tokens"] == 123
+    assert call["extractor_output_tokens"] == 45
 
 
 @pytest.mark.asyncio
