@@ -1514,13 +1514,14 @@ class CallService:
         )
         logger.info(
             "ask_poke asked call_id=%s question_id=%s tool_call_id=%s sequence=%s "
-            "question=%r reason=%r",
+            "question_chars=%s question=%r reason=%r",
             call_id,
             row["question_id"],
             tool_call_id,
             row["sequence_number"],
-            request.question,
-            request.reason,
+            len(request.question),
+            _truncate_for_log(request.question),
+            None if request.reason is None else _truncate_for_log(request.reason),
         )
         if self.settings.poke_push_enabled:
             self._spawn(
