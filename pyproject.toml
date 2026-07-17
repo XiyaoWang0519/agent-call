@@ -20,11 +20,14 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "mypy>=1.17.0",
+    "pre-commit>=4.2.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
     "respx>=0.23.1",
     "ruff>=0.15.21",
+    "types-protobuf>=6.30.2",
 ]
 
 [build-system]
@@ -45,3 +48,27 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 ignore = ["B008", "E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+warn_unreachable = true
+show_error_codes = true
+packages = ["app"]
+exclude = [
+    "tests/",
+    "scripts/",
+    "dist/",
+]
+
+# Third-party packages without complete stubs.
+[[tool.mypy.overrides]]
+module = [
+    "twilio.*",
+    "phonenumbers.*",
+    "fastmcp.*",
+    "aiosqlite.*",
+]
+ignore_missing_imports = true

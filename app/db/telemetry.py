@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.protocols import DatabaseAccess
+
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -62,7 +67,7 @@ class LatencyMark:
 
 class TelemetryMixin:
     async def record_latency_events(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         events: Iterable[tuple[LatencyStage, LatencyMark, str]],
     ) -> None:
@@ -83,7 +88,7 @@ class TelemetryMixin:
             await conn.executemany(UPSERT_LATENCY_EVENT, rows)
 
     async def record_latency_event(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         stage: LatencyStage,
         mark: LatencyMark | None = None,
@@ -95,7 +100,7 @@ class TelemetryMixin:
             [(stage, mark or LatencyMark.now(), event_key)],
         )
 
-    async def get_latency_events(self, call_id: str) -> list[dict[str, Any]]:
+    async def get_latency_events(self: DatabaseAccess, call_id: str) -> list[dict[str, Any]]:
         return await self.fetch_all(
             """SELECT stage, event_key, occurred_at, monotonic_ns, clock_id
                FROM call_latency_events WHERE call_id=? ORDER BY occurred_at, id""",
@@ -103,7 +108,7 @@ class TelemetryMixin:
         )
 
     async def record_tool_call(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         *,
         latency_mark: LatencyMark,
@@ -141,7 +146,7 @@ class TelemetryMixin:
                 ),
             )
 
-    async def mark_tool_continuation_observed(self, call_id: str) -> bool:
+    async def mark_tool_continuation_observed(self: DatabaseAccess, call_id: str) -> bool:
         """Record a continuation only when at least one tool call was durably received."""
 
         return await self._execute_cas(

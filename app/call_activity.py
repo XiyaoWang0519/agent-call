@@ -30,7 +30,7 @@ class CallActivityTracker:
         db: Database,
         *,
         is_audio_drain_active: Callable[[str], bool],
-        clear_audio_drain: Callable[[str], None],
+        clear_audio_drain: Callable[[str], object],
     ) -> None:
         self._db = db
         self._is_audio_drain_active = is_audio_drain_active

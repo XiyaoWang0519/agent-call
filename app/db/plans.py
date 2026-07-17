@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.protocols import DatabaseAccess
+
 import json
 from datetime import datetime
 from typing import Any
@@ -11,7 +16,7 @@ from app.models import CallState
 
 class PlansMixin:
     async def create_plan(
-        self,
+        self: DatabaseAccess,
         plan_id: str,
         context: dict[str, Any],
         authority_basis: str | None,
@@ -25,11 +30,11 @@ class PlansMixin:
             (plan_id, json.dumps(context), authority_basis, now, expires_at.isoformat()),
         )
 
-    async def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+    async def get_plan(self: DatabaseAccess, plan_id: str) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM plans WHERE plan_id = ?", (plan_id,))
 
     async def claim_plan_and_create_call(
-        self,
+        self: DatabaseAccess,
         *,
         plan_id: str,
         call_id: str,

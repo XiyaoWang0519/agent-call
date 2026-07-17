@@ -181,7 +181,7 @@ class OwnerTransferCoordinator:
                         and not current.get("termination_claimed")
                         and current.get("transfer_outcome") == joining
                     )
-                    if not exact_joining:
+                    if not exact_joining or current is None:
                         if claim_error is not None:
                             raise claim_error
                         return None, "owner transfer already attempted or call is ending"
@@ -216,7 +216,8 @@ class OwnerTransferCoordinator:
             name=f"claim-owner-transfer:{call_id}",
             must_finish=True,
         )
-        return await self._await_network_task(claim)
+        result = await self._await_network_task(claim)
+        return result  # type: ignore[no-any-return]
 
 
 class OwnerTransferRun:

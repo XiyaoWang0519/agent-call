@@ -10,6 +10,9 @@
 - `uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload`: run the local service with reload.
 - `uv run ruff format --check app tests scripts`: verify formatting.
 - `uv run ruff check app tests scripts`: run configured lint and import checks.
+- `uv run mypy app`: run strict mypy type checking on the application package.
+- `uv run pre-commit install`: install local git hooks (ruff, large-file check, gitleaks, mypy).
+- `uv run pre-commit run --all-files`: run the same hooks on the full tree.
 - `uv run pytest -q`: run the automated test suite.
 - `uv run pytest -q tests/test_security.py`: run one focused test module.
 - `uv run python scripts/run_sip_canary.py --mode full`: validate a deployed SIP flow; this places a real call and requires configured credentials.
@@ -29,6 +32,21 @@ Recent history uses short, imperative, sentence-case subjects such as `Add call-
 ## Security & Operations
 
 Copy `.env.example` to `.env.local`; never commit secrets, transcripts, or database files. Preserve webhook signature checks, replay protection, destination policy, and explicit call confirmation. Do not deploy or restart while a call is active, and keep production to one Fly Machine because SQLite state is volume-local.
+
+### Rollback (one-command recovery)
+
+If a deploy breaks production, do not redeploy a fix while debugging. Roll back first:
+
+1. Confirm no active calls (or wait for them to finish):
+   `curl -sS -H "Authorization: Bearer $DEPLOY_GUARD_TOKEN" https://poke-call.fly.dev/internal/deployment-lock`
+2. List recent releases:
+   `flyctl releases -a poke-call`
+3. Roll back to the previous healthy image (one click / one command):
+   `flyctl releases rollback -a poke-call`
+4. Verify:
+   `curl -fsS https://poke-call.fly.dev/healthz`
+
+`flyctl releases rollback` restores the prior release image without a full rebuild. Only re-deploy after calls are idle and the fix is verified locally (`ruff` + `mypy` + `pytest`).
 
 ## Cursor Cloud specific instructions
 

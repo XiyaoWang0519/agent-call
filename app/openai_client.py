@@ -17,14 +17,9 @@ def create_openai_client(settings: Settings) -> AsyncOpenAI:
         settings.openai_http_timeout_seconds,
         connect=settings.openai_connect_timeout_seconds,
     )
-    options: dict[str, object] = {
-        "api_key": Settings.reveal(settings.openai_api_key),
-        "webhook_secret": Settings.reveal(settings.openai_webhook_secret),
-        "timeout": timeout,
-        "max_retries": 0,
-    }
+    http_client: httpx.AsyncClient | None = None
     if settings.openai_keepalive_expiry_seconds is not None:
-        options["http_client"] = httpx.AsyncClient(
+        http_client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             limits=httpx.Limits(
@@ -33,4 +28,17 @@ def create_openai_client(settings: Settings) -> AsyncOpenAI:
                 keepalive_expiry=settings.openai_keepalive_expiry_seconds,
             ),
         )
-    return AsyncOpenAI(**options)
+    if http_client is None:
+        return AsyncOpenAI(
+            api_key=Settings.reveal(settings.openai_api_key),
+            webhook_secret=Settings.reveal(settings.openai_webhook_secret),
+            timeout=timeout,
+            max_retries=0,
+        )
+    return AsyncOpenAI(
+        api_key=Settings.reveal(settings.openai_api_key),
+        webhook_secret=Settings.reveal(settings.openai_webhook_secret),
+        timeout=timeout,
+        max_retries=0,
+        http_client=http_client,
+    )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -36,7 +37,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         context: ContextPacket,
         authority_basis: str | None = None,
         requested_by_owner: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         try:
             output = await get_service().prepare(
                 PreparePhoneCallInput(
@@ -60,7 +61,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
     )
     async def start_phone_call(
         plan_id: str, explicit_confirmation: bool, confirmation_text: str
-    ) -> dict:
+    ) -> dict[str, Any]:
         try:
             result = await get_service().start(
                 plan_id,
@@ -79,7 +80,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
             + CONTEXT_GUIDANCE
         ),
     )
-    async def get_call_result(call_id: str) -> dict:
+    async def get_call_result(call_id: str) -> dict[str, Any]:
         try:
             return await get_service().get_result(call_id)
         except LookupError as exc:
@@ -89,7 +90,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         name="end_phone_call",
         description="End an active call at the owner's request. " + CONTEXT_GUIDANCE,
     )
-    async def end_phone_call(call_id: str) -> dict:
+    async def end_phone_call(call_id: str) -> dict[str, Any]:
         ended = await get_service().terminate_call(call_id, "owner_request")
         return {"call_id": call_id, "termination_started": ended}
 
@@ -97,7 +98,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         name="get_phone_call",
         description="Return lightweight call status and timing fields. " + CONTEXT_GUIDANCE,
     )
-    async def get_phone_call(call_id: str) -> dict:
+    async def get_phone_call(call_id: str) -> dict[str, Any]:
         try:
             snapshot = await get_service().get_snapshot(call_id)
         except LookupError as exc:
@@ -117,7 +118,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         call_id: str,
         after_sequence: int = 0,
         timeout_seconds: float = 20.0,
-    ) -> dict:
+    ) -> dict[str, Any]:
         logger.info(
             "mcp tool wait_for_call_event call_id=%s after_sequence=%s timeout_seconds=%s",
             call_id,
@@ -164,7 +165,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
             + CONTEXT_GUIDANCE
         ),
     )
-    async def answer_call_question(call_id: str, question_id: str, answer: str) -> dict:
+    async def answer_call_question(call_id: str, question_id: str, answer: str) -> dict[str, Any]:
         logger.info(
             "mcp tool answer_call_question call_id=%s question_id=%s answer_chars=%s",
             call_id,

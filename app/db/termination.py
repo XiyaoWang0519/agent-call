@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.protocols import DatabaseAccess
+
 from typing import Any
 
 from app.db.engine import _decode_json_columns, _iso_now
@@ -7,7 +12,9 @@ from app.models import TERMINAL_STATES, CallState
 
 
 class TerminationMixin:
-    async def claim_termination(self, call_id: str, reason: str) -> dict[str, Any] | None:
+    async def claim_termination(
+        self: DatabaseAccess, call_id: str, reason: str
+    ) -> dict[str, Any] | None:
         """Atomically claim and enter termination, returning the claimed current row."""
 
         placeholders, terminal_states = self._in_clause(state.value for state in TERMINAL_STATES)
@@ -35,7 +42,7 @@ class TerminationMixin:
         return _decode_json_columns(dict(row)) if row else None
 
     async def claim_startup_recovery(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         *,
         expected_transfer_outcome: str | None,
@@ -89,7 +96,7 @@ class TerminationMixin:
         return _decode_json_columns(dict(row)) if row else None
 
     async def finish_claimed_termination(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         *,
         expected_reason: str,
@@ -121,7 +128,7 @@ class TerminationMixin:
             params,
         )
 
-    async def reset_termination_claim(self, call_id: str) -> None:
+    async def reset_termination_claim(self: DatabaseAccess, call_id: str) -> None:
         placeholders, terminal_states = self._in_clause(state.value for state in TERMINAL_STATES)
         await self.execute(
             f"""UPDATE calls SET termination_claimed=0

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -296,7 +296,7 @@ class DatabaseEngine:
         await conn.commit()
 
     @asynccontextmanager
-    async def _write_connection(self):
+    async def _write_connection(self) -> AsyncIterator[aiosqlite.Connection]:
         async with self._write_lock:
             conn = self._writer
             if conn is None:
@@ -332,7 +332,7 @@ class DatabaseEngine:
             raise asyncio.CancelledError
 
     @asynccontextmanager
-    async def _read_connection(self):
+    async def _read_connection(self) -> AsyncIterator[aiosqlite.Connection]:
         async with self._read_lock:
             conn = self._reader
             if conn is None:
@@ -366,7 +366,7 @@ class DatabaseEngine:
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
         async with self._write_connection() as conn:
             async with conn.execute(sql, tuple(params)) as cursor:
-                rowcount = cursor.rowcount
+                rowcount = int(cursor.rowcount)
             await conn.commit()
             return rowcount
 
@@ -395,7 +395,7 @@ class DatabaseEngine:
         return ",".join("?" for _ in values), values
 
     @asynccontextmanager
-    async def _immediate_transaction(self):
+    async def _immediate_transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         """BEGIN IMMEDIATE, run the body, commit on normal exit.
 
         Only fits blocks that always commit once entered (no conditional early-return

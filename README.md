@@ -184,6 +184,26 @@ flyctl status -a poke-call
 > [!IMPORTANT]
 > Keep exactly **one** Machine. SQLite state is volume-local; a second Machine would not share call state. `render.yaml` remains available as a paid Render alternative.
 
+
+### Rollback
+
+If a bad deploy reaches production, roll back first (do not redeploy while diagnosing):
+
+```bash
+# Confirm no active calls, or wait for them
+curl -sS -H "Authorization: Bearer $DEPLOY_GUARD_TOKEN" \
+  https://poke-call.fly.dev/internal/deployment-lock
+
+# List recent releases and restore the previous healthy image
+flyctl releases -a poke-call
+flyctl releases rollback -a poke-call
+
+# Verify
+curl -fsS https://poke-call.fly.dev/healthz
+```
+
+`flyctl releases rollback` restores the prior release image without a full rebuild. Re-deploy only after calls are idle and local checks pass (`ruff`, `mypy`, `pytest`).
+
 **CI/CD:** `.github/workflows/fly-deploy.yml` runs the locked test suite and deploys every push to `main`. It serializes production deployments, waits up to 10 minutes for active calls to finish via the authenticated `/internal/deployment-lock` lease, keeps `--ha=false`, and checks `/healthz` before reporting success. It needs the repository secrets `FLY_API_TOKEN` (app-scoped deploy token) and `DEPLOY_GUARD_TOKEN` — store the latter independently from the MCP and debug tokens; it can only touch the deployment lease. The lease is acquired atomically only when no call is active, blocks new calls while a deployment starts, expires after 15 minutes if canceled, and is cleared by a successful restart.
 
 ## 🔬 The fine print

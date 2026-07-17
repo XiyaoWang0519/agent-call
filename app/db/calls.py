@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.protocols import DatabaseAccess
+
 from collections.abc import Iterable
 from typing import Any
 
@@ -37,32 +42,36 @@ _UPDATE_CALL_ALLOWED_COLUMNS = frozenset(
 
 
 class CallsMixin:
-    async def get_call(self, call_id: str) -> dict[str, Any] | None:
+    async def get_call(self: DatabaseAccess, call_id: str) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM calls WHERE call_id=?", (call_id,))
 
-    async def get_call_by_openai_id(self, openai_call_id: str) -> dict[str, Any] | None:
+    async def get_call_by_openai_id(
+        self: DatabaseAccess, openai_call_id: str
+    ) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM calls WHERE openai_call_id=?", (openai_call_id,))
 
-    async def get_call_by_twilio_sid(self, sid: str) -> dict[str, Any] | None:
+    async def get_call_by_twilio_sid(self: DatabaseAccess, sid: str) -> dict[str, Any] | None:
         return await self.fetch_one(
             """SELECT * FROM calls
                WHERE twilio_ai_call_sid=? OR twilio_callee_call_sid=?""",
             (sid, sid),
         )
 
-    async def list_calls(self, limit: int = 100) -> list[dict[str, Any]]:
+    async def list_calls(self: DatabaseAccess, limit: int = 100) -> list[dict[str, Any]]:
         return await self.fetch_all(
             "SELECT * FROM calls ORDER BY created_at DESC LIMIT ?", (limit,)
         )
 
-    async def list_nonterminal_calls(self) -> list[dict[str, Any]]:
+    async def list_nonterminal_calls(self: DatabaseAccess) -> list[dict[str, Any]]:
         placeholders, params = self._in_clause(state.value for state in TERMINAL_STATES)
         return await self.fetch_all(
             f"SELECT * FROM calls WHERE state NOT IN ({placeholders})",  # noqa: S608
             params,
         )
 
-    async def list_terminal_calls_needing_finalization(self) -> list[dict[str, Any]]:
+    async def list_terminal_calls_needing_finalization(
+        self: DatabaseAccess,
+    ) -> list[dict[str, Any]]:
         placeholders, params = self._in_clause(state.value for state in TERMINAL_STATES)
         return await self.fetch_all(
             f"""SELECT calls.* FROM calls
@@ -76,21 +85,23 @@ class CallsMixin:
             params,
         )
 
-    async def set_conference_cleanup_pending(self, call_id: str, pending: bool) -> None:
+    async def set_conference_cleanup_pending(
+        self: DatabaseAccess, call_id: str, pending: bool
+    ) -> None:
         await self.execute(
             "UPDATE calls SET conference_cleanup_pending=? WHERE call_id=?",
             (1 if pending else 0, call_id),
         )
 
-    async def list_conference_cleanup_pending(self) -> list[dict[str, Any]]:
+    async def list_conference_cleanup_pending(self: DatabaseAccess) -> list[dict[str, Any]]:
         return await self.fetch_all("SELECT * FROM calls WHERE conference_cleanup_pending=1")
 
-    async def touch_call(self, call_id: str) -> None:
+    async def touch_call(self: DatabaseAccess, call_id: str) -> None:
         await self.execute(
             "UPDATE calls SET last_event_at=? WHERE call_id=?", (_iso_now(), call_id)
         )
 
-    async def touch_calls(self, activity: Iterable[tuple[str, str]]) -> None:
+    async def touch_calls(self: DatabaseAccess, activity: Iterable[tuple[str, str]]) -> None:
         """Persist latest observed activity for several calls in one durable transaction."""
         placeholders, terminal_states = self._in_clause(
             sorted(state.value for state in TERMINAL_STATES)
@@ -109,7 +120,7 @@ class CallsMixin:
                 rows,
             )
 
-    async def update_call(self, call_id: str, **values: Any) -> bool:
+    async def update_call(self: DatabaseAccess, call_id: str, **values: Any) -> bool:
         if not values:
             return True
         unknown = values.keys() - _UPDATE_CALL_ALLOWED_COLUMNS
@@ -125,7 +136,7 @@ class CallsMixin:
         return await self._execute_cas(f"UPDATE calls SET {columns} WHERE call_id=?", params)
 
     async def add_realtime_usage(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         *,
         input_text_tokens: int,
@@ -156,7 +167,7 @@ class CallsMixin:
         )
 
     async def add_extractor_usage(
-        self, call_id: str, *, input_tokens: int, output_tokens: int
+        self: DatabaseAccess, call_id: str, *, input_tokens: int, output_tokens: int
     ) -> None:
         await self.execute(
             """UPDATE calls
@@ -166,7 +177,7 @@ class CallsMixin:
             (input_tokens, output_tokens, call_id),
         )
 
-    async def record_exa_search(self, call_id: str, *, cost_dollars: float) -> None:
+    async def record_exa_search(self: DatabaseAccess, call_id: str, *, cost_dollars: float) -> None:
         await self.execute(
             """UPDATE calls
                SET exa_search_count = exa_search_count + 1,
@@ -175,14 +186,16 @@ class CallsMixin:
             (cost_dollars, call_id),
         )
 
-    async def cas_state(self, call_id: str, expected: CallState, replacement: CallState) -> bool:
+    async def cas_state(
+        self: DatabaseAccess, call_id: str, expected: CallState, replacement: CallState
+    ) -> bool:
         return await self._execute_cas(
             """UPDATE calls SET state=?, last_event_at=?
                WHERE call_id=? AND state=?""",
             (replacement.value, _iso_now(), call_id, expected.value),
         )
 
-    async def set_flag_once(self, call_id: str, flag: str) -> bool:
+    async def set_flag_once(self: DatabaseAccess, call_id: str, flag: str) -> bool:
         allowed = {
             "sideband_open",
             "callee_joined",
@@ -198,7 +211,9 @@ class CallsMixin:
             (_iso_now(), call_id),
         )
 
-    async def set_amd_once(self, call_id: str, answered_by: str, handling: str) -> bool:
+    async def set_amd_once(
+        self: DatabaseAccess, call_id: str, answered_by: str, handling: str
+    ) -> bool:
         return await self._execute_cas(
             """UPDATE calls
                SET amd_result=?, answered_by=?, answer_handling=?, last_event_at=?
@@ -206,7 +221,7 @@ class CallsMixin:
             (answered_by, answered_by, handling, _iso_now(), call_id),
         )
 
-    async def claim_opening_if_not_voicemail(self, call_id: str) -> bool:
+    async def claim_opening_if_not_voicemail(self: DatabaseAccess, call_id: str) -> bool:
         """Atomically claim the opening unless AMD has already classified voicemail."""
         return await self._execute_cas(
             """UPDATE calls SET opening_sent=1, last_event_at=?
