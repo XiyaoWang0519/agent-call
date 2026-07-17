@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -243,7 +244,14 @@ class RealtimeFunctionTool(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["function"] = "function"
-    name: Literal["transfer_to_owner", "record_call_outcome", "search_web", "ask_poke", "end_call"]
+    name: Literal[
+        "transfer_to_owner",
+        "record_call_outcome",
+        "search_web",
+        "send_dtmf",
+        "ask_poke",
+        "end_call",
+    ]
     description: str = Field(min_length=1)
     parameters: dict[str, Any]
 
@@ -287,6 +295,23 @@ class WebSearchRequest(BaseModel):
         normalized = " ".join(value.split())
         if len(normalized) < 2:
             raise ValueError("query must contain at least two non-whitespace characters")
+        return normalized
+
+
+DTMF_DIGITS_PATTERN = re.compile(r"^[0-9*#w]{1,32}$")
+
+
+class SendDtmfRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    digits: str
+
+    @field_validator("digits")
+    @classmethod
+    def normalize_digits(cls, value: str) -> str:
+        normalized = value.strip()
+        if not DTMF_DIGITS_PATTERN.match(normalized):
+            raise ValueError("digits must be 1-32 characters from 0-9, *, #, and w")
         return normalized
 
 

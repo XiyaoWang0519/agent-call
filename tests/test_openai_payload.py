@@ -46,6 +46,7 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         "transfer_to_owner",
         "record_call_outcome",
         "search_web",
+        "send_dtmf",
         "end_call",
     ]
     assert "ask_poke" not in [tool["name"] for tool in payload["tools"]]
@@ -66,7 +67,11 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         "required": ["query"],
         "additionalProperties": False,
     }
-    end_call = payload["tools"][3]
+    send_dtmf = payload["tools"][3]
+    assert send_dtmf["parameters"]["required"] == ["digits"]
+    assert send_dtmf["parameters"]["properties"]["digits"]["pattern"] == "^[0-9*#w]{1,32}$"
+    assert send_dtmf["parameters"]["additionalProperties"] is False
+    end_call = payload["tools"][4]
     assert end_call["parameters"]["required"] == ["reason"]
     assert "objective_completed" in end_call["parameters"]["properties"]["reason"]["enum"]
     assert "final goodbye" in end_call["description"].lower()
@@ -92,6 +97,7 @@ def test_accept_payload_includes_ask_poke_when_enabled(settings, packet):
         "transfer_to_owner",
         "record_call_outcome",
         "search_web",
+        "send_dtmf",
         "ask_poke",
         "end_call",
     ]
