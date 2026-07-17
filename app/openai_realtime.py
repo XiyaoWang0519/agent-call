@@ -6,7 +6,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 import websockets
 from openai import APIStatusError, AsyncOpenAI
@@ -25,7 +25,7 @@ from app.settings import Settings
 logger = logging.getLogger(__name__)
 
 EventHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
-OpenHandler = Callable[[str], Awaitable[None]]
+OpenHandler = Callable[[str], Coroutine[Any, Any, None]]
 FatalHandler = Callable[[str, str], Awaitable[None]]
 SendHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 ActivityHandler = Callable[..., object]
@@ -338,7 +338,7 @@ class RealtimeBridge:
                 # Supervise on_open as well: it may be awaiting the session.updated readiness
                 # echo, while either event task may fail independently.
                 open_task = asyncio.create_task(
-                    cast(Coroutine[Any, Any, None], self.on_open(runtime.call_id)),
+                    self.on_open(runtime.call_id),
                     name=f"sideband-open:{runtime.call_id}",
                 )
                 runtime.open_task = open_task

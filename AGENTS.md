@@ -33,20 +33,20 @@ Recent history uses short, imperative, sentence-case subjects such as `Add call-
 
 Copy `.env.example` to `.env.local`; never commit secrets, transcripts, or database files. Preserve webhook signature checks, replay protection, destination policy, and explicit call confirmation. Do not deploy or restart while a call is active, and keep production to one Fly Machine because SQLite state is volume-local.
 
-### Rollback (one-command recovery)
+### Rollback (prior-image recovery)
 
 If a deploy breaks production, do not redeploy a fix while debugging. Roll back first:
 
-1. Confirm no active calls (or wait for them to finish):
-   `curl -sS -H "Authorization: Bearer $DEPLOY_GUARD_TOKEN" https://poke-call.fly.dev/internal/deployment-lock`
-2. List recent releases:
-   `flyctl releases -a poke-call`
-3. Roll back to the previous healthy image (one click / one command):
-   `flyctl releases rollback -a poke-call`
+1. Confirm no active calls (or wait for them to finish); this POST acquires the deployment lease and fails with HTTP 409 while calls are active:
+   `curl --fail-with-body -sS --request POST -H "Authorization: Bearer $DEPLOY_GUARD_TOKEN" https://poke-call.fly.dev/internal/deployment-lock`
+2. List recent releases with image references:
+   `flyctl releases --image -a poke-call`
+3. Redeploy the previous healthy image (no rebuild):
+   `flyctl deploy --image <previous-image-reference> -a poke-call --ha=false --remote-only`
 4. Verify:
    `curl -fsS https://poke-call.fly.dev/healthz`
 
-`flyctl releases rollback` restores the prior release image without a full rebuild. Only re-deploy after calls are idle and the fix is verified locally (`ruff` + `mypy` + `pytest`).
+Redeploying a prior image restores the last healthy release without a full rebuild. Only ship a new build after calls are idle and the fix is verified locally (`ruff` + `mypy` + `pytest`).
 
 ## Cursor Cloud specific instructions
 
