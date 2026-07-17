@@ -250,6 +250,7 @@ class RealtimeFunctionTool(BaseModel):
         "search_web",
         "send_dtmf",
         "ask_poke",
+        "report_hold",
         "end_call",
     ]
     description: str = Field(min_length=1)
@@ -261,8 +262,12 @@ class AcceptPayload(BaseModel):
 
     type: Literal["realtime"] = "realtime"
     model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
-    reasoning: dict[str, Literal["low"]] = Field(default_factory=lambda: {"effort": "low"})
-    output_modalities: list[Literal["audio"]] = Field(default_factory=lambda: ["audio"])
+    reasoning: dict[str, Literal["low"]] = Field(
+        default_factory=lambda: {"effort": "low"}  # type: ignore[arg-type]
+    )
+    output_modalities: list[Literal["audio"]] = Field(
+        default_factory=lambda: ["audio"]  # type: ignore[arg-type]
+    )
     max_output_tokens: Literal["inf"] = "inf"
     parallel_tool_calls: Literal[True] = True
     tool_choice: Literal["auto"] = "auto"

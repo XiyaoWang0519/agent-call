@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.protocols import DatabaseAccess
+
 from datetime import UTC, datetime, timedelta
 
 from app.db.engine import _iso_now
@@ -21,7 +26,7 @@ def _lock_is_active(locked_at: str | None) -> bool:
 
 
 class DeploymentMixin:
-    async def acquire_deployment_lock(self) -> int:
+    async def acquire_deployment_lock(self: DatabaseAccess) -> int:
         """Atomically block new calls if no call is currently nonterminal.
 
         Returns the number of active calls that prevented acquisition. Zero means
@@ -35,7 +40,8 @@ class DeploymentMixin:
                 f"SELECT COUNT(*) FROM calls WHERE state NOT IN ({placeholders})",  # noqa: S608
                 params,
             )
-            active_calls = int((await cursor.fetchone())[0])
+            count_row = await cursor.fetchone()
+            active_calls = int(count_row[0]) if count_row is not None else 0
             if active_calls:
                 await conn.rollback()
                 return active_calls
@@ -48,12 +54,12 @@ class DeploymentMixin:
             await conn.commit()
             return 0
 
-    async def release_deployment_lock(self) -> None:
+    async def release_deployment_lock(self: DatabaseAccess) -> None:
         await self.execute(
             "UPDATE deployment_control SET locked=0, locked_at=NULL WHERE singleton=1"
         )
 
-    async def deployment_lock_is_active(self) -> bool:
+    async def deployment_lock_is_active(self: DatabaseAccess) -> bool:
         row = await self.fetch_one(
             "SELECT locked, locked_at FROM deployment_control WHERE singleton=1"
         )

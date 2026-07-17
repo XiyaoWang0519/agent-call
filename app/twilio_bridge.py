@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlencode
 
 from twilio.base.exceptions import TwilioRestException
@@ -42,7 +43,7 @@ class TwilioBridge:
         custom = urlencode({"X-Plan-Id": plan_id, "X-Bridge-Call-Id": call_id})
         sip_uri = f"sip:{self.settings.openai_project_id}@sip.api.openai.com;transport=tls?{custom}"
 
-        def create():
+        def create() -> Any:
             return self.client.conferences(conference_name).participants.create(
                 from_=self.settings.twilio_caller_id,
                 to=sip_uri,
@@ -83,7 +84,7 @@ class TwilioBridge:
         conference_sid_or_name: str,
         packet: ContextPacket,
     ) -> ParticipantInfo:
-        def create():
+        def create() -> Any:
             return self.client.conferences(conference_sid_or_name).participants.create(
                 from_=self.settings.twilio_caller_id,
                 to=packet.target.phone,
@@ -120,7 +121,7 @@ class TwilioBridge:
         conference_sid_or_name: str,
         owner_phone: str,
     ) -> ParticipantInfo:
-        def create():
+        def create() -> Any:
             return self.client.conferences(conference_sid_or_name).participants.create(
                 from_=self.settings.twilio_caller_id,
                 to=owner_phone,

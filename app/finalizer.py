@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from openai import (
     APIConnectionError,
@@ -81,9 +81,11 @@ class Finalizer:
         self._locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
-    def _call_status(state: str) -> str:
-        if state in {CallState.COMPLETED.value, CallState.TRANSFERRED.value}:
-            return state
+    def _call_status(state: str) -> Literal["completed", "transferred", "failed", "timed_out"]:
+        if state == CallState.COMPLETED.value:
+            return "completed"
+        if state == CallState.TRANSFERRED.value:
+            return "transferred"
         if state == CallState.TIMED_OUT.value:
             return "timed_out"
         return "failed"
@@ -134,7 +136,17 @@ class Finalizer:
         transcript_complete = any(turn.speaker != "system" for turn in transcript) and not any(
             reason.startswith(prefix) for prefix in fatal_reasons
         )
-        fallback_outcome = "failed" if call_status == "failed" else "unknown"
+        fallback_outcome: Literal[
+            "completed",
+            "partially_completed",
+            "needs_follow_up",
+            "declined",
+            "voicemail_left",
+            "wrong_number",
+            "transferred",
+            "failed",
+            "unknown",
+        ] = "failed" if call_status == "failed" else "unknown"
         if call.get("answer_handling") == "voicemail":
             fallback_outcome = "voicemail_left"
         fallback = StoredCallResult(

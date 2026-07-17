@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.security import require_debug_token
@@ -49,7 +51,7 @@ DEBUG_SAFE_CALL_FIELDS = {
 
 
 @router.get("/calls/{call_id}")
-async def get_call(call_id: str, request: Request):
+async def get_call(call_id: str, request: Request) -> dict[str, Any]:
     try:
         snapshot = await request.app.state.call_service.get_snapshot(call_id)
     except LookupError as exc:
@@ -68,6 +70,6 @@ async def get_call(call_id: str, request: Request):
 
 
 @router.get("/calls")
-async def list_calls(request: Request):
+async def list_calls(request: Request) -> list[dict[str, Any]]:
     rows = await request.app.state.call_service.list_call_records()
     return [{key: row.get(key) for key in DEBUG_SAFE_CALL_FIELDS} for row in rows]

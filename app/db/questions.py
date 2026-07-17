@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.protocols import DatabaseAccess
+
 from typing import Any
 from uuid import uuid4
 
@@ -14,7 +19,7 @@ from app.models import CallState
 
 class QuestionsMixin:
     async def create_question(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         *,
         tool_call_id: str,
@@ -65,14 +70,19 @@ class QuestionsMixin:
                 "SELECT COUNT(*) FROM call_questions WHERE call_id=?",
                 (call_id,),
             )
-            if (await cursor.fetchone())[0] >= max_questions:
+            count_row = await cursor.fetchone()
+            if count_row is not None and count_row[0] >= max_questions:
                 await conn.rollback()
                 return None, "question_limit_reached"
             cursor = await conn.execute(
                 "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM call_questions WHERE call_id=?",
                 (call_id,),
             )
-            sequence = (await cursor.fetchone())[0]
+            sequence_row = await cursor.fetchone()
+            if sequence_row is None:
+                await conn.rollback()
+                return None, "sequence_unavailable"
+            sequence = sequence_row[0]
             try:
                 cursor = await conn.execute(
                     """INSERT INTO call_questions
@@ -103,7 +113,7 @@ class QuestionsMixin:
         return dict(row) if row else None, None
 
     async def claim_question_answer(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         question_id: str,
         answer: str,
@@ -133,7 +143,9 @@ class QuestionsMixin:
             await conn.commit()
         return dict(row)
 
-    async def claim_question_expiry(self, question_id: str) -> dict[str, Any] | None:
+    async def claim_question_expiry(
+        self: DatabaseAccess, question_id: str
+    ) -> dict[str, Any] | None:
         resolved_at = _iso_now()
         async with self._write_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
@@ -164,7 +176,7 @@ class QuestionsMixin:
             await conn.commit()
         return dict(row)
 
-    async def cancel_pending_questions(self, call_id: str) -> list[dict[str, Any]]:
+    async def cancel_pending_questions(self: DatabaseAccess, call_id: str) -> list[dict[str, Any]]:
         async with self._immediate_transaction() as conn:
             resolved_at = _iso_now()
             cursor = await conn.execute(
@@ -177,7 +189,7 @@ class QuestionsMixin:
             rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-    async def cancel_all_pending_questions(self) -> list[dict[str, Any]]:
+    async def cancel_all_pending_questions(self: DatabaseAccess) -> list[dict[str, Any]]:
         async with self._immediate_transaction() as conn:
             resolved_at = _iso_now()
             cursor = await conn.execute(
@@ -190,13 +202,15 @@ class QuestionsMixin:
             rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-    async def get_question(self, question_id: str) -> dict[str, Any] | None:
+    async def get_question(self: DatabaseAccess, question_id: str) -> dict[str, Any] | None:
         return await self.fetch_one(
             "SELECT * FROM call_questions WHERE question_id=?",
             (question_id,),
         )
 
-    async def get_questions_after(self, call_id: str, after_sequence: int) -> list[dict[str, Any]]:
+    async def get_questions_after(
+        self: DatabaseAccess, call_id: str, after_sequence: int
+    ) -> list[dict[str, Any]]:
         return await self.fetch_all(
             """SELECT * FROM call_questions
                WHERE call_id=? AND sequence_number > ?
@@ -204,7 +218,7 @@ class QuestionsMixin:
             (call_id, after_sequence),
         )
 
-    async def count_call_questions(self, call_id: str) -> int:
+    async def count_call_questions(self: DatabaseAccess, call_id: str) -> int:
         row = await self.fetch_one(
             "SELECT COUNT(*) AS count FROM call_questions WHERE call_id=?",
             (call_id,),

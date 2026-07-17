@@ -188,7 +188,13 @@ class CallService:
         self._undelivered_answers: dict[str, set[str]] = {}
         self._event_notifiers: dict[str, asyncio.Event] = {}
 
-    def _spawn(self, coroutine, *, name: str, must_finish: bool = False) -> asyncio.Task[Any]:
+    def _spawn(
+        self,
+        coroutine: Any,
+        *,
+        name: str,
+        must_finish: bool = False,
+    ) -> asyncio.Task[Any]:
         if self._stopping and not must_finish:
             # Reject new ordinary work once shutdown starts, but still register a
             # no-op task so callers holding the returned Task cannot outlive the
@@ -554,19 +560,23 @@ class CallService:
                     call_id = candidate["call_id"]
                     break
         call = await self.db.get_call(call_id) if call_id else None
-        if call is None or (plan_id and call["plan_id"] != plan_id):
+        if call is None or call_id is None or (plan_id and call["plan_id"] != plan_id):
             await self.realtime.reject(openai_call_id)
             raise LookupError("incoming SIP call could not be mapped to an approved plan")
         if call.get("openai_call_id") and call["openai_call_id"] != openai_call_id:
             await self.realtime.reject(openai_call_id)
             raise RuntimeError("call already mapped to a different OpenAI call")
-        await self.db.update_call(call_id, openai_call_id=openai_call_id)
+        mapped_call_id = call_id
+        await self.db.update_call(mapped_call_id, openai_call_id=openai_call_id)
         plan = await self.db.get_plan(call["plan_id"])
+        if plan is None:
+            await self.realtime.reject(openai_call_id)
+            raise LookupError("incoming SIP call plan is missing")
         packet = ContextPacket.model_validate(plan["context"])
         accept_status = await self._run_latency_marked_step(
-            call_id,
+            mapped_call_id,
             lambda: self.realtime.accept_and_connect(
-                call_id=call_id,
+                call_id=mapped_call_id,
                 openai_call_id=openai_call_id,
                 packet=packet,
             ),
@@ -576,12 +586,12 @@ class CallService:
             failure_reason="openai_accept_failed",
         )
         try:
-            await self.db.update_call(call_id, openai_accept_status=accept_status)
+            await self.db.update_call(mapped_call_id, openai_accept_status=accept_status)
         except Exception:
             logger.exception("failed to persist OpenAI accept status")
-            await self.terminate_call(call_id, "openai_accept_failed")
+            await self.terminate_call(mapped_call_id, "openai_accept_failed")
             raise
-        return call_id
+        return mapped_call_id
 
     async def handle_sideband_open(self, call_id: str) -> None:
         sideband_open = LatencyMark.now()
@@ -613,11 +623,14 @@ class CallService:
             return
         call = await self.db.get_call(call_id)
         if (
-            call
+            call is not None
             and CallState(call["state"]) not in TERMINAL_STATES
             and await self.db.set_flag_once(call_id, "callee_dialed")
         ):
             plan = await self.db.get_plan(call["plan_id"])
+            if plan is None:
+                await self.terminate_call(call_id, "plan_missing_after_sideband_open")
+                return
             packet = ContextPacket.model_validate(plan["context"])
             participant = await self._run_latency_marked_step(
                 call_id,
@@ -1343,7 +1356,7 @@ class CallService:
         try:
             advisory = AdvisoryOutcome.model_validate(arguments)
             advisory_outcome = advisory.model_dump(mode="json", by_alias=True)
-            output = {"accepted": True}
+            output: dict[str, Any] = {"accepted": True}
         except Exception as exc:
             output = {"accepted": False, "error": str(exc)}
         await self._send_nontransfer_tool_result(
@@ -2321,7 +2334,8 @@ class CallService:
         )
         # Once a termination claim may commit, caller cancellation must not strand
         # billing/media teardown behind an unreclaimable termination_claimed flag.
-        return await self._await_network_task(continuation)
+        result = await self._await_network_task(continuation)
+        return bool(result)
 
     async def _claim_and_finish_termination(
         self,
@@ -2565,6 +2579,8 @@ class CallService:
                     reason,
                 )
                 return False
+            if current is None:
+                return False
             call = current
             logger.warning(
                 "reconciled ambiguous terminal transition call_id=%s state=%s",
@@ -2757,12 +2773,15 @@ class CallService:
                 failure = "failed:owner_exit_unarmed"
                 failure_reason = "transfer_failed:owner_exit_unarmed"
                 try:
-                    failed_closed = await self.db.fail_promoted_transfer(
-                        call_id,
-                        transfer_outcome,
-                        failure,
-                        failure_reason,
-                    )
+                    if not isinstance(transfer_outcome, str):
+                        failed_closed = False
+                    else:
+                        failed_closed = await self.db.fail_promoted_transfer(
+                            call_id,
+                            transfer_outcome,
+                            failure,
+                            failure_reason,
+                        )
                 except Exception:
                     failed_closed = False
                     logger.warning(
