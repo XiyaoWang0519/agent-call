@@ -18,8 +18,8 @@ async def _validated_call_id(request: Request) -> str:
     plan_id = request.query_params.get("plan_id")
     if not call_id or not plan_id:
         raise HTTPException(status_code=400, detail="missing call mapping")
-    call = await request.app.state.call_service.db.get_call(call_id)
-    if call is None or call["plan_id"] != plan_id:
+    call = await request.app.state.call_service.resolve_webhook_call(call_id, plan_id)
+    if call is None:
         raise HTTPException(status_code=400, detail="invalid call mapping")
     return call_id
 

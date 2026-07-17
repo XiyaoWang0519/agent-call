@@ -30,13 +30,16 @@ LIFESPAN_CLEANUP_STEP_TIMEOUT_SECONDS = 15.0
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
-    holder: dict[str, CallService] = {}
     mcp = FastMCP("Poke Phone-Call Bridge")
 
     def get_service() -> CallService:
-        if "service" not in holder:
+        # `app` is assigned below; this closure is only ever invoked once the
+        # server is handling requests, by which point it is bound. Reading from
+        # app.state keeps MCP tools and HTTP routes on the same access path.
+        service = getattr(app.state, "call_service", None)
+        if service is None:
             raise RuntimeError("service is not started")
-        return holder["service"]
+        return service
 
     register_tools(mcp, get_service)
     mcp_http_app = mcp.http_app(
@@ -59,7 +62,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             openai = create_openai_client(settings)
             service = CallService(settings, db, openai=openai)
-            holder["service"] = service
             app.state.call_service = service
             # Recovery happens before the server accepts traffic.
             await service.recover_startup()
@@ -94,8 +96,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except BaseException as exc:
                     cleanup_errors.append(exc)
             try:
-                holder.clear()
-            except BaseException as exc:  # pragma: no cover - dict.clear is defensive here
+                app.state.call_service = None
+            except BaseException as exc:  # pragma: no cover - state assignment is defensive here
                 cleanup_errors.append(exc)
 
         if cancelled:

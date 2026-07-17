@@ -258,6 +258,36 @@ async def test_extractor_unknown_evidence_retry_carries_feedback_and_can_recover
 
 
 @pytest.mark.asyncio
+async def test_extractor_citation_with_surrounding_whitespace_is_canonicalized(
+    settings, service, packet
+):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.add_transcript_turn(
+        call_id=call_id,
+        turn_id="turn_real",
+        speaker="callee",
+        text="Reference ABC-123.",
+        source_event_type="transcription.completed",
+        source_event_id="evt_real",
+    )
+    padded = ExtractedCallResult(
+        outcome="completed",
+        summary="Completed.",
+        commitments=[],
+        confirmation_numbers=[{"value": "ABC-123", "evidence_turn_ids": [" turn_real \n"]}],
+        follow_ups=[],
+        confidence=0.9,
+    )
+    responses = FakeResponses(parsed=padded)
+    finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=responses))
+    result = await finalizer.finalize(call_id)
+
+    assert responses.calls == 1
+    assert result.finalization_status == "succeeded"
+    assert result.confirmation_numbers[0].evidence_turn_ids == ["turn_real"]
+
+
+@pytest.mark.asyncio
 async def test_extractor_payload_exposes_only_citable_turn_fields(settings, service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
     await service.db.add_transcript_turn(

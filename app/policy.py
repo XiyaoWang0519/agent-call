@@ -75,12 +75,12 @@ def validate_context(packet: ContextPacket, settings: Settings) -> list[PolicyDe
                 "Owner callback number must match configured OWNER_PHONE_E164",
             )
         )
-    if packet.owner.display_name != "Irvin":
+    if packet.owner.display_name != settings.owner_display_name:
         errors.append(
             PolicyDecision(
                 False,
                 "owner_identity_mismatch",
-                "This single-user service is configured only for owner Irvin",
+                f"This single-user service is configured only for owner {settings.owner_display_name}",
             )
         )
     text_fields = [

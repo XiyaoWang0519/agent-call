@@ -13,7 +13,7 @@ router = APIRouter(
 
 @router.post("", include_in_schema=False)
 async def acquire_deployment_lock(request: Request) -> dict[str, int | bool]:
-    active_calls = await request.app.state.call_service.db.acquire_deployment_lock()
+    active_calls = await request.app.state.call_service.acquire_deployment_lock()
     if active_calls:
         raise HTTPException(
             status_code=409,
@@ -24,5 +24,5 @@ async def acquire_deployment_lock(request: Request) -> dict[str, int | bool]:
 
 @router.delete("", include_in_schema=False)
 async def release_deployment_lock(request: Request) -> dict[str, bool]:
-    await request.app.state.call_service.db.release_deployment_lock()
+    await request.app.state.call_service.release_deployment_lock()
     return {"released": True}
