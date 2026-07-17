@@ -203,7 +203,7 @@ flyctl deploy --image <previous-image-reference> -a poke-call --ha=false --remot
 curl -fsS https://poke-call.fly.dev/healthz
 ```
 
-Redeploying a prior image restores the last healthy release without a full rebuild. Ship a new build only after calls are idle and local checks pass (`ruff`, `mypy`, `pytest`).
+Redeploying a prior image restores only the application image without a full rebuild; it does not roll back the current Fly configuration, environment variables, or secrets. Ship a new build only after calls are idle and local checks pass (`ruff`, `mypy`, `pytest`).
 
 **CI/CD:** `.github/workflows/fly-deploy.yml` runs the locked test suite and deploys every push to `main`. It serializes production deployments, waits up to 10 minutes for active calls to finish via the authenticated `/internal/deployment-lock` lease, keeps `--ha=false`, and checks `/healthz` before reporting success. It needs the repository secrets `FLY_API_TOKEN` (app-scoped deploy token) and `DEPLOY_GUARD_TOKEN` — store the latter independently from the MCP and debug tokens; it can only touch the deployment lease. The lease is acquired atomically only when no call is active, blocks new calls while a deployment starts, expires after 15 minutes if canceled, and is cleared by a successful restart.
 

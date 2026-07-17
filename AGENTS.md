@@ -46,7 +46,7 @@ If a deploy breaks production, do not redeploy a fix while debugging. Roll back 
 4. Verify:
    `curl -fsS https://poke-call.fly.dev/healthz`
 
-Redeploying a prior image restores the last healthy release without a full rebuild. Only ship a new build after calls are idle and the fix is verified locally (`ruff` + `mypy` + `pytest`).
+Redeploying a prior image restores only the application image without a full rebuild; it does not roll back the current Fly configuration, environment variables, or secrets. Only ship a new build after calls are idle and the fix is verified locally (`ruff` + `mypy` + `pytest`).
 
 ## Cursor Cloud specific instructions
 
