@@ -71,6 +71,17 @@ class Settings(BaseSettings):
     max_call_seconds: Literal[600] = 600
     owner_timezone: str = "America/Los_Angeles"
 
+    # Cost tracking (estimated pricing, USD per 1M tokens unless noted)
+    realtime_text_input_price_per_1m: float = Field(default=4.00, ge=0)
+    realtime_audio_input_price_per_1m: float = Field(default=32.00, ge=0)
+    realtime_cached_text_input_price_per_1m: float = Field(default=0.40, ge=0)
+    realtime_cached_audio_input_price_per_1m: float = Field(default=0.40, ge=0)
+    realtime_text_output_price_per_1m: float = Field(default=16.00, ge=0)
+    realtime_audio_output_price_per_1m: float = Field(default=64.00, ge=0)
+    extractor_input_price_per_1m: float = Field(default=0.05, ge=0)
+    extractor_output_price_per_1m: float = Field(default=0.40, ge=0)
+    twilio_voice_price_per_minute: float = Field(default=0.014, ge=0)
+
     @field_validator("allowed_country_codes", mode="before")
     @classmethod
     def parse_country_codes(cls, value: object) -> object:

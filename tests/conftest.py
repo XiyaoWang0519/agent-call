@@ -93,6 +93,8 @@ class FakeTwilio:
         self.agent_creates = 0
         self.callee_creates = 0
         self.owner_creates = 0
+        self.dtmf: list[tuple[str, str, str]] = []
+        self.dtmf_exc: Exception | None = None
 
     async def create_agent_participant(self, **kwargs) -> ParticipantInfo:
         self.agent_creates += 1
@@ -119,6 +121,13 @@ class FakeTwilio:
         self, conference_sid_or_name, participant_call_sid
     ) -> None:
         self.end_on_exit.append((conference_sid_or_name, participant_call_sid))
+
+    async def send_dtmf(
+        self, conference_sid_or_name, participant_call_sid, *, call_id, plan_id, digits
+    ) -> None:
+        if self.dtmf_exc is not None:
+            raise self.dtmf_exc
+        self.dtmf.append((conference_sid_or_name, participant_call_sid, digits))
 
 
 class FakeRealtime:

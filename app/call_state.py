@@ -14,7 +14,9 @@ from time import monotonic_ns
 from typing import Any
 
 from openai import AsyncOpenAI
+from twilio.base.exceptions import TwilioRestException
 
+from app.costs import compute_call_cost
 from app.db import (
     TRANSFER_ELIGIBLE_STATES,
     Database,
@@ -33,6 +35,7 @@ from app.models import (
     ContextPacket,
     PreparePhoneCallInput,
     PreparePhoneCallOutput,
+    SendDtmfRequest,
     StartPhoneCallOutput,
     VoiceEndCallRequest,
     WebSearchRequest,
@@ -768,8 +771,10 @@ class CallService:
         elif leg == "callee" and status in {"completed", "failed", "busy", "no-answer", "canceled"}:
             duration = int(form.get("CallDuration") or 0)
             reason = "callee_call_completed" if status == "completed" else f"callee_{status}"
-            if status == "completed" and duration >= self.settings.max_call_seconds:
-                reason = "time_limit"
+            if status == "completed":
+                if duration >= self.settings.max_call_seconds:
+                    reason = "time_limit"
+                await self.db.update_call(call_id, twilio_reported_duration_seconds=duration)
             await self.terminate_call(call_id, reason)
         elif leg == "agent" and status in {"completed", "failed"}:
             await self.terminate_call(call_id, "agent_call_completed")
@@ -957,6 +962,7 @@ class CallService:
             status = response.get("status")
             if event_type == "response.done":
                 self._active_response_ids.pop(call_id, None)
+                await self._record_realtime_usage(call_id, response)
             if status in {"cancelled", "canceled"}:
                 await self.db.update_call(call_id, interruption_observed=1)
             elif status == "failed":
@@ -997,6 +1003,40 @@ class CallService:
                 self.terminate_call(call_id, "openai_fatal_error"),
                 name=f"terminate:{call_id}:openai-error",
             )
+
+    async def _record_realtime_usage(self, call_id: str, response: dict[str, Any]) -> None:
+        # A cancelled response still bills for the tokens it consumed, so this runs
+        # regardless of response status.
+        usage = response.get("usage") or {}
+        input_details = usage.get("input_token_details") or {}
+        cached = input_details.get("cached_tokens_details") or {}
+        output_details = usage.get("output_token_details") or {}
+        input_text_tokens = int(input_details.get("text_tokens") or 0)
+        input_audio_tokens = int(input_details.get("audio_tokens") or 0)
+        input_cached_text_tokens = int(cached.get("text_tokens") or 0)
+        input_cached_audio_tokens = int(cached.get("audio_tokens") or 0)
+        output_text_tokens = int(output_details.get("text_tokens") or 0)
+        output_audio_tokens = int(output_details.get("audio_tokens") or 0)
+        if not any(
+            (
+                input_text_tokens,
+                input_audio_tokens,
+                input_cached_text_tokens,
+                input_cached_audio_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+            )
+        ):
+            return
+        await self.db.add_realtime_usage(
+            call_id,
+            input_text_tokens=input_text_tokens,
+            input_audio_tokens=input_audio_tokens,
+            input_cached_text_tokens=input_cached_text_tokens,
+            input_cached_audio_tokens=input_cached_audio_tokens,
+            output_text_tokens=output_text_tokens,
+            output_audio_tokens=output_audio_tokens,
+        )
 
     async def handle_realtime_send(self, call_id: str, event: dict[str, Any]) -> None:
         sent = LatencyMark.now()
@@ -1161,6 +1201,7 @@ class CallService:
                     result.output_bytes,
                     result.cost_dollars,
                 )
+                await self.db.record_exa_search(call_id, cost_dollars=result.cost_dollars or 0.0)
             except ExaSearchError as exc:
                 logger.warning("Exa search failed call_id=%s code=%s", call_id, exc.code)
                 output = {"ok": False, "error": exc.code}
@@ -1182,6 +1223,77 @@ class CallService:
                 output,
                 received=received,
                 event_key=event_key,
+            )
+        elif name == "send_dtmf":
+            try:
+                request = SendDtmfRequest.model_validate(arguments)
+            except Exception:
+                logger.info("invalid send_dtmf tool arguments call_id=%s", call_id)
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "invalid_dtmf_request"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+
+            call = await self.db.get_call(call_id)
+            if call is None or call["state"] != CallState.ACTIVE.value:
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "call_not_ready"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+            conference = call.get("conference_sid") or call.get("conference_name")
+            callee_sid = call.get("twilio_callee_call_sid")
+            if not conference or not callee_sid:
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "call_not_ready"},
+                    received=received,
+                    event_key=event_key,
+                )
+                return
+
+            self._note_call_activity(call_id)
+            self._inflight_tools.add(call_id)
+            try:
+                await self.twilio.send_dtmf(
+                    conference,
+                    callee_sid,
+                    call_id=call_id,
+                    plan_id=call["plan_id"],
+                    digits=request.digits,
+                )
+                output = {"ok": True, "digits": request.digits}
+            except TwilioRestException:
+                logger.warning(
+                    "send_dtmf Twilio call failed call_id=%s digits=%s", call_id, request.digits
+                )
+                output = {"ok": False, "error": "dtmf_failed"}
+            except Exception:
+                logger.exception("unexpected send_dtmf failure call_id=%s", call_id)
+                output = {"ok": False, "error": "dtmf_failed"}
+            finally:
+                self._inflight_tools.discard(call_id)
+                self._note_call_activity(call_id)
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                output,
+                received=received,
+                event_key=event_key,
+                continuation_instructions=(
+                    "The keypad tones were sent. Stay silent and listen to how the menu "
+                    "responds before speaking or sending more digits."
+                )
+                if output.get("ok")
+                else None,
             )
         elif name == "record_call_outcome":
             advisory_outcome: dict[str, Any] | None = None
@@ -2802,21 +2914,33 @@ class CallService:
             answer_handling=call.get("answer_handling"),
             duration_seconds=call.get("duration_seconds"),
             result=result,
+            cost=compute_call_cost(call, self.settings),
         )
 
     async def get_result(self, call_id: str) -> dict[str, Any]:
         snapshot = await self.get_snapshot(call_id)
+        cost = snapshot.cost
         if snapshot.state in TERMINAL_STATES:
             result = snapshot.result
             if result is None or result.finalization_status == "telephony_only":
                 # Telephony is terminal; never report in_progress while finalization catches up.
                 result = await self.finalizer.finalize(call_id)
+                # Finalization may have just persisted extractor token usage; refresh cost.
+                call = await self.db.get_call(call_id)
+                if call is not None:
+                    cost = compute_call_cost(call, self.settings)
             return {
                 "call_id": call_id,
                 "state": snapshot.state,
                 "result": result.model_dump(mode="json"),
+                "cost": cost.model_dump(mode="json") if cost else None,
             }
-        return {"call_id": call_id, "state": snapshot.state, "result": None}
+        return {
+            "call_id": call_id,
+            "state": snapshot.state,
+            "result": None,
+            "cost": cost.model_dump(mode="json") if cost else None,
+        }
 
     async def _setup_deadline(self, call_id: str) -> None:
         await asyncio.sleep(self.settings.setup_deadline_seconds)

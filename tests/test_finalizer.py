@@ -10,15 +10,16 @@ import respx
 from openai import APIStatusError, APITimeoutError
 from pydantic import SecretStr
 
-from app.finalizer import Finalizer
-from app.models import CallState, ExtractedCallResult
+from app.finalizer import Finalizer, format_owner_summary
+from app.models import CallState, ExtractedCallResult, StoredCallResult
 from tests.conftest import seed_call
 
 
 class FakeResponses:
-    def __init__(self, parsed=None, error=None):
+    def __init__(self, parsed=None, error=None, usage=None):
         self.parsed = parsed
         self.error = error
+        self.usage = usage
         self.calls = 0
         self.timeouts: list[float] = []
 
@@ -27,7 +28,82 @@ class FakeResponses:
         self.timeouts.append(kwargs["timeout"])
         if self.error:
             raise self.error
-        return SimpleNamespace(output_parsed=self.parsed)
+        return SimpleNamespace(output_parsed=self.parsed, usage=self.usage)
+
+
+def _stored_result(**overrides) -> StoredCallResult:
+    fields = dict(
+        call_id="call_test",
+        call_status="completed",
+        finalization_status="succeeded",
+        outcome="completed",
+        result_source="post_call_extractor",
+        summary="Booked table for 2 at 7pm.",
+        transcript_complete=True,
+        raw_transcript_available=True,
+    )
+    fields.update(overrides)
+    return StoredCallResult(**fields)
+
+
+def test_format_owner_summary_completed_with_confirmation_and_action_follow_up():
+    result = _stored_result(
+        confirmation_numbers=[{"value": "48", "evidence_turn_ids": ["turn_1"]}],
+        follow_ups=[
+            {
+                "value": "Call back to confirm allergy info.",
+                "evidence_turn_ids": ["turn_1"],
+                "owner_action_required": True,
+            },
+            {
+                "value": "No action needed here.",
+                "evidence_turn_ids": ["turn_1"],
+                "owner_action_required": False,
+            },
+        ],
+    )
+
+    text = format_owner_summary(result)
+
+    assert text.startswith("📞 Booked table for 2 at 7pm.")
+    assert "Confirmation #48" in text
+    assert "Action needed: Call back to confirm allergy info." in text
+    assert "No action needed here." not in text
+    assert "call call_test — details via get_call_result" in text
+
+
+def test_format_owner_summary_non_completed_outcome_shows_label():
+    result = _stored_result(outcome="declined", summary="They said no thanks.")
+
+    text = format_owner_summary(result)
+
+    assert text.startswith("📞 Declined: They said no thanks.")
+
+
+def test_format_owner_summary_multiple_confirmation_numbers():
+    result = _stored_result(
+        confirmation_numbers=[
+            {"value": "48", "evidence_turn_ids": ["turn_1"]},
+            {"value": "49", "evidence_turn_ids": ["turn_2"]},
+        ]
+    )
+
+    text = format_owner_summary(result)
+
+    assert "Confirmations: #48, #49" in text
+
+
+def test_format_owner_summary_failed_finalization_notes_extraction_problem():
+    result = _stored_result(
+        finalization_status="failed",
+        outcome="unknown",
+        result_source="extraction_failed",
+        summary="The call ended, but structured extraction failed.",
+    )
+
+    text = format_owner_summary(result)
+
+    assert "Automatic extraction had problems; the full transcript is saved." in text
 
 
 def status_error(status_code: int) -> APIStatusError:
@@ -266,6 +342,45 @@ async def test_optional_push_http_failure_never_changes_stored_result(settings, 
 
 
 @pytest.mark.asyncio
+@respx.mock
+async def test_optional_push_sends_owner_summary_text(settings, service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    settings.poke_push_enabled = True
+    settings.poke_api_key = SecretStr("poke-test")
+    route = respx.post("https://poke.com/api/v1/inbound/api-message").mock(
+        return_value=httpx.Response(200)
+    )
+    parsed = ExtractedCallResult(
+        outcome="completed",
+        summary="Booked table for 2 at 7pm.",
+        commitments=[],
+        confirmation_numbers=[{"value": "48", "evidence_turn_ids": ["turn_1"]}],
+        follow_ups=[],
+        confidence=0.95,
+    )
+    await service.db.add_transcript_turn(
+        call_id=call_id,
+        turn_id="turn_1",
+        speaker="callee",
+        text="Your table is confirmed, reference 48.",
+        source_event_type="transcription.completed",
+        source_event_id="evt_1",
+    )
+    finalizer = Finalizer(
+        settings, service.db, SimpleNamespace(responses=FakeResponses(parsed=parsed))
+    )
+
+    result = await finalizer.finalize(call_id)
+
+    assert route.called
+    body = json.loads(route.calls[-1].request.content)
+    assert isinstance(body["message"], str)
+    assert "Booked table for 2 at 7pm." in body["message"]
+    assert "Confirmation #48" in body["message"]
+    assert body == {"message": format_owner_summary(result)}
+
+
+@pytest.mark.asyncio
 async def test_extractor_retries_one_transient_failure_only(settings, service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
     parsed = ExtractedCallResult(
@@ -318,6 +433,30 @@ async def test_extractor_retries_one_server_error(settings, service, packet):
 
     assert responses.calls == 2
     assert result.finalization_status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_extractor_usage_is_persisted_to_calls_row(settings, service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    parsed = ExtractedCallResult(
+        outcome="completed",
+        summary="Completed.",
+        commitments=[],
+        confirmation_numbers=[],
+        follow_ups=[],
+        confidence=0.9,
+    )
+    responses = FakeResponses(
+        parsed=parsed, usage=SimpleNamespace(input_tokens=123, output_tokens=45)
+    )
+    finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=responses))
+
+    result = await finalizer.finalize(call_id)
+
+    assert result.finalization_status == "succeeded"
+    call = await service.db.get_call(call_id)
+    assert call["extractor_input_tokens"] == 123
+    assert call["extractor_output_tokens"] == 45
 
 
 @pytest.mark.asyncio

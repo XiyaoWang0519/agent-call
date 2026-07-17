@@ -137,6 +137,7 @@ During a live call, `wait_for_call_event` is the canonical monitoring loop; once
 - 🙋 A call cannot start without an unexpired prepared plan **and** explicit confirmation text.
 - 🚫 Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
 - 🤐 The voice model may not share or request passwords, auth codes, payment credentials, or government identifiers. It chooses how to open from Poke's approved call context; the bridge does not impose identity, disclosure, or recipient-confirmation wording.
+- ☎️ The agent can press automated phone-menu (IVR) keys via a signed announce webhook, but is instructed never to enter payment, authentication, or identity digits that way.
 - 👋 The in-call model decides when the conversation is done and invokes its private `end_call` function; the bridge asks for one final spoken goodbye, waits for it, then tears down OpenAI and Twilio.
 
 > [!WARNING]
