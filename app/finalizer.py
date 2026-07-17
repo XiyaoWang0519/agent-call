@@ -25,6 +25,47 @@ from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+_OUTCOME_LABELS: dict[str, str] = {
+    "completed": "Done",
+    "partially_completed": "Partially done",
+    "needs_follow_up": "Needs follow-up",
+    "declined": "Declined",
+    "voicemail_left": "Voicemail left",
+    "wrong_number": "Wrong number",
+    "transferred": "Transferred to a human",
+    "failed": "Call failed",
+    "unknown": "Outcome unknown",
+}
+
+
+def format_owner_summary(result: StoredCallResult) -> str:
+    """Short owner-facing text for the post-call Poke push."""
+    lines: list[str] = []
+    summary = result.summary.strip()
+    label = _OUTCOME_LABELS.get(result.outcome, "Outcome unknown")
+    if result.outcome == "completed" and summary:
+        lines.append(f"📞 {summary}")
+    elif summary:
+        lines.append(f"📞 {label}: {summary}")
+    else:
+        lines.append(f"📞 {label}.")
+    if result.confirmation_numbers:
+        values = [item.value for item in result.confirmation_numbers]
+        if len(values) == 1:
+            lines.append(f"Confirmation #{values[0]}")
+        else:
+            lines.append("Confirmations: " + ", ".join(f"#{v}" for v in values))
+    confirmed = [c.value for c in result.commitments if c.status == "confirmed"]
+    if confirmed:
+        lines.append("Confirmed: " + "; ".join(confirmed))
+    actions = [f.value for f in result.follow_ups if f.owner_action_required]
+    if actions:
+        lines.append("Action needed: " + "; ".join(actions))
+    if result.finalization_status != "succeeded":
+        lines.append("Automatic extraction had problems; the full transcript is saved.")
+    lines.append(f"(call {result.call_id} — details via get_call_result)")
+    return "\n".join(lines)
+
 
 class UnknownEvidenceError(ValueError):
     def __init__(self, unknown_ids: set[str]):
@@ -222,4 +263,4 @@ class Finalizer:
     async def _maybe_push(self, result: StoredCallResult) -> None:
         from app.poke_push import push_message_to_poke
 
-        await push_message_to_poke(self.settings, result.model_dump(mode="json"))
+        await push_message_to_poke(self.settings, format_owner_summary(result))
