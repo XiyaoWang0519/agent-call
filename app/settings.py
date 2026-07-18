@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     poke_api_key: SecretStr | None = None
     poke_push_enabled: bool = False
     ask_poke_enabled: bool = False
-    ask_poke_answer_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    ask_poke_answer_timeout_seconds: float = Field(default=60.0, gt=0, le=120)
     ask_poke_max_questions_per_call: int = Field(default=5, ge=1, le=20)
     hold_detection_enabled: bool = False
     hold_max_seconds: float = Field(default=300.0, gt=0, le=600)
