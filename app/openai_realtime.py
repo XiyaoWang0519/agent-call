@@ -4,24 +4,31 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 
 import websockets
 from openai import APIStatusError, AsyncOpenAI
 
-from app.models import AcceptPayload, ContextPacket
+from app.models import (
+    AcceptPayload,
+    ContextPacket,
+    RealtimeAudio,
+    RealtimeAudioInput,
+    RealtimeAudioOutput,
+    RealtimeFunctionTool,
+)
 from app.prompts import realtime_instructions
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
 EventHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
-OpenHandler = Callable[[str], Awaitable[None]]
+OpenHandler = Callable[[str], Coroutine[Any, Any, None]]
 FatalHandler = Callable[[str, str], Awaitable[None]]
 SendHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
-ActivityHandler = Callable[[str], None]
+ActivityHandler = Callable[..., object]
 
 # Realtime events are normally consumed as quickly as they arrive. A bounded queue protects a
 # call from unbounded memory growth if application handling stalls while still leaving ample room
@@ -245,14 +252,11 @@ class RealtimeBridge:
                 ask_poke_enabled=self.settings.ask_poke_enabled,
                 hold_detection_enabled=self.settings.hold_detection_enabled,
             ),
-            audio={
-                "input": self._input_audio_config(create_response=False, interrupt_response=False),
-                "output": {
-                    "voice": "cedar",
-                    "speed": 1.0,
-                },
-            },
-            tools=tools,
+            audio=RealtimeAudio(
+                input=self._input_audio_config(create_response=False, interrupt_response=False),
+                output=RealtimeAudioOutput(voice="cedar", speed=1.0),
+            ),
+            tools=[RealtimeFunctionTool.model_validate(tool) for tool in tools],
         )
 
     async def accept_and_connect(
@@ -543,10 +547,17 @@ class RealtimeBridge:
                     exc_info=True,
                 )
 
-    async def _update_session(self, call_id: str, audio_input: dict[str, Any]) -> dict[str, Any]:
+    async def _update_session(
+        self, call_id: str, audio_input: RealtimeAudioInput | dict[str, Any]
+    ) -> dict[str, Any]:
         runtime = self._runtime.get(call_id)
         if runtime is None:
             raise RuntimeError("sideband runtime missing")
+        payload = (
+            audio_input.model_dump(mode="json", exclude_none=True)
+            if isinstance(audio_input, RealtimeAudioInput)
+            else audio_input
+        )
         async with runtime.update_lock:
             loop = asyncio.get_running_loop()
             runtime.update_waiter = loop.create_future()
@@ -556,7 +567,7 @@ class RealtimeBridge:
                     "type": "session.update",
                     "session": {
                         "type": "realtime",
-                        "audio": {"input": audio_input},
+                        "audio": {"input": payload},
                     },
                 },
             )
@@ -574,20 +585,22 @@ class RealtimeBridge:
 
     def _input_audio_config(
         self, *, create_response: bool, interrupt_response: bool
-    ) -> dict[str, Any]:
+    ) -> RealtimeAudioInput:
         # Do not specify audio.format: SIP media negotiates G.711 with Twilio, and
         # explicitly overriding it can silence RTP. Always re-assert transcription
         # alongside turn_detection: session.update replaces the nested audio.input
         # object, so a turn_detection-only update would drop input transcription.
-        return {
-            "transcription": self._transcription_config(),
-            "turn_detection": {
-                "type": "semantic_vad",
-                "eagerness": self.settings.semantic_vad_eagerness,
-                "create_response": create_response,
-                "interrupt_response": interrupt_response,
-            },
-        }
+        return RealtimeAudioInput.model_validate(
+            {
+                "transcription": self._transcription_config(),
+                "turn_detection": {
+                    "type": "semantic_vad",
+                    "eagerness": self.settings.semantic_vad_eagerness,
+                    "create_response": create_response,
+                    "interrupt_response": interrupt_response,
+                },
+            }
+        )
 
     async def verify_initial_session(self, call_id: str) -> dict[str, Any]:
         return await self._update_session(

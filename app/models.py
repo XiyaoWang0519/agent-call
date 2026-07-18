@@ -112,10 +112,15 @@ class StartPhoneCallOutput(BaseModel):
     state: CallState
     poll_after_seconds: int = 2
     next_action: str = (
-        "Call wait_for_call_event. For each pending question, finish all relevant checks and use "
-        "answer_call_question once with only the final, ready-to-relay result, never an "
-        "intermediate 'I'm checking' update. Continue waiting with next_after_sequence; when "
-        "terminal, call get_call_result."
+        "The call has started. Immediately begin calling wait_for_call_event in a loop "
+        "with the returned next_after_sequence, and keep calling it again NOW after every "
+        "response until the call reaches a terminal state. For each pending question, finish "
+        "all relevant checks and use answer_call_question once with only the final, "
+        "ready-to-relay result, never an intermediate 'I'm checking' update, then resume the "
+        "wait_for_call_event loop. Do not end your turn and do not stop polling until the "
+        "call is terminal — if you stop, mid-call questions from the phone agent (ask_poke) "
+        "will time out and the call may fail its objective. When terminal, call "
+        "get_call_result."
     )
 
 
@@ -252,6 +257,7 @@ class RealtimeFunctionTool(BaseModel):
         "search_web",
         "send_dtmf",
         "ask_poke",
+        "report_hold",
         "end_call",
     ]
     description: str = Field(min_length=1)
@@ -263,8 +269,12 @@ class AcceptPayload(BaseModel):
 
     type: Literal["realtime"] = "realtime"
     model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
-    reasoning: dict[str, Literal["low"]] = Field(default_factory=lambda: {"effort": "low"})
-    output_modalities: list[Literal["audio"]] = Field(default_factory=lambda: ["audio"])
+    reasoning: dict[str, Literal["low"]] = Field(
+        default_factory=lambda: {"effort": "low"}  # type: ignore[arg-type]
+    )
+    output_modalities: list[Literal["audio"]] = Field(
+        default_factory=lambda: ["audio"]  # type: ignore[arg-type]
+    )
     max_output_tokens: Literal["inf"] = "inf"
     parallel_tool_calls: Literal[True] = True
     tool_choice: Literal["auto"] = "auto"

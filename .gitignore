@@ -5,10 +5,23 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 *.db
 *.db-shm
 *.db-wal
 .playwright-mcp/
+dist/
+*.egg-info/
 
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

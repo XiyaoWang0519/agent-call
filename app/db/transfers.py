@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.protocols import DatabaseAccess
+
 from typing import Any
 
 from app.db.engine import _decode_json_columns, _iso_now
@@ -12,7 +17,7 @@ TRANSFER_ELIGIBLE_STATES = ("prewarming", "ready_to_activate", "activating", "ac
 
 
 class TransfersMixin:
-    async def claim_transfer_joining(self, call_id: str, reason: str) -> bool:
+    async def claim_transfer_joining(self: DatabaseAccess, call_id: str, reason: str) -> bool:
         """Durably allow at most one owner-transfer attempt for a live call.
 
         Eligible once the callee has joined, even before activation completes.
@@ -30,7 +35,7 @@ class TransfersMixin:
         )
 
     async def record_transfer_owner_sid(
-        self, call_id: str, expected: str, owner_call_sid: str
+        self: DatabaseAccess, call_id: str, expected: str, owner_call_sid: str
     ) -> bool:
         """Persist the owner leg before transfer promotion can become recoverable."""
 
@@ -52,7 +57,9 @@ class TransfersMixin:
             ),
         )
 
-    async def promote_transfer(self, call_id: str, reason: str) -> dict[str, Any] | None:
+    async def promote_transfer(
+        self: DatabaseAccess, call_id: str, reason: str
+    ) -> dict[str, Any] | None:
         """Claim teardown ownership while promoting a joined owner transfer."""
 
         placeholders, states = self._in_clause(TRANSFER_ELIGIBLE_STATES)
@@ -81,7 +88,9 @@ class TransfersMixin:
             row = await cursor.fetchone()
         return _decode_json_columns(dict(row)) if row else None
 
-    async def fail_joining_transfer(self, call_id: str, expected: str, failure: str) -> bool:
+    async def fail_joining_transfer(
+        self: DatabaseAccess, call_id: str, expected: str, failure: str
+    ) -> bool:
         placeholders, states = self._in_clause(TRANSFER_ELIGIBLE_STATES)
         return await self._execute_cas(
             f"""UPDATE calls SET transfer_outcome=?, last_event_at=?
@@ -92,7 +101,9 @@ class TransfersMixin:
             (failure, _iso_now(), call_id, expected, *states),
         )
 
-    async def complete_promoted_transfer(self, call_id: str, expected: str, completed: str) -> bool:
+    async def complete_promoted_transfer(
+        self: DatabaseAccess, call_id: str, expected: str, completed: str
+    ) -> bool:
         return await self._execute_cas(
             """UPDATE calls SET transfer_outcome=?, last_event_at=?
                WHERE call_id=?
@@ -104,7 +115,7 @@ class TransfersMixin:
         )
 
     async def fail_promoted_transfer(
-        self,
+        self: DatabaseAccess,
         call_id: str,
         expected: str,
         failure: str,

@@ -65,6 +65,34 @@ TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
 # cancel_response + function_call_output each bound to REALTIME_SEND_TIMEOUT_SECONDS; keep
 # the stale-call carve-out long enough for both sends after the answer deadline fires.
 WATCHDOG_QUESTION_GRACE_SECONDS = 2 * REALTIME_SEND_TIMEOUT_SECONDS + 5.0
+ASK_POKE_LOG_TEXT_LIMIT = 200
+
+# Poke (the MCP client) is an LLM agent: it reliably follows explicit next_action
+# directives embedded in tool RESULTS, but under-weights static tool descriptions. There
+# is no reliable out-of-band push to wake a Poke turn that has already ended, so every
+# response for a non-terminal call must repeat this warning to keep Poke long-polling —
+# otherwise a mid-call ask_poke question can arrive with nobody listening and time out.
+ASK_POKE_POLL_WARNING = (
+    "Do not end your turn and do not stop polling until the call reaches a terminal "
+    "state — if you stop, mid-call questions from the phone agent (ask_poke) will "
+    "time out and the call may fail its objective."
+)
+
+
+def _truncate_for_log(text: str, *, limit: int = ASK_POKE_LOG_TEXT_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
+def _seconds_until(iso_timestamp: str | None) -> float | None:
+    if not iso_timestamp:
+        return None
+    try:
+        target = datetime.fromisoformat(iso_timestamp)
+    except ValueError:
+        return None
+    return (target - datetime.now(UTC)).total_seconds()
 
 
 @dataclass(slots=True)
@@ -181,7 +209,13 @@ class CallService:
         self._undelivered_answers: dict[str, set[str]] = {}
         self._event_notifiers: dict[str, asyncio.Event] = {}
 
-    def _spawn(self, coroutine, *, name: str, must_finish: bool = False) -> asyncio.Task[Any]:
+    def _spawn(
+        self,
+        coroutine: Any,
+        *,
+        name: str,
+        must_finish: bool = False,
+    ) -> asyncio.Task[Any]:
         if self._stopping and not must_finish:
             # Reject new ordinary work once shutdown starts, but still register a
             # no-op task so callers holding the returned Task cannot outlive the
@@ -547,19 +581,23 @@ class CallService:
                     call_id = candidate["call_id"]
                     break
         call = await self.db.get_call(call_id) if call_id else None
-        if call is None or (plan_id and call["plan_id"] != plan_id):
+        if call is None or call_id is None or (plan_id and call["plan_id"] != plan_id):
             await self.realtime.reject(openai_call_id)
             raise LookupError("incoming SIP call could not be mapped to an approved plan")
         if call.get("openai_call_id") and call["openai_call_id"] != openai_call_id:
             await self.realtime.reject(openai_call_id)
             raise RuntimeError("call already mapped to a different OpenAI call")
-        await self.db.update_call(call_id, openai_call_id=openai_call_id)
+        mapped_call_id = call_id
+        await self.db.update_call(mapped_call_id, openai_call_id=openai_call_id)
         plan = await self.db.get_plan(call["plan_id"])
+        if plan is None:
+            await self.realtime.reject(openai_call_id)
+            raise LookupError("incoming SIP call plan is missing")
         packet = ContextPacket.model_validate(plan["context"])
         accept_status = await self._run_latency_marked_step(
-            call_id,
+            mapped_call_id,
             lambda: self.realtime.accept_and_connect(
-                call_id=call_id,
+                call_id=mapped_call_id,
                 openai_call_id=openai_call_id,
                 packet=packet,
             ),
@@ -569,12 +607,12 @@ class CallService:
             failure_reason="openai_accept_failed",
         )
         try:
-            await self.db.update_call(call_id, openai_accept_status=accept_status)
+            await self.db.update_call(mapped_call_id, openai_accept_status=accept_status)
         except Exception:
             logger.exception("failed to persist OpenAI accept status")
-            await self.terminate_call(call_id, "openai_accept_failed")
+            await self.terminate_call(mapped_call_id, "openai_accept_failed")
             raise
-        return call_id
+        return mapped_call_id
 
     async def handle_sideband_open(self, call_id: str) -> None:
         sideband_open = LatencyMark.now()
@@ -606,11 +644,14 @@ class CallService:
             return
         call = await self.db.get_call(call_id)
         if (
-            call
+            call is not None
             and CallState(call["state"]) not in TERMINAL_STATES
             and await self.db.set_flag_once(call_id, "callee_dialed")
         ):
             plan = await self.db.get_plan(call["plan_id"])
+            if plan is None:
+                await self.terminate_call(call_id, "plan_missing_after_sideband_open")
+                return
             packet = ContextPacket.model_validate(plan["context"])
             participant = await self._run_latency_marked_step(
                 call_id,
@@ -1336,7 +1377,7 @@ class CallService:
         try:
             advisory = AdvisoryOutcome.model_validate(arguments)
             advisory_outcome = advisory.model_dump(mode="json", by_alias=True)
-            output = {"accepted": True}
+            output: dict[str, Any] = {"accepted": True}
         except Exception as exc:
             output = {"accepted": False, "error": str(exc)}
         await self._send_nontransfer_tool_result(
@@ -1380,7 +1421,13 @@ class CallService:
         # turn; resolve the question now so both delivery paths lose their claims.
         self._clear_pending_question(call_id)
         try:
-            await self.db.cancel_pending_questions(call_id)
+            cancelled = await self.db.cancel_pending_questions(call_id)
+            for cancelled_row in cancelled:
+                logger.info(
+                    "ask_poke question cancelled call_id=%s question_id=%s reason=voice_end_call",
+                    call_id,
+                    cancelled_row["question_id"],
+                )
         except Exception:
             logger.warning(
                 "pending question cancellation failed at end_call call_id=%s",
@@ -1456,6 +1503,12 @@ class CallService:
         received: LatencyMark,
         event_key: str,
     ) -> None:
+        logger.info(
+            "ask_poke rejected call_id=%s tool_call_id=%s error=%s",
+            call_id,
+            tool_call_id,
+            error,
+        )
         await self._send_nontransfer_tool_result(
             call_id,
             tool_call_id,
@@ -1498,6 +1551,17 @@ class CallService:
             LatencyStage.ASK_POKE_ASKED,
             LatencyMark.now(),
             event_key=str(row["question_id"]),
+        )
+        logger.info(
+            "ask_poke asked call_id=%s question_id=%s tool_call_id=%s sequence=%s "
+            "question_chars=%s question=%r reason=%r",
+            call_id,
+            row["question_id"],
+            tool_call_id,
+            row["sequence_number"],
+            len(request.question),
+            _truncate_for_log(request.question),
+            None if request.reason is None else _truncate_for_log(request.reason),
         )
         if self.settings.poke_push_enabled:
             self._spawn(
@@ -1585,6 +1649,12 @@ class CallService:
             and existing_pending.question_id == row["question_id"]
             and existing_pending.tool_call_id == tool_call_id
         ):
+            logger.info(
+                "ask_poke redelivered call_id=%s question_id=%s tool_call_id=%s",
+                call_id,
+                row["question_id"],
+                tool_call_id,
+            )
             return
 
         await self._register_ask_poke_question(
@@ -1706,15 +1776,21 @@ class CallService:
             pending.delivering = True
 
     async def _deliver_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
+        question_id = question_row["question_id"]
         if call_id in self._voice_end_pending:
             # The goodbye turn owns the sideband now; do not inject an answer relay.
-            logger.info("suppressing question answer delivery during voice end call_id=%s", call_id)
-            self._clear_pending_question(call_id, question_row["question_id"])
+            logger.info(
+                "ask_poke answer delivery suppressed during voice end call_id=%s question_id=%s",
+                call_id,
+                question_id,
+            )
+            self._clear_pending_question(call_id, question_id)
             self._notify_call_event(call_id)
             return
-        self._mark_question_delivering(call_id, question_row["question_id"])
+        self._mark_question_delivering(call_id, question_id)
         await self._cancel_active_response(call_id)
-        output = {"status": "answered", "answer": question_row["answer"]}
+        answer = question_row["answer"] or ""
+        output = {"status": "answered", "answer": answer}
         delivered = await self._guarded_send_tool_result(
             call_id,
             question_row["tool_call_id"],
@@ -1727,28 +1803,49 @@ class CallService:
         if delivered:
             undelivered = self._undelivered_answers.get(call_id)
             if undelivered is not None:
-                undelivered.discard(question_row["question_id"])
+                undelivered.discard(question_id)
                 if not undelivered:
                     self._undelivered_answers.pop(call_id, None)
             self._queue_latency(
                 call_id,
                 LatencyStage.ASK_POKE_RESOLVED,
                 LatencyMark.now(),
-                event_key=str(question_row["question_id"]),
+                event_key=str(question_id),
             )
             self._activity.note(call_id)
+            logger.info(
+                "ask_poke answer delivered call_id=%s question_id=%s tool_call_id=%s "
+                "answer_chars=%s answer=%r",
+                call_id,
+                question_id,
+                question_row["tool_call_id"],
+                len(answer),
+                _truncate_for_log(answer),
+            )
         else:
             # The question is durably 'answered' but the model never saw the output.
             # Remember it so a Poke retry re-attempts delivery instead of stopping at
             # already_answered with the function call still open.
-            self._undelivered_answers.setdefault(call_id, set()).add(question_row["question_id"])
-        self._clear_pending_question(call_id, question_row["question_id"])
+            self._undelivered_answers.setdefault(call_id, set()).add(question_id)
+            logger.warning(
+                "ask_poke answer delivery failed call_id=%s question_id=%s tool_call_id=%s",
+                call_id,
+                question_id,
+                question_row["tool_call_id"],
+            )
+        self._clear_pending_question(call_id, question_id)
         self._notify_call_event(call_id)
 
     async def _question_deadline(self, call_id: str, question_id: str) -> None:
         await asyncio.sleep(self.settings.ask_poke_answer_timeout_seconds)
         if call_id in self._voice_end_pending:
             # end_call already cancels pending questions; the goodbye owns the sideband.
+            logger.info(
+                "ask_poke question cancelled call_id=%s question_id=%s "
+                "reason=voice_end_pending_owns_cancellation",
+                call_id,
+                question_id,
+            )
             return
         self._mark_question_delivering(call_id, question_id)
         try:
@@ -1763,7 +1860,14 @@ class CallService:
         if row is None:
             # Lost the claim (answered, cancelled, or termination owns the call and
             # will cancel it); drop a stale watchdog carve-out entry left behind if
-            # resolution raced our registration.
+            # resolution raced our registration. Not a cancellation — the winner
+            # already owns the final status.
+            logger.info(
+                "ask_poke question expiry claim lost call_id=%s question_id=%s "
+                "reason=expiry_claim_lost_race",
+                call_id,
+                question_id,
+            )
             self._clear_pending_question(call_id, question_id)
             return
         await self._cancel_active_response(call_id)
@@ -1788,6 +1892,12 @@ class CallService:
             event_key=question_id,
         )
         self._activity.note(call_id)
+        logger.info(
+            "ask_poke timed out call_id=%s question_id=%s tool_call_id=%s",
+            call_id,
+            question_id,
+            row["tool_call_id"],
+        )
         self._clear_pending_question(call_id, question_id)
         self._notify_call_event(call_id)
 
@@ -1804,6 +1914,12 @@ class CallService:
         deadline = loop.time() + timeout
         # Clamp to SQLite's INTEGER range; an absurd cursor is a caller bug, not a 500.
         after = min(max(0, int(after_sequence)), 2**63 - 1)
+        logger.info(
+            "wait_for_call_event started call_id=%s after_sequence=%s timeout_seconds=%.2f",
+            call_id,
+            after,
+            timeout,
+        )
 
         while True:
             # Subscribe before reading so a notify that fires between the reads below
@@ -1840,18 +1956,58 @@ class CallService:
                     (event["sequence"] for event in events),
                     default=after,
                 )
+                pending_events = [event for event in events if event["status"] == "pending"]
                 if terminal:
-                    next_action = "Call is terminal; call get_call_result."
+                    next_action = (
+                        f"Call is terminal (state={state.value}). The call is over; stop "
+                        "polling and call get_call_result to retrieve the result."
+                    )
+                elif pending_events:
+                    question_event = pending_events[-1]
+                    answer_remaining = _seconds_until(question_event["deadline_at"])
+                    if answer_remaining is None:
+                        answer_remaining = self.settings.ask_poke_answer_timeout_seconds
+                    next_action = (
+                        "Answer immediately via answer_call_question with "
+                        f"question_id={question_event['question_id']}; you have "
+                        f"~{max(0, round(answer_remaining))}s. Finish all relevant checks "
+                        "first, then answer once with only the final, ready-to-relay result "
+                        "and no progress update such as 'I'm still checking'. "
+                        + ASK_POKE_POLL_WARNING
+                    )
                 elif events:
                     next_action = (
-                        "New call events are available. Finish all relevant checks first, then "
-                        "use answer_call_question once with only the final, ready-to-relay result "
-                        "and no progress update such as 'I'm still checking'. Then wait again "
-                        "with next_after_sequence."
+                        "New call events are available but none are pending questions. Call "
+                        f"wait_for_call_event again NOW with after_sequence={next_after}. "
+                        + ASK_POKE_POLL_WARNING
                     )
                 else:
                     next_action = (
-                        "No new events; re-enter wait_for_call_event with the same after_sequence."
+                        "No new events. Call wait_for_call_event again NOW with "
+                        f"after_sequence={next_after}. The call is still in progress. "
+                        + ASK_POKE_POLL_WARNING
+                    )
+                if events or terminal:
+                    logger.info(
+                        "wait_for_call_event returned call_id=%s after_sequence=%s "
+                        "next_after_sequence=%s state=%s terminal=%s event_count=%s "
+                        "event_statuses=%s",
+                        call_id,
+                        after,
+                        next_after,
+                        state.value,
+                        terminal,
+                        len(events),
+                        [event["status"] for event in events],
+                    )
+                else:
+                    logger.debug(
+                        "wait_for_call_event idle timeout call_id=%s after_sequence=%s "
+                        "state=%s waited_seconds=%.2f",
+                        call_id,
+                        after,
+                        state.value,
+                        timeout,
                     )
                 return {
                     "call_id": call_id,
@@ -1870,6 +2026,13 @@ class CallService:
         question_id: str,
         answer: str,
     ) -> dict[str, Any]:
+        logger.info(
+            "answer_call_question received call_id=%s question_id=%s answer_chars=%s answer=%r",
+            call_id,
+            question_id,
+            len(answer),
+            _truncate_for_log(answer),
+        )
         row = await self.db.claim_question_answer(call_id, question_id, answer)
         if row is not None:
             self._spawn(
@@ -1877,10 +2040,27 @@ class CallService:
                 name=f"deliver-question:{call_id}:{question_id}",
                 must_finish=True,
             )
-            return {"status": "accepted", "question_id": question_id}
+            logger.info(
+                "answer_call_question accepted call_id=%s question_id=%s",
+                call_id,
+                question_id,
+            )
+            return {
+                "status": "accepted",
+                "question_id": question_id,
+                "next_action": (
+                    "Answer accepted. Resume polling: call wait_for_call_event with "
+                    f"after_sequence={row['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                ),
+            }
 
         existing = await self.db.get_question(question_id)
         if existing is None or existing.get("call_id") != call_id:
+            logger.info(
+                "answer_call_question unknown question call_id=%s question_id=%s",
+                call_id,
+                question_id,
+            )
             raise LookupError("unknown question")
         status = existing.get("status")
         if status == "answered":
@@ -1893,6 +2073,11 @@ class CallService:
                     self._undelivered_answers.pop(call_id, None)
                 call = await self.db.get_call(call_id)
                 if call is None or self._call_activity_is_closed(call):
+                    logger.info(
+                        "answer_call_question call_ended on retry call_id=%s question_id=%s",
+                        call_id,
+                        question_id,
+                    )
                     return {"status": "call_ended"}
                 if call_id not in self._pending_questions:
                     # Restore the watchdog carve-out for the re-delivery window.
@@ -1907,21 +2092,76 @@ class CallService:
                     name=f"deliver-question:{call_id}:{question_id}",
                     must_finish=True,
                 )
-                return {"status": "accepted", "question_id": question_id}
-            return {"status": "already_answered"}
+                logger.info(
+                    "answer_call_question retrying undelivered answer call_id=%s question_id=%s",
+                    call_id,
+                    question_id,
+                )
+                return {
+                    "status": "accepted",
+                    "question_id": question_id,
+                    "next_action": (
+                        "Answer accepted. Resume polling: call wait_for_call_event with "
+                        f"after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                    ),
+                }
+            logger.info(
+                "answer_call_question already_answered call_id=%s question_id=%s",
+                call_id,
+                question_id,
+            )
+            return {
+                "status": "already_answered",
+                "next_action": (
+                    "Question already answered. Resume polling: call wait_for_call_event "
+                    f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                ),
+            }
         if status == "expired":
+            logger.info(
+                "answer_call_question expired call_id=%s question_id=%s",
+                call_id,
+                question_id,
+            )
             return {
                 "status": "expired",
                 "detail": "timeout already sent to the agent",
+                "next_action": (
+                    "Answer window already expired. Resume polling: call wait_for_call_event "
+                    f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                ),
             }
         if status == "cancelled":
+            logger.info(
+                "answer_call_question call_ended call_id=%s question_id=%s status=%s",
+                call_id,
+                question_id,
+                status,
+            )
             return {"status": "call_ended"}
         call = await self.db.get_call(call_id)
         if call is None or self._activity.is_closed(call):
+            logger.info(
+                "answer_call_question call_ended call_id=%s question_id=%s status=%s",
+                call_id,
+                question_id,
+                status,
+            )
             return {"status": "call_ended"}
         # Pending claim lost to a concurrent race without a readable winner — treat as
         # already handled so Poke can advance rather than retry forever.
-        return {"status": "already_answered"}
+        logger.info(
+            "answer_call_question already_answered after race call_id=%s question_id=%s",
+            call_id,
+            question_id,
+        )
+        return {
+            "status": "already_answered",
+            "next_action": (
+                "Question already handled. Resume polling: call wait_for_call_event "
+                f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+            ),
+        }
 
     async def _handle_voice_end_response_done(self, call_id: str, event: dict[str, Any]) -> None:
         pending = self._voice_end_pending.get(call_id)
@@ -2184,7 +2424,8 @@ class CallService:
         )
         # Once a termination claim may commit, caller cancellation must not strand
         # billing/media teardown behind an unreclaimable termination_claimed flag.
-        return await self._await_network_task(continuation)
+        result = await self._await_network_task(continuation)
+        return bool(result)
 
     async def _claim_and_finish_termination(
         self,
@@ -2221,7 +2462,15 @@ class CallService:
                 # teardown and mark a question answered after the call left ACTIVE.
                 self._pending_questions.pop(call_id, None)
                 try:
-                    await self.db.cancel_pending_questions(call_id)
+                    cancelled = await self.db.cancel_pending_questions(call_id)
+                    for cancelled_row in cancelled:
+                        logger.info(
+                            "ask_poke question cancelled call_id=%s question_id=%s "
+                            "reason=termination_claim reason_code=%s",
+                            call_id,
+                            cancelled_row["question_id"],
+                            reason,
+                        )
                 except Exception:
                     logger.warning(
                         "pending question cancellation failed at termination claim call_id=%s",
@@ -2428,6 +2677,8 @@ class CallService:
                     reason,
                 )
                 return False
+            if current is None:
+                return False
             call = current
             logger.warning(
                 "reconciled ambiguous terminal transition call_id=%s state=%s",
@@ -2436,7 +2687,15 @@ class CallService:
             )
         self._clear_call_runtime_state(call_id)
         try:
-            await self.db.cancel_pending_questions(call_id)
+            cancelled = await self.db.cancel_pending_questions(call_id)
+            for cancelled_row in cancelled:
+                logger.info(
+                    "ask_poke question cancelled call_id=%s question_id=%s "
+                    "reason=termination_finished reason_code=%s",
+                    call_id,
+                    cancelled_row["question_id"],
+                    reason,
+                )
         except Exception:
             logger.warning(
                 "pending question cancellation failed call_id=%s", call_id, exc_info=True
@@ -2620,12 +2879,15 @@ class CallService:
                 failure = "failed:owner_exit_unarmed"
                 failure_reason = "transfer_failed:owner_exit_unarmed"
                 try:
-                    failed_closed = await self.db.fail_promoted_transfer(
-                        call_id,
-                        transfer_outcome,
-                        failure,
-                        failure_reason,
-                    )
+                    if not isinstance(transfer_outcome, str):
+                        failed_closed = False
+                    else:
+                        failed_closed = await self.db.fail_promoted_transfer(
+                            call_id,
+                            transfer_outcome,
+                            failure,
+                            failure_reason,
+                        )
                 except Exception:
                     failed_closed = False
                     logger.warning(
@@ -2694,7 +2956,13 @@ class CallService:
 
     async def recover_startup(self) -> None:
         try:
-            await self.db.cancel_all_pending_questions()
+            cancelled = await self.db.cancel_all_pending_questions()
+            for cancelled_row in cancelled:
+                logger.info(
+                    "ask_poke question cancelled call_id=%s question_id=%s reason=startup_recovery",
+                    cancelled_row["call_id"],
+                    cancelled_row["question_id"],
+                )
         except Exception:
             logger.warning("startup could not cancel pending questions", exc_info=True)
         recovered: set[str] = set()

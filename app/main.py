@@ -39,7 +39,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service = getattr(app.state, "call_service", None)
         if service is None:
             raise RuntimeError("service is not started")
-        return service
+        return service  # type: ignore[no-any-return]
 
     register_tools(mcp, get_service)
     mcp_http_app = mcp.http_app(
