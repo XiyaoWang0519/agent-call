@@ -112,8 +112,10 @@ class StartPhoneCallOutput(BaseModel):
     state: CallState
     poll_after_seconds: int = 2
     next_action: str = (
-        "Call wait_for_call_event. Answer pending questions with answer_call_question and continue "
-        "waiting with next_after_sequence; when terminal, call get_call_result."
+        "Call wait_for_call_event. For each pending question, finish all relevant checks and use "
+        "answer_call_question once with only the final, ready-to-relay result, never an "
+        "intermediate 'I'm checking' update. Continue waiting with next_after_sequence; when "
+        "terminal, call get_call_result."
     )
 
 

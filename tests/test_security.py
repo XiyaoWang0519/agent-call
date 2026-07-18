@@ -292,3 +292,9 @@ async def test_exactly_seven_mcp_tools(settings):
         "wait_for_call_event",
         "answer_call_question",
     }
+
+    answer_tool = next(tool for tool in tools if tool.name == "answer_call_question")
+    description = answer_tool.description.lower()
+    assert "only the final, ready-to-relay result" in description
+    assert "never submit a progress update" in description
+    assert "cannot be found after checking" in description

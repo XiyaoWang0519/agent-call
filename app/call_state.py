@@ -1844,8 +1844,10 @@ class CallService:
                     next_action = "Call is terminal; call get_call_result."
                 elif events:
                     next_action = (
-                        "New call events are available. Answer pending questions with "
-                        "answer_call_question, then wait again with next_after_sequence."
+                        "New call events are available. Finish all relevant checks first, then "
+                        "use answer_call_question once with only the final, ready-to-relay result "
+                        "and no progress update such as 'I'm still checking'. Then wait again "
+                        "with next_after_sequence."
                     )
                 else:
                     next_action = (

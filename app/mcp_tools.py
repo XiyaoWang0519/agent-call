@@ -131,9 +131,15 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
     @mcp.tool(
         name="answer_call_question",
         description=(
-            "Answer one pending mid-call question from the voice agent. Exactly-once: a second "
-            "answer returns already_answered; late answers after timeout return expired. "
-            + CONTEXT_GUIDANCE
+            "Submit the final answer to one pending mid-call question from the voice agent. "
+            "Finish all relevant checks in Poke memory and integrations before calling this "
+            "tool: the answer is relayed to the callee immediately and accepted exactly once. "
+            "The answer must contain only the final, ready-to-relay result. Never submit a "
+            "progress update, partial result, or promise to keep checking (for example, 'one "
+            "sec', 'I'm still looking', or 'let me check further'). If the requested fact "
+            "cannot be found after checking, submit a conclusive final answer saying that and "
+            "include only useful confirmed facts. A second answer returns already_answered; "
+            "late answers after timeout return expired. " + CONTEXT_GUIDANCE
         ),
     )
     async def answer_call_question(call_id: str, question_id: str, answer: str) -> dict:
