@@ -39,11 +39,11 @@ async def run(args: argparse.Namespace) -> int:
     )
     context = {
         "owner": {
-            "display_name": "Irvin",
+            "display_name": settings.owner_display_name,
             "timezone": settings.owner_timezone,
             "callback_number": settings.owner_phone_e164,
         },
-        "target": {"name": "Irvin", "organization": None, "phone": target},
+        "target": {"name": settings.owner_display_name, "organization": None, "phone": target},
         "objective": (
             "Run a SIP canary. Ask the callee to say the displayed nonce, acknowledge it, "
             "then explain in one sentence that the canary is complete. " + tool_instruction

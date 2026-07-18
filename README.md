@@ -22,7 +22,7 @@
 
 ---
 
-A single-user [FastAPI](https://fastapi.tiangolo.com) + FastMCP service that lets [Poke](https://poke.com) prepare, confirm, start, monitor, and end outbound phone calls for Irvin. [Twilio](https://www.twilio.com) dials an [OpenAI](https://openai.com) SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite keeps the receipts: plans, state, ordered transcripts, and deterministic final results.
+A single-user [FastAPI](https://fastapi.tiangolo.com) + FastMCP service that lets [Poke](https://poke.com) prepare, confirm, start, monitor, and end outbound phone calls for its owner. [Twilio](https://www.twilio.com) dials an [OpenAI](https://openai.com) SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite keeps the receipts: plans, state, ordered transcripts, and deterministic final results.
 
 ## ✨ How a call happens
 

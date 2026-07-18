@@ -52,7 +52,7 @@ def settings(tmp_path: Path) -> Settings:
 def packet() -> ContextPacket:
     return ContextPacket(
         owner=OwnerContext(
-            display_name="Irvin",
+            display_name="the owner",
             timezone="America/Los_Angeles",
             callback_number="+14155550101",
         ),

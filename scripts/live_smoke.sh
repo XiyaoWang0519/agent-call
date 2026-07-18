@@ -57,7 +57,7 @@ echo "OK tools/list (7 tools present)"
 
 PREPARE='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"prepare_phone_call","arguments":{
   "context":{
-    "owner":{"display_name":"Irvin","timezone":"America/Los_Angeles","callback_number":"+15550000001"},
+    "owner":{"display_name":"the owner","timezone":"America/Los_Angeles","callback_number":"+15550000001"},
     "target":{"name":"Smoke Target","phone":"+15550000002"},
     "objective":"Smoke test objective",
     "escalation":{"mode":"end_call","owner_phone":"+15550000001"}},
