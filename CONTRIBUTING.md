@@ -15,20 +15,18 @@ Thanks for considering a contribution to the Poke Phone-Call Bridge.
 3. Copy the example environment file:
 
    ```bash
-   cp .env.example .env
+   test -e .env.local || cp .env.example .env.local
    ```
 
-   `.env.example` documents every setting the app reads: OpenAI, Exa, and
-   Twilio credentials/timeouts; the single-owner and Poke auth settings
-   (`OWNER_PHONE_E164`, `OWNER_DISPLAY_NAME`, `ALLOWED_POKE_USER_ID`,
-   `MCP_BEARER_TOKEN`, `DEBUG_API_TOKEN`, `DEPLOY_GUARD_TOKEN`); deployment
-   settings (`PUBLIC_BASE_URL`, `DATABASE_URL`, `ALLOWED_COUNTRY_CODES`);
-   model/transcription configuration; and feature flags for optional Poke
-   push, mid-call `ask_poke`, and hold-music detection. You do not need any
-   real credentials to run the test suite — every external service (OpenAI,
-   Twilio, Exa, Poke) is mocked in `tests/conftest.py`, and tests run against
-   a temporary SQLite database. Real credentials plus a public HTTPS tunnel
-   are only needed to place a live call.
+   `.env.local` is gitignored. Fill dummy values for local boots; you do not
+   need real credentials to run the test suite — every external service
+   (OpenAI, Twilio, Exa, Poke) is mocked in `tests/conftest.py`, and tests
+   run against a temporary SQLite database. Real credentials plus a public
+   HTTPS tunnel are only needed to place a live call.
+
+   Do not set `ALLOWED_COUNTRY_CODES` in `.env.local` (or any dotenv file).
+   pydantic-settings JSON-decodes list-typed fields, so a bare `=+1` value
+   crashes startup — omit it and rely on the default `["+1"]`.
 
 ## Running tests
 

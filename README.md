@@ -81,7 +81,7 @@ uv sync --all-groups --frozen
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Fill every required value in `.env.local`. Generate `MCP_BEARER_TOKEN` and `DEBUG_API_TOKEN` with `openssl rand -hex 32`. Never commit env files — `.gitignore` already excludes them.
+Fill every required value in `.env.local`. Generate `MCP_BEARER_TOKEN` and `DEBUG_API_TOKEN` with `openssl rand -hex 32`. Leave `ALLOWED_COUNTRY_CODES` unset in dotenv files (the app defaults to `["+1"]`). Never commit env files — `.gitignore` already excludes them.
 
 Then check your work:
 
