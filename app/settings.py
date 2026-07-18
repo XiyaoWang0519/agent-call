@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     twilio_caller_id: str | None = None
     twilio_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     owner_phone_e164: str | None = None
-    owner_display_name: str = "Irvin"
+    owner_display_name: str = "the owner"
     allowed_poke_user_id: str | None = None
     mcp_bearer_token: SecretStr | None = None
     debug_api_token: SecretStr | None = None

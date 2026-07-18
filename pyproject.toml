@@ -41,12 +41,21 @@ packages = ["app"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.coverage.run]
+source = ["app"]
+
+[tool.coverage.report]
+# Gates regressions in CI (`pytest --cov=app`) without affecting plain
+# `uv run pytest`, which doesn't load coverage at all.
+fail_under = 85
+show_missing = true
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ASYNC"]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "FIX"]
 ignore = ["B008", "E501"]
 
 [tool.mypy]

@@ -114,11 +114,13 @@ class StartPhoneCallOutput(BaseModel):
     next_action: str = (
         "The call has started. Immediately begin calling wait_for_call_event in a loop "
         "with the returned next_after_sequence, and keep calling it again NOW after every "
-        "response until the call reaches a terminal state. Answer pending questions with "
-        "answer_call_question, then resume the wait_for_call_event loop. Do not end your "
-        "turn and do not stop polling until the call is terminal — if you stop, mid-call "
-        "questions from the phone agent (ask_poke) will time out and the call may fail its "
-        "objective. When terminal, call get_call_result."
+        "response until the call reaches a terminal state. For each pending question, finish "
+        "all relevant checks and use answer_call_question once with only the final, "
+        "ready-to-relay result, never an intermediate 'I'm checking' update, then resume the "
+        "wait_for_call_event loop. Do not end your turn and do not stop polling until the "
+        "call is terminal — if you stop, mid-call questions from the phone agent (ask_poke) "
+        "will time out and the call may fail its objective. When terminal, call "
+        "get_call_result."
     )
 
 

@@ -49,6 +49,8 @@ def test_start_phone_call_output_routes_monitoring_through_event_poll():
 
     assert "wait_for_call_event" in output.next_action
     assert "answer_call_question" in output.next_action
+    assert "only the final, ready-to-relay result" in output.next_action
+    assert "I'm checking" in output.next_action
     assert "get_call_result" in output.next_action
 
 
@@ -75,6 +77,23 @@ async def test_ask_persists_without_immediate_tool_output(ask_service, packet):
     assert call_id in ask_service._pending_questions
     call = await ask_service.db.get_call(call_id)
     assert call["tool_call_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_question_event_requires_final_answer_after_checks(ask_service, packet):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_final_guidance")
+
+    result = await ask_service.wait_for_call_event(
+        call_id,
+        after_sequence=0,
+        timeout_seconds=0.01,
+    )
+
+    assert len(result["events"]) == 1
+    assert "finish all relevant checks first" in result["next_action"].lower()
+    assert "only the final, ready-to-relay result" in result["next_action"]
+    assert "I'm still checking" in result["next_action"]
 
 
 @pytest.mark.asyncio

@@ -22,7 +22,7 @@
 
 ---
 
-A single-user [FastAPI](https://fastapi.tiangolo.com) + FastMCP service that lets [Poke](https://poke.com) prepare, confirm, start, monitor, and end outbound phone calls for Irvin. [Twilio](https://www.twilio.com) dials an [OpenAI](https://openai.com) SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite keeps the receipts: plans, state, ordered transcripts, and deterministic final results.
+A single-user [FastAPI](https://fastapi.tiangolo.com) + FastMCP service that lets [Poke](https://poke.com) prepare, confirm, start, monitor, and end outbound phone calls for its owner. [Twilio](https://www.twilio.com) dials an [OpenAI](https://openai.com) SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite keeps the receipts: plans, state, ordered transcripts, and deterministic final results.
 
 ## ✨ How a call happens
 
@@ -81,7 +81,7 @@ uv sync --all-groups --frozen
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Fill every required value in `.env.local`. Generate `MCP_BEARER_TOKEN` and `DEBUG_API_TOKEN` with `openssl rand -hex 32`. Never commit env files — `.gitignore` already excludes them.
+Fill every required value in `.env.local`. Generate `MCP_BEARER_TOKEN` and `DEBUG_API_TOKEN` with `openssl rand -hex 32`. Leave `ALLOWED_COUNTRY_CODES` unset in dotenv files (the app defaults to `["+1"]`). Never commit env files — `.gitignore` already excludes them.
 
 Then check your work:
 
