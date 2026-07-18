@@ -41,6 +41,10 @@ Add regression coverage for state transitions, signed webhook handling,
 payload shapes, and recovery/teardown paths — exercise both success and
 failure cases for new behavior.
 
+CI enforces a coverage floor; to check locally run
+`uv run pytest -q --cov=app` (fails under 85%, see `[tool.coverage.report]`
+in `pyproject.toml`).
+
 ## Linting
 
 ```bash

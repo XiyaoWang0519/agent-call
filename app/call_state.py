@@ -65,7 +65,6 @@ TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
 # cancel_response + function_call_output each bound to REALTIME_SEND_TIMEOUT_SECONDS; keep
 # the stale-call carve-out long enough for both sends after the answer deadline fires.
 WATCHDOG_QUESTION_GRACE_SECONDS = 2 * REALTIME_SEND_TIMEOUT_SECONDS + 5.0
-ASK_POKE_LOG_TEXT_LIMIT = 200
 
 # Poke (the MCP client) is an LLM agent: it reliably follows explicit next_action
 # directives embedded in tool RESULTS, but under-weights static tool descriptions. There
@@ -77,12 +76,6 @@ ASK_POKE_POLL_WARNING = (
     "state — if you stop, mid-call questions from the phone agent (ask_poke) will "
     "time out and the call may fail its objective."
 )
-
-
-def _truncate_for_log(text: str, *, limit: int = ASK_POKE_LOG_TEXT_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "…"
 
 
 def _seconds_until(iso_timestamp: str | None) -> float | None:
@@ -1554,14 +1547,13 @@ class CallService:
         )
         logger.info(
             "ask_poke asked call_id=%s question_id=%s tool_call_id=%s sequence=%s "
-            "question_chars=%s question=%r reason=%r",
+            "question_chars=%s reason_present=%s",
             call_id,
             row["question_id"],
             tool_call_id,
             row["sequence_number"],
             len(request.question),
-            _truncate_for_log(request.question),
-            None if request.reason is None else _truncate_for_log(request.reason),
+            request.reason is not None,
         )
         if self.settings.poke_push_enabled:
             self._spawn(
@@ -1815,12 +1807,11 @@ class CallService:
             self._activity.note(call_id)
             logger.info(
                 "ask_poke answer delivered call_id=%s question_id=%s tool_call_id=%s "
-                "answer_chars=%s answer=%r",
+                "answer_chars=%s",
                 call_id,
                 question_id,
                 question_row["tool_call_id"],
                 len(answer),
-                _truncate_for_log(answer),
             )
         else:
             # The question is durably 'answered' but the model never saw the output.
@@ -2027,11 +2018,10 @@ class CallService:
         answer: str,
     ) -> dict[str, Any]:
         logger.info(
-            "answer_call_question received call_id=%s question_id=%s answer_chars=%s answer=%r",
+            "answer_call_question received call_id=%s question_id=%s answer_chars=%s",
             call_id,
             question_id,
             len(answer),
-            _truncate_for_log(answer),
         )
         row = await self.db.claim_question_answer(call_id, question_id, answer)
         if row is not None:
