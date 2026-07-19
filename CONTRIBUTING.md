@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for considering a contribution to the Poke Phone-Call Bridge.
+Thanks for considering a contribution to the Phone-Call Bridge for Poke.
 
 ## Getting started
 
@@ -53,9 +53,8 @@ uv run ruff format --check .
 Ruff targets Python 3.12 with a 100-character line length and enforces
 pycodestyle, Pyflakes, import sorting (`I`), pyupgrade, bugbear, and async
 rules (see `[tool.ruff]` in `pyproject.toml`). Run `uv run ruff format .` to
-auto-format before committing. If you have `mypy` set up locally, `uv run
-mypy app` runs strict type checking on the `app` package (not required for
-CI, but appreciated).
+auto-format before committing. `uv run mypy app` runs strict type checking on
+the application package and is required by CI.
 
 ## Pull request guidelines
 
@@ -63,8 +62,8 @@ CI, but appreciated).
 - Keep PRs focused on a single change; avoid unrelated refactors.
 - Add or update tests for any behavioral change.
 - Ensure CI passes: GitHub Actions runs `ruff format --check`, `ruff check`,
-  and `pytest -q` against `app`, `tests`, and `scripts` on every PR and push
-  to `main`.
+  strict mypy, and the coverage-gated pytest suite on every PR and push to
+  `main`.
 - Describe the behavioral change, any risk to live-call handling or billing,
   and configuration changes in the PR description.
 

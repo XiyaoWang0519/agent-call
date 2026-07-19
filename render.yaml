@@ -13,7 +13,7 @@ services:
       - key: DATABASE_URL
         value: sqlite:////var/data/poke_call.db
       - key: ALLOWED_COUNTRY_CODES
-        value: +1
+        value: '["+1"]'
       - key: INPUT_TRANSCRIPTION_MODEL
         value: gpt-4o-mini-transcribe
       - key: EXTRACTOR_MODEL

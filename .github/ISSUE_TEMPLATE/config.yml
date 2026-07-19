@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/XiyaoWang0519/poke-call/security/advisories/new
+    about: Report exploitable security problems privately.

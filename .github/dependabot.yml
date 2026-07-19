@@ -23,3 +23,15 @@ updates:
       - "area/ci"
     commit-message:
       prefix: "ci"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "type/tech-debt"
+      - "area/ci"
+    commit-message:
+      prefix: "docker"

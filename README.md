@@ -1,15 +1,7 @@
-<p align="center">
-  <a href="https://poke.com"><img src="docs/images/poke-og.jpg" alt="Poke" width="720"/></a>
-</p>
-
-<h1 align="center">📞 Poke Phone-Call Bridge</h1>
+<h1 align="center">📞 Phone-Call Bridge for Poke</h1>
 
 <p align="center">
   <em>Text Poke. Poke calls a human. An AI does the talking. You get the transcript.</em>
-</p>
-
-<p align="center">
-  <img src="docs/images/poke-icon.png" alt="Poke" height="56"/>
 </p>
 
 <p align="center">
@@ -23,6 +15,10 @@
 ---
 
 A single-user [FastAPI](https://fastapi.tiangolo.com) + FastMCP service that lets [Poke](https://poke.com) prepare, confirm, start, monitor, and end outbound phone calls for its owner. [Twilio](https://www.twilio.com) dials an [OpenAI](https://openai.com) SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite keeps the receipts: plans, state, ordered transcripts, and deterministic final results.
+
+> [!NOTE]
+> This is an independent, unofficial integration. It is not endorsed by or
+> affiliated with Poke, OpenAI, Twilio, Exa, Fly.io, FastAPI, or Astral.
 
 ## ✨ How a call happens
 
@@ -49,17 +45,6 @@ sequenceDiagram
 The callee's phone never rings until the AI is already on the line, warmed up, and ready to speak.
 
 ## 🧰 Built with
-
-<p align="center">
-  <a href="https://developers.openai.com/api/docs/guides/realtime-sip"><img src="docs/images/openai-realtime-sip.png" alt="OpenAI Realtime API with SIP" width="49%"/></a>
-  <a href="https://developers.openai.com"><img src="docs/images/openai-developers-og.png" alt="OpenAI Developers" width="49%"/></a>
-</p>
-
-<p align="center">
-  <a href="https://www.twilio.com"><img src="docs/images/twilio-og.png" alt="Twilio" width="32%"/></a>
-  <a href="https://exa.ai"><img src="docs/images/exa-og.png" alt="Exa" width="32%"/></a>
-  <a href="https://fly.io"><img src="docs/images/fly-og.jpg" alt="Fly.io" width="32%"/></a>
-</p>
 
 | Piece | Job |
 | --- | --- |
@@ -166,7 +151,33 @@ Both exit nonzero if any gate fails. The debug evidence endpoint they use requir
 
 ## 🎈 Deploying
 
-`fly.toml` defines production at `https://poke-call.fly.dev`: one always-on shared-CPU machine, 512 MB RAM, a 1 GB volume at `/data`, and SQLite at `sqlite:////data/poke_call.db`.
+### Self-hosting on Fly.io
+
+The checked-in `fly.toml` documents the maintainer's deployment and must be
+customized for a new installation. Before deploying a fork:
+
+1. Change `app` and `primary_region` in `fly.toml` to your own Fly app and
+   preferred region.
+2. Set `PUBLIC_BASE_URL` to your app's HTTPS origin.
+3. Create a 1 GB volume named `poke_call_data` in the same region as the
+   Machine; the app stores SQLite state at `/data/poke_call.db`.
+4. Configure every required secret listed in `.env.example`.
+5. Point the OpenAI project webhook at
+   `https://YOUR_HOST/webhooks/openai` and subscribe it to
+   `realtime.call.incoming`.
+6. If you retain `.github/workflows/fly-deploy.yml`, replace the hard-coded app
+   name and URLs, configure a protected `production` environment, and add the
+   `FLY_API_TOKEN` and `DEPLOY_GUARD_TOKEN` repository secrets.
+
+Keep exactly one Machine. SQLite state is volume-local; multiple Machines do
+not share call state. `render.yaml` is available as a paid Render alternative
+and prompts for deployment-specific secrets.
+
+### Maintainer production
+
+The repository's `fly.toml` currently defines the maintainer deployment at
+`https://poke-call.fly.dev`: one always-on shared-CPU machine, 512 MB RAM, a
+1 GB volume at `/data`, and SQLite at `sqlite:////data/poke_call.db`.
 
 ```bash
 flyctl config validate
@@ -180,10 +191,6 @@ Set every required value from `.env.example` with `flyctl secrets set` or `flyct
 flyctl secrets deploy -a poke-call
 flyctl status -a poke-call
 ```
-
-> [!IMPORTANT]
-> Keep exactly **one** Machine. SQLite state is volume-local; a second Machine would not share call state. `render.yaml` remains available as a paid Render alternative.
-
 
 ### Rollback
 
@@ -217,7 +224,9 @@ Redeploying a prior image restores only the application image without a full reb
 - `SEMANTIC_VAD_EAGERNESS` defaults to `auto` (OpenAI's medium-eagerness behavior); set `high` for quicker turn completion.
 - `OPENAI_KEEPALIVE_EXPIRY_SECONDS=60` keeps the control-plane TLS connection reusable between sporadic calls; only set it to a bounded 5–300 second value.
 - The voice model can call `search_web` for current or uncertain facts. The application fixes Exa Search to `type=auto`, 10 results, moderation, and token-efficient highlights, with a three-second wall-clock deadline controlled by `EXA_SEARCH_TIMEOUT_SECONDS`.
-- Locked dependency versions: OpenAI Python `2.45.0`, Twilio Python `9.10.9`, FastMCP `3.4.4`, FastAPI `0.139.0`, websockets `16.1`. `uv.lock` is authoritative.
+- Runtime and development dependencies are locked in `uv.lock`; use
+  `uv sync --all-groups --frozen` rather than copying version numbers from the
+  documentation.
 
 </details>
 
@@ -243,12 +252,22 @@ Telephony state and extraction state remain separate. A successful phone call wh
 
 </details>
 
+## Contributing and support
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md) before opening a pull request. Use
+[SUPPORT.md](SUPPORT.md) for setup questions and [SECURITY.md](SECURITY.md) for
+private vulnerability reporting.
+
+## License
+
+Original project code and documentation are available under the
+[MIT License](LICENSE). Third-party services, names, and marks are governed by
+their respective owners' terms and are not included in that license grant.
+
 ---
 
-<p align="center">
-  <sub>Brand images in <code>docs/images/</code> were fetched from official sites
-  (<a href="https://poke.com">poke.com</a>, <a href="https://developers.openai.com">developers.openai.com</a>,
-  <a href="https://www.twilio.com">twilio.com</a>, <a href="https://exa.ai">exa.ai</a>,
-  <a href="https://fly.io">fly.io</a>, <a href="https://fastapi.tiangolo.com">fastapi.tiangolo.com</a>,
-  <a href="https://astral.sh">astral.sh</a>). Marks belong to their respective owners.</sub>
-</p>
+Poke, OpenAI, Twilio, Exa, Fly.io, FastAPI, Astral, and related names and marks
+belong to their respective owners. Their use here identifies interoperability
+only and does not imply sponsorship or endorsement. Third-party names and marks
+are not licensed under this project's MIT License.
