@@ -10,7 +10,13 @@ from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from app.call_state import CallService
-from app.models import AnswerCallQuestionRequest, ContextPacket, PreparePhoneCallInput
+from app.models import (
+    AnswerCallQuestionRequest,
+    ContextPacket,
+    PreparePhoneCallInput,
+    QuestionResolution,
+    QuestionSource,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -174,30 +180,44 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
         name="answer_call_question",
         description=(
             "Submit the final answer to one pending mid-call question from the voice agent — "
-            "the callee is waiting live on the phone. Finish all relevant checks in Poke "
-            "memory and integrations before calling this tool: the answer is relayed to the "
-            "callee immediately and accepted exactly once. The answer must contain only the "
-            "final, ready-to-relay result. Never submit a progress update, partial result, or "
-            "promise to keep checking (for example, 'one sec', 'I'm still looking', or 'let "
-            "me check further'). If the requested fact cannot be found after checking, submit "
-            "a conclusive final answer saying that and include only useful confirmed facts. "
-            "A second answer returns already_answered; late answers after timeout return "
-            "expired. After answering, immediately resume the wait_for_call_event loop until "
-            "the call is terminal; do not end your turn. " + CONTEXT_GUIDANCE
+            "the callee is waiting live on the phone. Begin retrieval immediately, but prioritize "
+            "accuracy over speed within the remaining deadline. For owner-specific facts, search "
+            "Poke memory and conversation history first, then relevant integrations such as "
+            "email. A miss in one source does not mean the answer is unavailable, and call context "
+            "such as 'this is a test' does not make the requested fact optional. The answer is "
+            "relayed to the callee immediately and accepted exactly once, so it must contain only "
+            "the final, ready-to-relay result. Never submit a progress update, partial result, or "
+            "promise to keep checking. Set resolution=not_found only after checking both "
+            "poke_memory and conversation_history and include them in sources_checked; otherwise "
+            "the submission is rejected and the question remains pending. A second accepted answer "
+            "returns already_answered; late answers after timeout return expired. After answering, "
+            "immediately resume the wait_for_call_event loop until the call is terminal; do not end "
+            "your turn. " + CONTEXT_GUIDANCE
         ),
     )
-    async def answer_call_question(call_id: str, question_id: str, answer: str) -> dict[str, Any]:
+    async def answer_call_question(
+        call_id: str,
+        question_id: str,
+        answer: str,
+        resolution: QuestionResolution,
+        sources_checked: list[QuestionSource],
+    ) -> dict[str, Any]:
         logger.info(
-            "mcp tool answer_call_question call_id=%s question_id=%s answer_chars=%s",
+            "mcp tool answer_call_question call_id=%s question_id=%s answer_chars=%s "
+            "resolution=%s sources_checked=%s",
             call_id,
             question_id,
             len(answer),
+            resolution.value,
+            ",".join(source.value for source in sources_checked),
         )
         try:
             request = AnswerCallQuestionRequest(
                 call_id=call_id,
                 question_id=question_id,
                 answer=answer,
+                resolution=resolution,
+                sources_checked=sources_checked,
             )
         except ValidationError as exc:
             logger.info(
@@ -205,7 +225,26 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
                 call_id,
                 question_id,
             )
-            raise ToolError(str(exc)) from exc
+            issues = [
+                {
+                    "field": ".".join(str(part) for part in error["loc"]) or "request",
+                    "message": error["msg"],
+                }
+                for error in exc.errors(include_input=False, include_url=False)
+            ]
+            raise ToolError(
+                json.dumps(
+                    {
+                        "code": "invalid_answer_submission",
+                        "message": "Answer rejected; the question remains pending.",
+                        "issues": issues,
+                        "next_action": (
+                            "Complete the missing source checks and retry "
+                            "answer_call_question before the original deadline."
+                        ),
+                    }
+                )
+            ) from exc
         try:
             result = await get_service().answer_call_question(
                 request.call_id,

@@ -297,4 +297,14 @@ async def test_exactly_seven_mcp_tools(settings):
     description = answer_tool.description.lower()
     assert "only the final, ready-to-relay result" in description
     assert "never submit a progress update" in description
-    assert "cannot be found after checking" in description
+    assert "prioritize accuracy over speed" in description
+    assert "search poke memory and conversation history first" in description
+    assert "resolution=not_found" in description
+    assert "question remains pending" in description
+
+    required = set(answer_tool.parameters["required"])
+    assert {"resolution", "sources_checked"}.issubset(required)
+    assert answer_tool.parameters["properties"]["resolution"]["enum"] == [
+        "found",
+        "not_found",
+    ]

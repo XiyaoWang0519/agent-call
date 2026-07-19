@@ -1959,11 +1959,16 @@ class CallService:
                     if answer_remaining is None:
                         answer_remaining = self.settings.ask_poke_answer_timeout_seconds
                     next_action = (
-                        "Answer immediately via answer_call_question with "
+                        "Begin the required retrieval now for "
                         f"question_id={question_event['question_id']}; you have "
-                        f"~{max(0, round(answer_remaining))}s. Finish all relevant checks "
-                        "first, then answer once with only the final, ready-to-relay result "
-                        "and no progress update such as 'I'm still checking'. "
+                        f"~{max(0, round(answer_remaining))}s. Accuracy is more important than "
+                        "speed within that window. For owner-specific facts, search poke_memory "
+                        "and conversation_history first, then relevant integrations. A miss in one "
+                        "source is not a not_found result, and call context such as 'this is a test' "
+                        "does not make the question optional. Call answer_call_question once with "
+                        "only the final, ready-to-relay result, its resolution, and the sources "
+                        "actually checked. resolution=not_found requires both poke_memory and "
+                        "conversation_history in sources_checked. Do not send a progress update. "
                         + ASK_POKE_POLL_WARNING
                     )
                 elif events:

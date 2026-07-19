@@ -114,9 +114,10 @@ class StartPhoneCallOutput(BaseModel):
     next_action: str = (
         "The call has started. Immediately begin calling wait_for_call_event in a loop "
         "with the returned next_after_sequence, and keep calling it again NOW after every "
-        "response until the call reaches a terminal state. For each pending question, finish "
-        "all relevant checks and use answer_call_question once with only the final, "
-        "ready-to-relay result, never an intermediate 'I'm checking' update, then resume the "
+        "response until the call reaches a terminal state. For each pending question, follow the "
+        "returned source-check instructions, prioritize accuracy within the answer deadline, and "
+        "use answer_call_question once with only the final, ready-to-relay result and source "
+        "attestation, never an intermediate 'I'm checking' update, then resume the "
         "wait_for_call_event loop. Do not end your turn and do not stop polling until the "
         "call is terminal — if you stop, mid-call questions from the phone agent (ask_poke) "
         "will time out and the call may fail its objective. When terminal, call "
@@ -334,6 +335,20 @@ class QuestionStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class QuestionResolution(StrEnum):
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+
+
+class QuestionSource(StrEnum):
+    POKE_MEMORY = "poke_memory"
+    CONVERSATION_HISTORY = "conversation_history"
+    EMAIL = "email"
+    CALENDAR = "calendar"
+    DRIVE = "drive"
+    OTHER = "other"
+
+
 class AskPokeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -363,6 +378,20 @@ class AnswerCallQuestionRequest(BaseModel):
     call_id: str = Field(min_length=1, max_length=120)
     question_id: str = Field(min_length=1, max_length=120)
     answer: str = Field(min_length=1, max_length=4096)
+    resolution: QuestionResolution = Field(
+        description=(
+            "Use found only for a confirmed answer. Use not_found only after the required "
+            "owner-specific sources were searched."
+        )
+    )
+    sources_checked: list[QuestionSource] = Field(
+        min_length=1,
+        max_length=len(QuestionSource),
+        description=(
+            "Sources actually checked before submitting. For owner-specific facts, search "
+            "poke_memory and conversation_history before relevant integrations."
+        ),
+    )
 
     @field_validator("answer")
     @classmethod
@@ -373,6 +402,21 @@ class AnswerCallQuestionRequest(BaseModel):
         if len(stripped.encode("utf-8")) > 4096:
             raise ValueError("answer exceeds 4096 UTF-8 bytes")
         return stripped
+
+    @model_validator(mode="after")
+    def validate_sources_checked(self) -> AnswerCallQuestionRequest:
+        if len(set(self.sources_checked)) != len(self.sources_checked):
+            raise ValueError("sources_checked must not contain duplicates")
+        if self.resolution is QuestionResolution.NOT_FOUND:
+            required = {
+                QuestionSource.POKE_MEMORY,
+                QuestionSource.CONVERSATION_HISTORY,
+            }
+            missing = required.difference(self.sources_checked)
+            if missing:
+                names = ", ".join(sorted(source.value for source in missing))
+                raise ValueError("not_found answers require sources_checked to include " + names)
+        return self
 
 
 class AdvisoryOutcome(BaseModel):
