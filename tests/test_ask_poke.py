@@ -9,10 +9,17 @@ from types import SimpleNamespace
 
 import pytest
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from app.call_state import WATCHDOG_QUESTION_GRACE_SECONDS, PendingQuestion
 from app.mcp_tools import register_tools
-from app.models import CallState, StartPhoneCallOutput
+from app.models import (
+    AnswerCallQuestionRequest,
+    CallState,
+    QuestionResolution,
+    QuestionSource,
+    StartPhoneCallOutput,
+)
 from app.openai_realtime import RealtimeBridge
 from tests.conftest import seed_call, wait_background
 
@@ -50,6 +57,7 @@ def test_start_phone_call_output_routes_monitoring_through_event_poll():
     assert "wait_for_call_event" in output.next_action
     assert "answer_call_question" in output.next_action
     assert "only the final, ready-to-relay result" in output.next_action
+    assert "source attestation" in output.next_action
     assert "I'm checking" in output.next_action
     assert "get_call_result" in output.next_action
 
@@ -80,7 +88,7 @@ async def test_ask_persists_without_immediate_tool_output(ask_service, packet):
 
 
 @pytest.mark.asyncio
-async def test_question_event_requires_final_answer_after_checks(ask_service, packet):
+async def test_question_event_prioritizes_required_sources_over_speed(ask_service, packet):
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_final_guidance")
 
@@ -91,9 +99,68 @@ async def test_question_event_requires_final_answer_after_checks(ask_service, pa
     )
 
     assert len(result["events"]) == 1
-    assert "finish all relevant checks first" in result["next_action"].lower()
+    assert "accuracy is more important than speed" in result["next_action"].lower()
+    assert "search poke_memory and conversation_history first" in result["next_action"]
+    assert "this is a test" in result["next_action"]
     assert "only the final, ready-to-relay result" in result["next_action"]
-    assert "I'm still checking" in result["next_action"]
+    assert "resolution=not_found requires both" in result["next_action"]
+
+
+def test_not_found_answer_requires_memory_and_conversation_history():
+    with pytest.raises(ValueError, match="not_found answers require sources_checked"):
+        AnswerCallQuestionRequest(
+            call_id="call_1",
+            question_id="question_1",
+            answer="I could not find the building.",
+            resolution=QuestionResolution.NOT_FOUND,
+            sources_checked=[QuestionSource.EMAIL],
+        )
+
+    request = AnswerCallQuestionRequest(
+        call_id="call_1",
+        question_id="question_1",
+        answer="I could not find the building after checking the available records.",
+        resolution=QuestionResolution.NOT_FOUND,
+        sources_checked=[
+            QuestionSource.POKE_MEMORY,
+            QuestionSource.CONVERSATION_HISTORY,
+            QuestionSource.EMAIL,
+        ],
+    )
+
+    assert request.resolution is QuestionResolution.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_mcp_rejects_unsupported_not_found_without_claiming_question(ask_service, packet):
+    call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
+    await _ask(ask_service, call_id, tool_call_id="tc_unsupported_not_found")
+    await wait_background()
+    rows = await ask_service.db.get_questions_after(call_id, 0)
+    question_id = rows[0]["question_id"]
+    mcp = FastMCP("test-ask-poke-source-validation")
+    register_tools(mcp, lambda: ask_service)
+
+    with pytest.raises(ToolError, match="question remains pending"):
+        await mcp.call_tool(
+            "answer_call_question",
+            {
+                "call_id": call_id,
+                "question_id": question_id,
+                "answer": "I could not find the building in email.",
+                "resolution": "not_found",
+                "sources_checked": ["email"],
+            },
+        )
+    await wait_background()
+
+    question = await ask_service.db.get_question(question_id)
+    assert question is not None
+    assert question["status"] == "pending"
+    assert not any(
+        tool_call_id == "tc_unsupported_not_found"
+        for _, tool_call_id, _ in ask_service._test_realtime.tool_results
+    )
 
 
 @pytest.mark.asyncio
@@ -770,6 +837,8 @@ async def test_mcp_ask_poke_tools_emit_invocation_logs(ask_service, packet, capl
                 "call_id": call_id,
                 "question_id": question_id,
                 "answer": "CVS on Market Street",
+                "resolution": "found",
+                "sources_checked": ["poke_memory"],
             },
         )
         await wait_background()
@@ -784,7 +853,12 @@ async def test_mcp_ask_poke_tools_emit_invocation_logs(ask_service, packet, capl
     messages = _messages(caplog, logger_name="app.mcp_tools")
     assert any("mcp tool wait_for_call_event call_id=" in message for message in messages)
     assert any("mcp tool wait_for_call_event completed" in message for message in messages)
-    assert any("mcp tool answer_call_question call_id=" in message for message in messages)
+    assert any(
+        "mcp tool answer_call_question call_id=" in message
+        and "resolution=found" in message
+        and "sources_checked=poke_memory" in message
+        for message in messages
+    )
     assert any(
         "mcp tool answer_call_question completed" in message and "status=accepted" in message
         for message in messages
