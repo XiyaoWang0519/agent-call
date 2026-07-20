@@ -193,7 +193,10 @@ class CallService:
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
         self._tool_seen_calls: set[str] = set()
-        self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
+        # Keyed by call_id first (then by (stage, event_key)) so call termination can
+        # drop one call's dedup entries in O(1) instead of rebuilding this dict over
+        # every in-memory call.
+        self._queued_latency_events: dict[str, dict[tuple[LatencyStage, str], LatencyMark]] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
         self._hold_state: dict[str, HoldState] = {}
@@ -377,12 +380,13 @@ class CallService:
         *events: tuple[LatencyStage, LatencyMark, str],
     ) -> None:
         pending: list[tuple[LatencyStage, LatencyMark, str]] = []
+        call_events = self._queued_latency_events.setdefault(call_id, {})
         for stage, mark, event_key in events:
-            key = (call_id, stage, event_key)
-            previous = self._queued_latency_events.get(key)
+            key = (stage, event_key)
+            previous = call_events.get(key)
             if previous is not None and previous.monotonic_ns <= mark.monotonic_ns:
                 continue
-            self._queued_latency_events[key] = mark
+            call_events[key] = mark
             pending.append((stage, mark, event_key))
         if not pending:
             return
@@ -1186,79 +1190,26 @@ class CallService:
         except json.JSONDecodeError:
             arguments = {}
         if name == "search_web":
-            await self._tool_search_web(
-                call_id, tool_call_id, arguments, received=received, event_key=event_key
+            # Exa search can take 3-10s. The dispatcher (_dispatch_events ->
+            # handle_realtime_event -> _handle_tool_call) processes every Realtime
+            # event for this call strictly serially, so awaiting the search here
+            # would stall all other events (audio, transcripts, other tool calls)
+            # for the same call. Spawn it instead and let it deliver its result
+            # out-of-band once the search completes.
+            self._spawn(
+                self._tool_search_web(
+                    call_id, tool_call_id, arguments, received=received, event_key=event_key
+                ),
+                name=f"tool-search-web:{call_id}:{event_key}",
             )
         elif name == "send_dtmf":
-            try:
-                request = SendDtmfRequest.model_validate(arguments)
-            except Exception:
-                logger.info("invalid send_dtmf tool arguments call_id=%s", call_id)
-                await self._send_nontransfer_tool_result(
-                    call_id,
-                    tool_call_id,
-                    {"ok": False, "error": "invalid_dtmf_request"},
-                    received=received,
-                    event_key=event_key,
-                )
-                return
-
-            call = await self.db.get_call(call_id)
-            if call is None or call["state"] != CallState.ACTIVE.value:
-                await self._send_nontransfer_tool_result(
-                    call_id,
-                    tool_call_id,
-                    {"ok": False, "error": "call_not_ready"},
-                    received=received,
-                    event_key=event_key,
-                )
-                return
-            conference = call.get("conference_sid") or call.get("conference_name")
-            callee_sid = call.get("twilio_callee_call_sid")
-            if not conference or not callee_sid:
-                await self._send_nontransfer_tool_result(
-                    call_id,
-                    tool_call_id,
-                    {"ok": False, "error": "call_not_ready"},
-                    received=received,
-                    event_key=event_key,
-                )
-                return
-
-            self._note_call_activity(call_id)
-            self._inflight_tools.add(call_id)
-            try:
-                await self.twilio.send_dtmf(
-                    conference,
-                    callee_sid,
-                    call_id=call_id,
-                    plan_id=call["plan_id"],
-                    digits=request.digits,
-                )
-                output = {"ok": True, "digits": request.digits}
-            except TwilioRestException:
-                logger.warning(
-                    "send_dtmf Twilio call failed call_id=%s digits=%s", call_id, request.digits
-                )
-                output = {"ok": False, "error": "dtmf_failed"}
-            except Exception:
-                logger.exception("unexpected send_dtmf failure call_id=%s", call_id)
-                output = {"ok": False, "error": "dtmf_failed"}
-            finally:
-                self._inflight_tools.discard(call_id)
-                self._note_call_activity(call_id)
-            await self._send_nontransfer_tool_result(
-                call_id,
-                tool_call_id,
-                output,
-                received=received,
-                event_key=event_key,
-                continuation_instructions=(
-                    "The keypad tones were sent. Stay silent and listen to how the menu "
-                    "responds before speaking or sending more digits."
-                )
-                if output.get("ok")
-                else None,
+            # Twilio's send_dtmf call can take up to 10s; same stall risk as
+            # search_web above, so it must not block the per-call dispatcher either.
+            self._spawn(
+                self._tool_send_dtmf(
+                    call_id, tool_call_id, arguments, received=received, event_key=event_key
+                ),
+                name=f"tool-send-dtmf:{call_id}:{event_key}",
             )
         elif name == "record_call_outcome":
             await self._tool_record_call_outcome(
@@ -1349,12 +1300,104 @@ class CallService:
                 LatencyMark.now(),
                 event_key=event_key,
             )
+        # The dispatcher kept processing this call's events while the Exa search
+        # above was in flight, so a VAD-triggered response may already be active.
+        # Sending function_call_output + response.create on top of it would make
+        # OpenAI emit an error event, and the generic error branch terminates the
+        # call - cancel any active response first so this out-of-band result cannot
+        # collide with it.
+        await self._cancel_active_response(call_id)
         await self._send_nontransfer_tool_result(
             call_id,
             tool_call_id,
             output,
             received=received,
             event_key=event_key,
+        )
+
+    async def _tool_send_dtmf(
+        self,
+        call_id: str,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        *,
+        received: LatencyMark,
+        event_key: str,
+    ) -> None:
+        try:
+            request = SendDtmfRequest.model_validate(arguments)
+        except Exception:
+            logger.info("invalid send_dtmf tool arguments call_id=%s", call_id)
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"ok": False, "error": "invalid_dtmf_request"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+
+        call = await self.db.get_call(call_id)
+        if call is None or call["state"] != CallState.ACTIVE.value:
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"ok": False, "error": "call_not_ready"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+        conference = call.get("conference_sid") or call.get("conference_name")
+        callee_sid = call.get("twilio_callee_call_sid")
+        if not conference or not callee_sid:
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"ok": False, "error": "call_not_ready"},
+                received=received,
+                event_key=event_key,
+            )
+            return
+
+        self._note_call_activity(call_id)
+        self._inflight_tools.add(call_id)
+        try:
+            await self.twilio.send_dtmf(
+                conference,
+                callee_sid,
+                call_id=call_id,
+                plan_id=call["plan_id"],
+                digits=request.digits,
+            )
+            output = {"ok": True, "digits": request.digits}
+        except TwilioRestException:
+            logger.warning(
+                "send_dtmf Twilio call failed call_id=%s digits=%s", call_id, request.digits
+            )
+            output = {"ok": False, "error": "dtmf_failed"}
+        except Exception:
+            logger.exception("unexpected send_dtmf failure call_id=%s", call_id)
+            output = {"ok": False, "error": "dtmf_failed"}
+        finally:
+            self._inflight_tools.discard(call_id)
+            self._note_call_activity(call_id)
+        # Same collision risk as _tool_search_web above: this Twilio call (up to
+        # 10s) ran while the dispatcher kept processing events, so a VAD-triggered
+        # response may now be active. Cancel it before the out-of-band tool result
+        # to avoid a fatal error event that would terminate the call.
+        await self._cancel_active_response(call_id)
+        await self._send_nontransfer_tool_result(
+            call_id,
+            tool_call_id,
+            output,
+            received=received,
+            event_key=event_key,
+            continuation_instructions=(
+                "The keypad tones were sent. Stay silent and listen to how the menu "
+                "responds before speaking or sending more digits."
+            )
+            if output.get("ok")
+            else None,
         )
 
     async def _tool_record_call_outcome(
@@ -2719,9 +2762,7 @@ class CallService:
             await self._finalize_call_best_effort(call_id)
         else:
             self._spawn(self._finalize_call_best_effort(call_id), name=f"finalize:{call_id}")
-        self._queued_latency_events = {
-            key: mark for key, mark in self._queued_latency_events.items() if key[0] != call_id
-        }
+        self._queued_latency_events.pop(call_id, None)
         return True
 
     async def get_snapshot(self, call_id: str) -> CallSnapshot:

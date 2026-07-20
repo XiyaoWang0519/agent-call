@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -52,15 +53,21 @@ DEBUG_SAFE_CALL_FIELDS = {
 
 @router.get("/calls/{call_id}")
 async def get_call(call_id: str, request: Request) -> dict[str, Any]:
+    call_service = request.app.state.call_service
+    # These four reads are independent; fetch them concurrently instead of
+    # sequentially. LookupError from get_snapshot and a missing row from
+    # get_call_record are both still mapped to the same 404 as before.
     try:
-        snapshot = await request.app.state.call_service.get_snapshot(call_id)
+        snapshot, row, transcript, latency_events = await asyncio.gather(
+            call_service.get_snapshot(call_id),
+            call_service.get_call_record(call_id),
+            call_service.get_transcript_records(call_id),
+            call_service.get_latency_event_records(call_id),
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="call not found") from exc
-    row = await request.app.state.call_service.get_call_record(call_id)
     if row is None:
         raise HTTPException(status_code=404, detail="call not found")
-    transcript = await request.app.state.call_service.get_transcript_records(call_id)
-    latency_events = await request.app.state.call_service.get_latency_event_records(call_id)
     return {
         **snapshot.model_dump(mode="json"),
         "canary_evidence": {key: row.get(key) for key in DEBUG_AUDIT_CALL_FIELDS},

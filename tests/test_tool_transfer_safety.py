@@ -6,6 +6,7 @@ import pytest
 
 import app.call_state as call_state_module
 import app.owner_transfer as owner_transfer_module
+from app.db import LatencyMark, LatencyStage
 from app.exa_search import ExaSearchError
 from app.models import CallState
 from app.twilio_bridge import ParticipantInfo
@@ -65,6 +66,7 @@ async def test_search_web_failure_continues_call_with_safe_error(service, packet
         call_id,
         _tool_event("tool_search", "search_web", '{"query":"current opening hours"}'),
     )
+    await wait_background()
 
     assert service._test_realtime.tool_results[-1][2] == {
         "ok": False,
@@ -87,12 +89,81 @@ async def test_search_web_rejects_model_control_of_provider_parameters(service, 
             '{"query":"current opening hours","type":"deep","numResults":100}',
         ),
     )
+    await wait_background()
 
     assert service._test_exa.queries == []
     assert service._test_realtime.tool_results[-1][2] == {
         "ok": False,
         "error": "invalid_search_request",
     }
+
+
+@pytest.mark.asyncio
+async def test_search_web_runs_in_background_and_does_not_block_dispatcher(
+    service, packet, monkeypatch
+):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    search_started = asyncio.Event()
+    release_search = asyncio.Event()
+
+    async def blocked_search(query: str):
+        del query
+        search_started.set()
+        await release_search.wait()
+        return service._test_exa.result
+
+    monkeypatch.setattr(service.exa, "search", blocked_search)
+
+    # The per-call dispatcher must not stall on the slow Exa search: this await
+    # has to return promptly even though the search itself is still in flight.
+    await asyncio.wait_for(
+        service.handle_realtime_event(
+            call_id,
+            _tool_event("tool_search_slow", "search_web", '{"query":"current opening hours"}'),
+        ),
+        timeout=1,
+    )
+    await asyncio.wait_for(search_started.wait(), timeout=1)
+    assert service._test_realtime.tool_results == []
+
+    release_search.set()
+    await wait_background()
+    assert service._test_realtime.tool_results[-1][1] == "tool_search_slow"
+
+
+@pytest.mark.asyncio
+async def test_search_web_cancels_active_response_before_delivering_result(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    service._active_response_ids[call_id] = "resp_active"
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_search_cancel", "search_web", '{"query":"current opening hours"}'),
+    )
+    await wait_background()
+
+    assert ("cancel_response", call_id) in service._test_realtime.events
+    assert call_id not in service._active_response_ids
+    assert service._test_realtime.tool_results[-1][1] == "tool_search_cancel"
+
+
+@pytest.mark.asyncio
+async def test_search_web_invalid_request_does_not_cancel_active_response(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    service._active_response_ids[call_id] = "resp_active"
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event(
+            "tool_search_invalid",
+            "search_web",
+            '{"query":"current opening hours","type":"deep","numResults":100}',
+        ),
+    )
+    await wait_background()
+
+    assert ("cancel_response", call_id) not in service._test_realtime.events
+    assert service._active_response_ids[call_id] == "resp_active"
 
 
 @pytest.mark.asyncio
@@ -1088,7 +1159,11 @@ async def test_shutdown_cancellation_cannot_interrupt_transfer_compensation(
     assert (await asyncio.wait_for(transferring, timeout=2))["accepted"] is False
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
-    assert call["termination_reason"] == "service_shutdown"
+    # Shutdown and the transfer compensation race for the termination claim; with
+    # pooled reader connections their DB reads no longer serialize, so either side
+    # may win. Both leave the call FAILED with the compensation recorded, so the
+    # reason only reflects which claim landed first.
+    assert call["termination_reason"] in {"service_shutdown", "transfer_cleanup_failed"}
     assert service._test_twilio.completed
     assert set(service._test_twilio.completed) == {"CF" + "a" * 32}
 
@@ -1231,3 +1306,62 @@ async def test_spawned_task_failure_is_logged(service, caplog):
         record.levelname == "ERROR" and "test-boom-task" in record.getMessage()
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_queued_latency_events_dedup_is_per_call_not_global(service, packet):
+    call_a = await seed_call(
+        service.db, packet, call_id="call_latency_a", openai_call_id="rtc_latency_a"
+    )
+    call_b = await seed_call(
+        service.db, packet, call_id="call_latency_b", openai_call_id="rtc_latency_b"
+    )
+    first = LatencyMark("2026-01-01T00:00:00+00:00", 100)
+    later_duplicate = LatencyMark("2026-01-01T00:00:01+00:00", 200)
+
+    # The first mark queued for a (stage, event_key) is kept...
+    service._queue_latency_batch(call_a, (LatencyStage.TOOL_CALL_RECEIVED, first, "k"))
+    assert service._queued_latency_events[call_a][(LatencyStage.TOOL_CALL_RECEIVED, "k")] is first
+
+    # ...and a later duplicate mark for the same key is dropped (dedup keeps the
+    # earliest-seen mark for a stage instead of being overwritten by re-delivery),
+    # exactly as it behaved before the per-call restructure.
+    service._queue_latency_batch(call_a, (LatencyStage.TOOL_CALL_RECEIVED, later_duplicate, "k"))
+    assert service._queued_latency_events[call_a][(LatencyStage.TOOL_CALL_RECEIVED, "k")] is first
+
+    # The same (stage, event_key) pair for a different call_id is tracked independently.
+    service._queue_latency_batch(call_b, (LatencyStage.TOOL_CALL_RECEIVED, later_duplicate, "k"))
+    assert (
+        service._queued_latency_events[call_b][(LatencyStage.TOOL_CALL_RECEIVED, "k")]
+        is later_duplicate
+    )
+    assert service._queued_latency_events[call_a][(LatencyStage.TOOL_CALL_RECEIVED, "k")] is first
+
+    await wait_background()
+
+
+@pytest.mark.asyncio
+async def test_termination_drops_only_that_calls_queued_latency_events(service, packet):
+    call_a = await seed_call(
+        service.db,
+        packet,
+        call_id="call_latency_term_a",
+        state=CallState.ACTIVE,
+        openai_call_id="rtc_latency_term_a",
+    )
+    call_b = await seed_call(
+        service.db,
+        packet,
+        call_id="call_latency_term_b",
+        state=CallState.ACTIVE,
+        openai_call_id="rtc_latency_term_b",
+    )
+    mark = LatencyMark.now()
+    service._queue_latency_batch(call_a, (LatencyStage.TOOL_CALL_RECEIVED, mark, "k"))
+    service._queue_latency_batch(call_b, (LatencyStage.TOOL_CALL_RECEIVED, mark, "k"))
+    await wait_background()
+
+    assert await service.terminate_call(call_a, "owner_request") is True
+
+    assert call_a not in service._queued_latency_events
+    assert call_b in service._queued_latency_events

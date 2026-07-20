@@ -169,37 +169,49 @@ def _decode_json_columns(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+# WAL mode lets many readers proceed concurrently, so a small fixed pool of reader
+# connections avoids needlessly serializing unrelated reads behind one shared connection.
+READER_POOL_SIZE = 4
+
+
 class DatabaseEngine:
     def __init__(self, path: Path):
         self.path = path
         self._lifecycle_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
-        self._read_lock = asyncio.Lock()
         self._writer: aiosqlite.Connection | None = None
-        self._reader: aiosqlite.Connection | None = None
+        # All reader connections currently owned by the engine (used for close/teardown).
+        # Checkout/checkin of individual connections happens through `_reader_queue`.
+        self._readers: list[aiosqlite.Connection] = []
+        self._reader_queue: asyncio.Queue[aiosqlite.Connection] | None = None
         # Monotonic values are comparable only when this process-local clock ID matches.
         self._latency_clock_id = uuid4().hex
 
     async def initialize(self) -> None:
         async with self._lifecycle_lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            if (self._writer is None) != (self._reader is None):
+            if (self._writer is None) != (not self._readers):
                 raise RuntimeError("database connection state is inconsistent")
             created_connections = self._writer is None
             if created_connections:
                 writer: aiosqlite.Connection | None = None
-                reader: aiosqlite.Connection | None = None
+                readers: list[aiosqlite.Connection] = []
                 try:
                     writer = await self._connect(query_only=False)
-                    reader = await self._connect(query_only=True)
+                    for _ in range(READER_POOL_SIZE):
+                        readers.append(await self._connect(query_only=True))
                 except BaseException:
-                    if reader is not None:
+                    for reader in readers:
                         await reader.close()
                     if writer is not None:
                         await writer.close()
                     raise
                 self._writer = writer
-                self._reader = reader
+                self._readers = readers
+                queue: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue()
+                for reader in readers:
+                    queue.put_nowait(reader)
+                self._reader_queue = queue
 
             try:
                 async with self._write_connection() as conn:
@@ -333,26 +345,49 @@ class DatabaseEngine:
 
     @asynccontextmanager
     async def _read_connection(self) -> AsyncIterator[aiosqlite.Connection]:
-        async with self._read_lock:
-            conn = self._reader
-            if conn is None:
-                raise RuntimeError("database is not initialized")
+        """Check out a pooled reader connection, returning it to the pool afterwards.
+
+        Unrelated reads that arrive concurrently each get their own connection (up to
+        `READER_POOL_SIZE`) instead of serializing behind a single shared connection --
+        WAL mode supports this without contention.
+        """
+        queue = self._reader_queue
+        if queue is None:
+            raise RuntimeError("database is not initialized")
+        conn = await queue.get()
+        try:
             yield conn
+        finally:
+            queue.put_nowait(conn)
+
+    async def _drain_reader_pool(self) -> list[aiosqlite.Connection]:
+        """Remove every reader connection from the pool, blocking until each is checked in.
+
+        Used by `_close_connections` to guarantee no read is in flight (and none can
+        start) before the pool's connections are torn down, mirroring the exclusion the
+        write lock gives writers.
+        """
+        queue = self._reader_queue
+        count = len(self._readers)
+        if queue is None or count == 0:
+            return []
+        return [await queue.get() for _ in range(count)]
 
     async def close(self) -> None:
-        """Close both persistent connections; safe to call more than once."""
+        """Close both the writer and every pooled reader connection; safe to call more than once."""
         async with self._lifecycle_lock:
             await self._close_connections()
 
     async def _close_connections(self) -> None:
-        async with self._write_lock, self._read_lock:
+        async with self._write_lock:
+            readers = await self._drain_reader_pool()
             writer = self._writer
-            reader = self._reader
             self._writer = None
-            self._reader = None
+            self._readers = []
+            self._reader_queue = None
 
             first_error: BaseException | None = None
-            for conn in (reader, writer):
+            for conn in (*readers, writer):
                 if conn is None:
                     continue
                 try:

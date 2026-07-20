@@ -12,6 +12,7 @@ from app.call_state import CallService
 from app.db import Database
 from app.mcp_tools import register_tools
 from app.openai_client import create_openai_client
+from app.poke_push import close_poke_http_client
 from app.routes import debug, deployment, openai_webhooks, twilio_webhooks
 from app.security import MCPAuthMiddleware
 from app.settings import Settings
@@ -78,8 +79,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cleanup_steps = []
             if service is not None:
                 cleanup_steps.append(service.stop)
+                # The bridge's Twilio calls may still run during service.stop()
+                # (e.g. tearing down conferences), so its executor closes only
+                # after that step completes. Guarded with getattr because some
+                # tests substitute minimal CallService fakes without a `.twilio`.
+                twilio_bridge = getattr(service, "twilio", None)
+                if twilio_bridge is not None:
+                    cleanup_steps.append(twilio_bridge.close)
             if openai is not None:
                 cleanup_steps.append(openai.close)
+            cleanup_steps.append(close_poke_http_client)
             cleanup_steps.append(db.close)
 
             # Cleanup steps are individually time-bounded and cancellation is

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi.testclient import TestClient
 from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
@@ -108,6 +110,64 @@ async def test_send_dtmf_twilio_failure_reports_error_and_clears_inflight(servic
         "error": "dtmf_failed",
     }
     assert call_id not in service._inflight_tools
+
+
+async def test_send_dtmf_runs_in_background_and_does_not_block_dispatcher(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    dtmf_started = asyncio.Event()
+    release_dtmf = asyncio.Event()
+
+    async def blocked_send_dtmf(*args, **kwargs):
+        del args, kwargs
+        dtmf_started.set()
+        await release_dtmf.wait()
+
+    service._test_twilio.send_dtmf = blocked_send_dtmf
+
+    # The per-call dispatcher must not stall on the slow Twilio call: this await
+    # has to return promptly even though send_dtmf is still in flight.
+    await asyncio.wait_for(
+        service.handle_realtime_event(
+            call_id,
+            _tool_event("tool_dtmf_slow", "send_dtmf", '{"digits":"1"}'),
+        ),
+        timeout=1,
+    )
+    await asyncio.wait_for(dtmf_started.wait(), timeout=1)
+    assert service._test_realtime.tool_results == []
+
+    release_dtmf.set()
+    await wait_background()
+    assert service._test_realtime.tool_results[-1][1] == "tool_dtmf_slow"
+
+
+async def test_send_dtmf_cancels_active_response_before_delivering_result(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    service._active_response_ids[call_id] = "resp_active"
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_dtmf_cancel", "send_dtmf", '{"digits":"1"}'),
+    )
+    await wait_background()
+
+    assert ("cancel_response", call_id) in service._test_realtime.events
+    assert call_id not in service._active_response_ids
+    assert service._test_realtime.tool_results[-1][1] == "tool_dtmf_cancel"
+
+
+async def test_send_dtmf_call_not_ready_does_not_cancel_active_response(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.PREWARMING)
+    service._active_response_ids[call_id] = "resp_active"
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_dtmf_not_ready_cancel", "send_dtmf", '{"digits":"1"}'),
+    )
+    await wait_background()
+
+    assert ("cancel_response", call_id) not in service._test_realtime.events
+    assert service._active_response_ids[call_id] == "resp_active"
 
 
 def test_announce_dtmf_webhook_returns_play_twiml(settings: Settings, packet):

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlencode
 
 from twilio.base.exceptions import TwilioRestException
@@ -11,6 +14,15 @@ from twilio.rest import Client
 
 from app.models import ContextPacket
 from app.settings import Settings
+
+T = TypeVar("T")
+
+# Twilio SDK calls are synchronous and block on network I/O (up to the configured
+# HTTP timeout). Running them on the process-wide default `to_thread` executor
+# would let a slow Twilio round-trip for one call starve other calls' Twilio
+# operations (and any other unrelated `to_thread` user) that share that pool.
+# A dedicated executor isolates this bridge's blocking calls.
+TWILIO_EXECUTOR_MAX_WORKERS = 8
 
 
 @dataclass(slots=True)
@@ -31,6 +43,19 @@ class TwilioBridge:
                 max_retries=0,
             ),
         )
+        self._executor = ThreadPoolExecutor(
+            max_workers=TWILIO_EXECUTOR_MAX_WORKERS, thread_name_prefix="twilio"
+        )
+
+    async def _run_blocking(self, fn: Callable[[], T]) -> T:
+        # Note: unlike `asyncio.to_thread`, `run_in_executor` does not propagate
+        # contextvars into the worker thread. None of the wrapped Twilio SDK calls
+        # read or depend on contextvars, so this is safe.
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, functools.partial(fn))
+
+    async def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _callback(self, path: str, *, call_id: str, plan_id: str, **extra: str) -> str:
         base = (self.settings.public_base_url or "").rstrip("/")
@@ -73,7 +98,7 @@ class TwilioBridge:
                 conference_status_callback_event=["start", "end", "join", "leave", "mute"],
             )
 
-        participant = await asyncio.to_thread(create)
+        participant = await self._run_blocking(create)
         return ParticipantInfo(participant.call_sid, participant.conference_sid)
 
     async def create_callee_participant(
@@ -110,7 +135,7 @@ class TwilioBridge:
                 status_callback_event=["initiated", "ringing", "answered", "completed"],
             )
 
-        participant = await asyncio.to_thread(create)
+        participant = await self._run_blocking(create)
         return ParticipantInfo(participant.call_sid, participant.conference_sid)
 
     async def create_owner_participant(
@@ -141,7 +166,7 @@ class TwilioBridge:
                 status_callback_event=["initiated", "ringing", "answered", "completed"],
             )
 
-        participant = await asyncio.to_thread(create)
+        participant = await self._run_blocking(create)
         return ParticipantInfo(participant.call_sid, participant.conference_sid)
 
     async def complete_conference(self, conference_sid_or_name: str | None) -> None:
@@ -152,7 +177,7 @@ class TwilioBridge:
             self.client.conferences(conference_sid_or_name).update(status="completed")
 
         try:
-            await asyncio.to_thread(complete)
+            await self._run_blocking(complete)
         except TwilioRestException as exc:
             # A missing conference is already fully torn down, which is the desired
             # idempotent outcome for retry and startup recovery paths.
@@ -171,7 +196,7 @@ class TwilioBridge:
                 participant_call_sid
             ).delete()
 
-        await asyncio.to_thread(remove)
+        await self._run_blocking(remove)
 
     async def enable_end_conference_on_exit(
         self, conference_sid_or_name: str | None, participant_call_sid: str | None
@@ -186,7 +211,7 @@ class TwilioBridge:
                 participant_call_sid
             ).update(end_conference_on_exit=True)
 
-        await asyncio.to_thread(enable)
+        await self._run_blocking(enable)
 
     async def unmute_participant(
         self, conference_sid_or_name: str | None, participant_call_sid: str | None
@@ -205,7 +230,7 @@ class TwilioBridge:
                 participant_call_sid
             ).update(muted=False)
 
-        await asyncio.to_thread(unmute)
+        await self._run_blocking(unmute)
 
     async def send_dtmf(
         self,
@@ -231,4 +256,4 @@ class TwilioBridge:
                 participant_call_sid
             ).update(announce_url=url, announce_method="POST")
 
-        await asyncio.to_thread(announce)
+        await self._run_blocking(announce)

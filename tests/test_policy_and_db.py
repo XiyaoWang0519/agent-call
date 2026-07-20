@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.db import Database, DeploymentLockedError, LatencyMark, LatencyStage
+from app.db.engine import READER_POOL_SIZE
 from app.models import CallState, EvidenceValue, PreparePhoneCallInput
 from app.policy import validate_context, validate_destination
 from app.settings import Settings
@@ -21,31 +22,65 @@ async def _pragma_value(connection: aiosqlite.Connection, name: str):
 
 
 @pytest.mark.asyncio
-async def test_database_reuses_reader_and_writer_with_durable_pragmas(database):
+async def test_database_reuses_reader_pool_and_writer_with_durable_pragmas(database):
     writer = database._writer
-    reader = database._reader
+    readers = list(database._readers)
     assert writer is not None
-    assert reader is not None
-    assert writer is not reader
+    assert len(readers) == READER_POOL_SIZE
+    assert len(set(id(r) for r in readers)) == READER_POOL_SIZE
+    assert all(reader is not writer for reader in readers)
 
-    for connection in (writer, reader):
+    for connection in (writer, *readers):
         assert await _pragma_value(connection, "journal_mode") == "wal"
         assert await _pragma_value(connection, "synchronous") == 2
         assert await _pragma_value(connection, "foreign_keys") == 1
         assert await _pragma_value(connection, "busy_timeout") == 5000
     assert await _pragma_value(writer, "query_only") == 0
-    assert await _pragma_value(reader, "query_only") == 1
+    for reader in readers:
+        assert await _pragma_value(reader, "query_only") == 1
 
     await database.execute("CREATE TABLE connection_reuse (value TEXT NOT NULL)")
     await database.execute("INSERT INTO connection_reuse(value) VALUES (?)", ("visible",))
     assert await database.fetch_one("SELECT value FROM connection_reuse") == {"value": "visible"}
     assert database._writer is writer
-    assert database._reader is reader
+    assert database._readers == readers
 
     # Re-running migrations is idempotent and does not churn live connections.
     await database.initialize()
     assert database._writer is writer
-    assert database._reader is reader
+    assert database._readers == readers
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_reads_proceed_without_deadlock(database):
+    """Unrelated reads should each get their own pooled connection, not serialize."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    entered = 0
+
+    async def blocking_read() -> dict[str, object] | None:
+        nonlocal entered
+        async with database._read_connection() as conn:
+            entered += 1
+            if entered == 2:
+                started.set()
+            await asyncio.wait_for(release.wait(), timeout=5)
+            cursor = await conn.execute("SELECT 1 AS value")
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    task_a = asyncio.create_task(blocking_read())
+    task_b = asyncio.create_task(blocking_read())
+
+    # Both reads must be holding a connection concurrently -- if they serialized behind
+    # a single shared connection/lock, the second task would never reach `entered == 2`
+    # while the first is still blocked on `release`.
+    await asyncio.wait_for(started.wait(), timeout=5)
+    release.set()
+
+    result_a, result_b = await asyncio.gather(task_a, task_b)
+    assert result_a == {"value": 1}
+    assert result_b == {"value": 1}
 
 
 @pytest.mark.asyncio
@@ -53,22 +88,55 @@ async def test_database_close_is_idempotent_and_initialize_reopens(settings):
     db = Database(settings.database_path)
     await db.initialize()
     first_writer = db._writer
-    first_reader = db._reader
+    first_readers = list(db._readers)
 
     await db.close()
     await db.close()
     assert db._writer is None
-    assert db._reader is None
+    assert db._readers == []
     with pytest.raises(RuntimeError, match="not initialized"):
         await db.fetch_one("SELECT 1")
 
     await db.initialize()
     try:
         assert db._writer is not first_writer
-        assert db._reader is not first_reader
+        assert len(db._readers) == READER_POOL_SIZE
+        assert all(reader not in first_readers for reader in db._readers)
         assert await db.fetch_one("SELECT 1 AS value") == {"value": 1}
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_close_drains_in_flight_reads_before_tearing_down_pool(settings):
+    """The drain-all path (both write and read exclusion) still closes cleanly even
+    while a read is holding one of the pooled connections."""
+    db = Database(settings.database_path)
+    await db.initialize()
+
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+
+    async def slow_read() -> None:
+        async with db._read_connection() as conn:
+            read_started.set()
+            await asyncio.wait_for(release_read.wait(), timeout=5)
+            await conn.execute("SELECT 1")
+
+    read_task = asyncio.create_task(slow_read())
+    await asyncio.wait_for(read_started.wait(), timeout=5)
+
+    close_task = asyncio.create_task(db.close())
+    # Give close() a chance to start draining and block on the in-flight read.
+    await asyncio.sleep(0.05)
+    assert not close_task.done()
+
+    release_read.set()
+    await read_task
+    await asyncio.wait_for(close_task, timeout=5)
+
+    assert db._writer is None
+    assert db._readers == []
 
 
 @pytest.mark.asyncio

@@ -137,3 +137,66 @@ async def test_app_lifespan_cancellation_during_body_propagates_and_runs_cleanup
             pass
 
     assert attempts == ["service", "openai"]
+
+
+@pytest.mark.asyncio
+async def test_app_lifespan_closes_twilio_bridge_and_poke_http_client(settings, monkeypatch):
+    attempts: list[str] = []
+
+    class FakeTwilioBridge:
+        async def close(self) -> None:
+            attempts.append("twilio")
+
+    class Service:
+        def __init__(self, *args, **kwargs):
+            self.twilio = FakeTwilioBridge()
+
+        async def recover_startup(self) -> None:
+            pass
+
+        async def start_watchdog(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            attempts.append("service")
+
+    async def fake_close_poke_http_client() -> None:
+        attempts.append("poke")
+
+    monkeypatch.setattr("app.main.CallService", Service)
+    monkeypatch.setattr("app.main.close_poke_http_client", fake_close_poke_http_client)
+    application = create_app(settings)
+
+    async with application.router.lifespan_context(application):
+        pass
+
+    # The Twilio bridge's executor is only torn down once service.stop() (which
+    # may still issue Twilio calls, e.g. conference teardown) has completed.
+    assert attempts == ["service", "twilio", "poke"]
+
+
+@pytest.mark.asyncio
+async def test_app_lifespan_tolerates_a_call_service_without_a_twilio_attribute(
+    settings, monkeypatch
+):
+    # Several tests substitute minimal CallService fakes with no `.twilio`
+    # attribute; the lifespan's twilio-bridge close step must not blow up on
+    # those fakes.
+    class MinimalService:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def recover_startup(self) -> None:
+            pass
+
+        async def start_watchdog(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("app.main.CallService", MinimalService)
+    application = create_app(settings)
+
+    async with application.router.lifespan_context(application):
+        pass

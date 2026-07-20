@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
+from pydantic import SecretStr
 
+import app.poke_push as poke_push
 from app.call_state import CallService
 from app.db import Database
 from app.exa_search import ExaSearchClient
@@ -59,6 +62,48 @@ def test_twilio_http_timeout_is_configurable(settings, monkeypatch):
     TwilioBridge(settings)
 
     assert observed["timeout"] == 12
+
+
+def test_twilio_bridge_has_its_own_dedicated_thread_pool_executor(settings, monkeypatch):
+    monkeypatch.setattr("app.twilio_bridge.TwilioHttpClient", lambda **kwargs: object())
+    monkeypatch.setattr("app.twilio_bridge.Client", lambda *args, **kwargs: SimpleNamespace())
+
+    first = TwilioBridge(settings)
+    second = TwilioBridge(settings)
+
+    assert first._executor.__class__.__name__ == "ThreadPoolExecutor"
+    assert first._executor._max_workers == 8
+    assert first._executor is not second._executor
+
+
+@pytest.mark.asyncio
+async def test_twilio_bridge_run_blocking_uses_the_dedicated_executor(settings, monkeypatch):
+    monkeypatch.setattr("app.twilio_bridge.TwilioHttpClient", lambda **kwargs: object())
+    monkeypatch.setattr("app.twilio_bridge.Client", lambda *args, **kwargs: SimpleNamespace())
+
+    bridge = TwilioBridge(settings)
+    observed: dict[str, str] = {}
+
+    def probe() -> str:
+        observed["thread_name"] = threading.current_thread().name
+        return "ok"
+
+    result = await bridge._run_blocking(probe)
+
+    assert result == "ok"
+    assert observed["thread_name"].startswith("twilio")
+
+
+@pytest.mark.asyncio
+async def test_twilio_bridge_close_shuts_down_its_executor(settings, monkeypatch):
+    monkeypatch.setattr("app.twilio_bridge.TwilioHttpClient", lambda **kwargs: object())
+    monkeypatch.setattr("app.twilio_bridge.Client", lambda *args, **kwargs: SimpleNamespace())
+
+    bridge = TwilioBridge(settings)
+    await bridge.close()
+
+    with pytest.raises(RuntimeError):
+        bridge._executor.submit(lambda: None)
 
 
 def test_openai_client_has_bounded_timeouts_and_no_sdk_retries(settings, monkeypatch):
@@ -160,6 +205,66 @@ def test_exa_client_has_bounded_pooled_transport(settings, monkeypatch):
     assert observed["limits"].max_keepalive_connections == 10
     assert observed["limits"].keepalive_expiry == 60
     assert observed["follow_redirects"] is True
+
+
+@pytest.mark.asyncio
+async def test_push_message_to_poke_reuses_one_shared_pooled_client(settings, monkeypatch):
+    created: list[dict[str, object]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+            self.closed = False
+
+        async def post(self, *args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(poke_push, "_poke_http", poke_push._PokeHttpClient())
+    monkeypatch.setattr(poke_push.httpx, "AsyncClient", FakeAsyncClient)
+    settings.poke_push_enabled = True
+    settings.poke_api_key = SecretStr("poke-test")
+
+    await poke_push.push_message_to_poke(settings, "first")
+    await poke_push.push_message_to_poke(settings, "second")
+
+    # A single client is created and reused across pushes instead of opening a
+    # fresh TCP+TLS connection per call.
+    assert len(created) == 1
+    assert created[0] == {"timeout": 5}
+
+    await poke_push.close_poke_http_client()
+
+
+@pytest.mark.asyncio
+async def test_push_message_to_poke_is_a_noop_after_close(settings, monkeypatch):
+    created: list[dict[str, object]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            created.append(kwargs)
+
+        async def post(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("should not be called after the client is closed")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(poke_push, "_poke_http", poke_push._PokeHttpClient())
+    monkeypatch.setattr(poke_push.httpx, "AsyncClient", FakeAsyncClient)
+    settings.poke_push_enabled = True
+    settings.poke_api_key = SecretStr("poke-test")
+
+    await poke_push.close_poke_http_client()
+    await poke_push.push_message_to_poke(settings, "hello")
+
+    assert created == []
 
 
 @pytest.mark.parametrize(
@@ -305,7 +410,7 @@ async def test_app_lifespan_closes_openai_when_service_shutdown_fails(settings, 
 
     assert client.closed is True
     assert captured["db"]._writer is None
-    assert captured["db"]._reader is None
+    assert captured["db"]._readers == []
 
 
 @pytest.mark.asyncio
@@ -338,7 +443,7 @@ async def test_app_lifespan_closes_database_when_openai_shutdown_fails(settings,
             pass
 
     assert captured["db"]._writer is None
-    assert captured["db"]._reader is None
+    assert captured["db"]._readers == []
 
 
 @pytest.mark.asyncio
@@ -364,7 +469,7 @@ async def test_app_lifespan_closes_database_when_openai_client_creation_fails(
             pass
 
     assert captured["db"]._writer is None
-    assert captured["db"]._reader is None
+    assert captured["db"]._readers == []
 
 
 @pytest.mark.asyncio
@@ -417,7 +522,7 @@ async def test_app_lifespan_aggregates_all_cleanup_failures(settings, monkeypatc
     ]
     assert attempts == ["service", "openai", "database"]
     assert captured["db"]._writer is None
-    assert captured["db"]._reader is None
+    assert captured["db"]._readers == []
     with pytest.raises(RuntimeError, match="service is not started"):
         service_getters[0]()
 
