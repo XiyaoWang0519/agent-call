@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import pytest
 from twilio.base.exceptions import TwilioRestException
 
-from app.openai_realtime import RealtimeBridge, RealtimeRuntime
+from app.openai_realtime import (
+    RESPONSE_PURPOSE_METADATA_KEY,
+    VOICEMAIL_RESPONSE_PURPOSE,
+    RealtimeBridge,
+    RealtimeRuntime,
+)
 from app.twilio_bridge import TwilioBridge
 
 
@@ -170,11 +175,14 @@ async def test_voicemail_prompt_does_not_script_identity_or_callback_wording(set
 
     await bridge.create_voicemail("call_1")
 
-    instructions = websocket.messages[0]["response"]["instructions"]
+    response = websocket.messages[0]["response"]
+    instructions = response["instructions"]
     assert "approved context" in instructions
     assert "Poke" not in instructions
     assert "AI assistant" not in instructions
     assert "callback" not in instructions
+    assert response["metadata"] == {RESPONSE_PURPOSE_METADATA_KEY: VOICEMAIL_RESPONSE_PURPOSE}
+    assert response["tool_choice"] == "none"
 
 
 def test_session_prompt_anchors_caller_role_without_scripting_wording(settings, packet):

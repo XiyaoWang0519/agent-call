@@ -42,6 +42,7 @@ class CallActivityTracker:
         self.active_response_ids: dict[str, str | None] = {}
         self.sip_output_playing: set[str] = set()
         self.inflight_tools: set[str] = set()
+        self.dtmf_listen_deadlines_ns: dict[str, int] = {}
 
     def note(self, call_id: str, mark: LatencyMark | None = None) -> bool:
         # A watchdog claim is the liveness linearization point. Activity observed
@@ -74,11 +75,37 @@ class CallActivityTracker:
             or call_id in self.inflight_tools
         )
 
+    def begin_dtmf_listen_grace(self, call_id: str, *, seconds: float) -> bool:
+        """Keep an intentional post-DTMF silence out of the stale-call path.
+
+        Realtime emits no sideband frames for silence or a bare IVR beep. After a
+        successful tone send, that quiet period is expected while the remote system
+        processes the input. The deadline is monotonic, process-local, and reset by a
+        later DTMF send.
+        """
+
+        self.prune_tombstones()
+        if call_id in self.watchdog_claims or call_id in self.tombstones:
+            return False
+        self.dtmf_listen_deadlines_ns[call_id] = monotonic_ns() + int(seconds * 1_000_000_000)
+        return True
+
+    def dtmf_listen_grace_is_live(self, call_id: str, *, now_ns: int | None = None) -> bool:
+        deadline_ns = self.dtmf_listen_deadlines_ns.get(call_id)
+        if deadline_ns is None:
+            return False
+        observed_ns = monotonic_ns() if now_ns is None else now_ns
+        if observed_ns < deadline_ns:
+            return True
+        self.dtmf_listen_deadlines_ns.pop(call_id, None)
+        return False
+
     def clear_assistant_work(self, call_id: str) -> None:
         self.active_response_ids.pop(call_id, None)
         self.sip_output_playing.discard(call_id)
         self._clear_audio_drain(call_id)
         self.inflight_tools.discard(call_id)
+        self.dtmf_listen_deadlines_ns.pop(call_id, None)
 
     def clear(self, call_id: str) -> None:
         self.latest.pop(call_id, None)

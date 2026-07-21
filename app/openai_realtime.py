@@ -24,6 +24,9 @@ from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+RESPONSE_PURPOSE_METADATA_KEY = "poke_call_purpose"
+VOICEMAIL_RESPONSE_PURPOSE = "voicemail"
+
 EventHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 OpenHandler = Callable[[str], Coroutine[Any, Any, None]]
 FatalHandler = Callable[[str, str], Awaitable[None]]
@@ -159,7 +162,8 @@ class RealtimeBridge:
                             "maxLength": 32,
                             "description": (
                                 "Keypad digits to send (0-9, *, #). Use 'w' for a half-second "
-                                "pause. Send one short sequence at a time."
+                                "pause. Send an explicitly requested short test sequence together; "
+                                "otherwise send one short menu choice at a time."
                             ),
                         }
                     },
@@ -639,12 +643,25 @@ class RealtimeBridge:
                 "Leave one concise voicemail that advances the approved objective using only "
                 "the approved context. Do not ask questions."
             ),
+            metadata={RESPONSE_PURPOSE_METADATA_KEY: VOICEMAIL_RESPONSE_PURPOSE},
+            tool_choice="none",
         )
 
-    async def request_response(self, call_id: str, *, instructions: str | None = None) -> None:
+    async def request_response(
+        self,
+        call_id: str,
+        *,
+        instructions: str | None = None,
+        metadata: dict[str, str] | None = None,
+        tool_choice: str | None = None,
+    ) -> None:
         response: dict[str, Any] = {"output_modalities": ["audio"]}
         if instructions:
             response["instructions"] = instructions
+        if metadata:
+            response["metadata"] = metadata
+        if tool_choice:
+            response["tool_choice"] = tool_choice
         await self.send(call_id, {"type": "response.create", "response": response})
 
     async def send_tool_result(

@@ -197,6 +197,7 @@ async def test_activity_after_watchdog_claim_does_not_reverse_real_timeout(
 async def test_terminal_call_clears_all_activity_tracking(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._note_call_activity(call_id)
+    service._activity.begin_dtmf_listen_grace(call_id, seconds=30)
     service._watchdog_claims.add(call_id)
     service._active_response_ids[call_id] = "resp_live"
     service._sip_output_playing.add(call_id)
@@ -214,6 +215,7 @@ async def test_terminal_call_clears_all_activity_tracking(service, packet):
     assert call_id not in service._sip_output_playing
     assert call_id not in service._audio_drain_terminations
     assert call_id not in service._inflight_tools
+    assert call_id not in service._dtmf_listen_deadlines_ns
 
 
 @pytest.mark.asyncio
