@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from fastapi.testclient import TestClient
 from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
 
+from app.call_state import POST_DTMF_LISTEN_GRACE_SECONDS
 from app.main import create_app
 from app.models import CallState
 from app.settings import Settings
@@ -39,8 +42,42 @@ async def test_send_dtmf_happy_path_records_twilio_call_and_result(service, pack
         "tool_dtmf",
         {"ok": True, "digits": "1w2"},
     )
+    assert service._test_realtime.tool_result_continuations[-1] is False
+    assert service._test_realtime.tool_result_continuation_texts[-1] is None
+    assert call_id in service._dtmf_listen_deadlines_ns
     call = await service.db.get_call(call_id)
     assert call["tool_call_count"] == 1
+
+
+async def test_send_dtmf_listen_grace_blocks_watchdog_then_expires(service, packet, monkeypatch):
+    clock_ns = [100 * 1_000_000_000]
+    monkeypatch.setattr("app.call_activity.monotonic_ns", lambda: clock_ns[0])
+    monkeypatch.setattr("app.db.telemetry.monotonic_ns", lambda: clock_ns[0])
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_dtmf_grace", "send_dtmf", '{"digits":"123#"}'),
+    )
+    await wait_background()
+    await service._flush_call_activity()
+    stale = datetime.now(UTC) - timedelta(minutes=1)
+    await service.db.execute(
+        "UPDATE calls SET last_event_at=? WHERE call_id=?",
+        (stale.isoformat(), call_id),
+    )
+
+    await service._watchdog_once()
+
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert call_id in service._dtmf_listen_deadlines_ns
+
+    clock_ns[0] += int((POST_DTMF_LISTEN_GRACE_SECONDS + 1) * 1_000_000_000)
+    await service._watchdog_once()
+    await wait_background()
+
+    assert (await service.db.get_call(call_id))["state"] == CallState.TIMED_OUT.value
+    assert call_id not in service._dtmf_listen_deadlines_ns
 
 
 async def test_send_dtmf_rejects_invalid_digits(service, packet):
@@ -107,7 +144,9 @@ async def test_send_dtmf_twilio_failure_reports_error_and_clears_inflight(servic
         "ok": False,
         "error": "dtmf_failed",
     }
+    assert service._test_realtime.tool_result_continuations[-1] is True
     assert call_id not in service._inflight_tools
+    assert call_id not in service._dtmf_listen_deadlines_ns
 
 
 def test_announce_dtmf_webhook_returns_play_twiml(settings: Settings, packet):

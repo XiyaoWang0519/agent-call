@@ -43,7 +43,12 @@ from app.models import (
     WebSearchRequest,
 )
 from app.openai_client import create_openai_client
-from app.openai_realtime import REALTIME_SEND_TIMEOUT_SECONDS, RealtimeBridge
+from app.openai_realtime import (
+    REALTIME_SEND_TIMEOUT_SECONDS,
+    RESPONSE_PURPOSE_METADATA_KEY,
+    VOICEMAIL_RESPONSE_PURPOSE,
+    RealtimeBridge,
+)
 from app.owner_transfer import OwnerTransferCoordinator
 from app.poke_push import push_message_to_poke
 from app.policy import validate_context
@@ -65,6 +70,10 @@ TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
 # cancel_response + function_call_output each bound to REALTIME_SEND_TIMEOUT_SECONDS; keep
 # the stale-call carve-out long enough for both sends after the answer deadline fires.
 WATCHDOG_QUESTION_GRACE_SECONDS = 2 * REALTIME_SEND_TIMEOUT_SECONDS + 5.0
+# A successful DTMF send is followed by deliberate silence while the IVR processes
+# the tones. Bare beeps and silence produce no Realtime sideband frames, so give that
+# wait its own bounded watchdog carve-out instead of treating it as a dead call.
+POST_DTMF_LISTEN_GRACE_SECONDS = 30.0
 
 # Poke (the MCP client) is an LLM agent: it reliably follows explicit next_action
 # directives embedded in tool RESULTS, but under-weights static tool descriptions. There
@@ -75,6 +84,16 @@ ASK_POKE_POLL_WARNING = (
     "Do not end your turn and do not stop polling until the call reaches a terminal "
     "state — if you stop, mid-call questions from the phone agent (ask_poke) will "
     "time out and the call may fail its objective."
+)
+
+# DetectMessageEnd can report machine_end_other for long IVR prompts as well as machines.
+# A beep or greeting-ending silence is actionable voicemail evidence; "other" is not.
+VOICEMAIL_AMD_RESULTS = frozenset({"machine_end_beep", "machine_end_silence"})
+AMBIGUOUS_AMD_RESULTS = frozenset({"machine_end_other"})
+AMBIGUOUS_AMD_CONTINUATION = (
+    "Continue from the callee's latest speech. If it was an automated menu asking for "
+    "keypad input, use send_dtmf with the best option for the approved objective without "
+    "speaking first. Otherwise respond naturally."
 )
 
 
@@ -357,6 +376,10 @@ class CallService:
     @property
     def _inflight_tools(self) -> set[str]:
         return self._activity.inflight_tools
+
+    @property
+    def _dtmf_listen_deadlines_ns(self) -> dict[str, int]:
+        return self._activity.dtmf_listen_deadlines_ns
 
     async def _record_latency(
         self,
@@ -701,7 +724,7 @@ class CallService:
         normalized = (answered_by or "unknown").lower()
         if normalized == "fax":
             handling = "fax"
-        elif normalized.startswith("machine_end_"):
+        elif normalized in VOICEMAIL_AMD_RESULTS:
             handling = "voicemail"
         elif normalized == "human":
             handling = "human"
@@ -899,7 +922,16 @@ class CallService:
             finally:
                 await unmute
         else:
+            opening_was_already_sent = bool(call.get("opening_sent"))
             await self._start_opening_on_answer(call_id)
+            if call.get("amd_result") in AMBIGUOUS_AMD_RESULTS and opening_was_already_sent:
+                # AMD can take the full 30 seconds, during which the IVR prompt is already
+                # in the conversation but automatic responses are disabled. Enabling VAD
+                # does not retroactively answer that completed turn, so explicitly resume it.
+                await self.realtime.request_response(
+                    call_id,
+                    instructions=AMBIGUOUS_AMD_CONTINUATION,
+                )
 
     async def handle_realtime_event(self, call_id: str, event: dict[str, Any]) -> None:
         received = LatencyMark.now()
@@ -993,9 +1025,18 @@ class CallService:
                 )
             if event_type == "response.done":
                 await self._handle_voice_end_response_done(call_id, event)
-            # A cancelled response.done here is the opening turn we cancelled when AMD
-            # reported voicemail; the voicemail response itself is still in flight.
-            if call and call.get("voicemail_sent") and status not in {"cancelled", "canceled"}:
+            metadata = response.get("metadata") or {}
+            is_voicemail_response = (
+                metadata.get(RESPONSE_PURPOSE_METADATA_KEY) == VOICEMAIL_RESPONSE_PURPOSE
+            )
+            # Only the tagged voicemail response may end a voicemail call. A late
+            # response.done from the opening or a tool continuation is unrelated.
+            if (
+                call
+                and call.get("voicemail_sent")
+                and is_voicemail_response
+                and status == "completed"
+            ):
                 self._terminate_after_audio_drain(
                     call_id,
                     response.get("id") or event.get("response_id"),
@@ -1247,18 +1288,20 @@ class CallService:
             finally:
                 self._inflight_tools.discard(call_id)
                 self._note_call_activity(call_id)
+            if output.get("ok"):
+                self._activity.begin_dtmf_listen_grace(
+                    call_id,
+                    seconds=POST_DTMF_LISTEN_GRACE_SECONDS,
+                )
             await self._send_nontransfer_tool_result(
                 call_id,
                 tool_call_id,
                 output,
                 received=received,
                 event_key=event_key,
-                continuation_instructions=(
-                    "The keypad tones were sent. Stay silent and listen to how the menu "
-                    "responds before speaking or sending more digits."
-                )
-                if output.get("ok")
-                else None,
+                # A response.create after successful DTMF invites a spoken acknowledgement.
+                # Let the next IVR audio turn trigger the model instead.
+                continue_response=not output.get("ok", False),
             )
         elif name == "record_call_outcome":
             await self._tool_record_call_outcome(
@@ -3064,6 +3107,14 @@ class CallService:
                         if not terminated:
                             self._watchdog_claims.discard(call_id)
                 # else: silence is expected while on hold, within budget.
+                continue
+            if self._activity.dtmf_listen_grace_is_live(
+                call_id,
+                now_ns=now.monotonic_ns,
+            ):
+                # Do not refresh last_event_at here. When the bounded grace expires,
+                # a still-silent call should become stale immediately rather than
+                # receiving an additional full watchdog window.
                 continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue

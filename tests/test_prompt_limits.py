@@ -116,6 +116,8 @@ def test_realtime_instructions_bound_send_dtmf_behavior(packet: ContextPacket):
 
     assert "send_dtmf" in flattened
     assert "automated phone menu" in flattened
+    assert "send the complete sequence together" in flattened
+    assert "append it to that sequence" in flattened
     assert "Never enter payment card numbers, PINs, passwords" in flattened
 
 
