@@ -652,6 +652,7 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
         "join",
         "leave",
         "mute",
+        "announcement",
     ]
 
     await bridge.create_callee_participant(**common, conference_sid_or_name="CF1", packet=packet)

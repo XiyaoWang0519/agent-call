@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
 
-from app.call_state import POST_DTMF_LISTEN_GRACE_SECONDS
+from app.call_state import POST_DTMF_LISTEN_GRACE_SECONDS, POST_DTMF_RECOVERY_INSTRUCTIONS
 from app.main import create_app
 from app.models import CallState
 from app.settings import Settings
@@ -49,7 +49,7 @@ async def test_send_dtmf_happy_path_records_twilio_call_and_result(service, pack
     assert call["tool_call_count"] == 1
 
 
-async def test_send_dtmf_listen_grace_blocks_watchdog_then_expires(service, packet, monkeypatch):
+async def test_send_dtmf_listen_grace_recovers_once_before_watchdog(service, packet, monkeypatch):
     clock_ns = [100 * 1_000_000_000]
     monkeypatch.setattr("app.call_activity.monotonic_ns", lambda: clock_ns[0])
     monkeypatch.setattr("app.db.telemetry.monotonic_ns", lambda: clock_ns[0])
@@ -76,7 +76,105 @@ async def test_send_dtmf_listen_grace_blocks_watchdog_then_expires(service, pack
     await service._watchdog_once()
     await wait_background()
 
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert call_id not in service._dtmf_listen_deadlines_ns
+    assert service._test_realtime.request_response_calls[-1] == (
+        call_id,
+        POST_DTMF_RECOVERY_INSTRUCTIONS,
+    )
+
+    # Recovery is one-shot. If it produces no response or inbound turn, the ordinary
+    # watchdog still terminates the call after its normal stale window.
+    await service._flush_call_activity()
+    await service.db.execute(
+        "UPDATE calls SET last_event_at=? WHERE call_id=?",
+        (stale.isoformat(), call_id),
+    )
+    clock_ns[0] += int((service.settings.watchdog_stale_seconds + 1) * 1_000_000_000)
+    await service._watchdog_once()
+    await wait_background()
+
     assert (await service.db.get_call(call_id))["state"] == CallState.TIMED_OUT.value
+    assert (
+        service._test_realtime.request_response_calls.count(
+            (call_id, POST_DTMF_RECOVERY_INSTRUCTIONS)
+        )
+        == 1
+    )
+
+
+async def test_send_dtmf_waits_until_active_callee_speech_finishes(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await service.handle_realtime_event(call_id, {"type": "input_audio_buffer.speech_started"})
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_dtmf_speaking", "send_dtmf", '{"digits":"123#"}'),
+    )
+    await wait_background()
+
+    assert service._test_twilio.dtmf == []
+    assert service._test_realtime.tool_results[-1][2] == {
+        "ok": False,
+        "error": "callee_speaking",
+        "retryable": True,
+    }
+    assert service._test_realtime.tool_result_continuations[-1] is False
+    assert call_id in service._input_speech_active
+
+    await service.handle_realtime_event(call_id, {"type": "input_audio_buffer.speech_stopped"})
+    assert call_id not in service._input_speech_active
+
+
+async def test_long_callee_prompt_stays_live_past_watchdog_window(service, packet, monkeypatch):
+    clock_ns = [100 * 1_000_000_000]
+    monkeypatch.setattr("app.call_activity.monotonic_ns", lambda: clock_ns[0])
+    monkeypatch.setattr("app.db.telemetry.monotonic_ns", lambda: clock_ns[0])
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    await service.handle_realtime_event(call_id, {"type": "input_audio_buffer.speech_started"})
+    await service._flush_call_activity()
+    stale = datetime.now(UTC) - timedelta(minutes=1)
+    await service.db.execute(
+        "UPDATE calls SET last_event_at=? WHERE call_id=?",
+        (stale.isoformat(), call_id),
+    )
+    clock_ns[0] += int((service.settings.watchdog_stale_seconds + 1) * 1_000_000_000)
+
+    await service._watchdog_once()
+
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+    assert call_id in service._input_speech_active
+    assert call_id not in service._watchdog_claims
+
+
+async def test_new_ivr_speech_cancels_post_dtmf_silence_recovery(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_dtmf_ivr", "send_dtmf", '{"digits":"2"}'),
+    )
+    await wait_background()
+    assert call_id in service._dtmf_listen_deadlines_ns
+
+    await service.handle_realtime_event(call_id, {"type": "input_audio_buffer.speech_started"})
+
+    assert call_id not in service._dtmf_listen_deadlines_ns
+    assert call_id in service._input_speech_active
+
+
+async def test_send_dtmf_does_not_hide_failed_tool_result_delivery(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    service._test_realtime.tool_result_failures_remaining = 1
+
+    await service.handle_realtime_event(
+        call_id,
+        _tool_event("tool_dtmf_delivery_fail", "send_dtmf", '{"digits":"1"}'),
+    )
+    await wait_background()
+
+    assert service._test_twilio.dtmf == [("CF" + "a" * 32, "CA" + "b" * 32, "1")]
     assert call_id not in service._dtmf_listen_deadlines_ns
 
 

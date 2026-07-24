@@ -74,6 +74,12 @@ WATCHDOG_QUESTION_GRACE_SECONDS = 2 * REALTIME_SEND_TIMEOUT_SECONDS + 5.0
 # the tones. Bare beeps and silence produce no Realtime sideband frames, so give that
 # wait its own bounded watchdog carve-out instead of treating it as a dead call.
 POST_DTMF_LISTEN_GRACE_SECONDS = 30.0
+POST_DTMF_RECOVERY_INSTRUCTIONS = (
+    "The keypad tones were sent successfully, but no new IVR speech turn followed. "
+    "Continue the approved objective from the latest menu state. Do not verbally acknowledge "
+    "the prior keypress. If the system is waiting for more keypad input, use send_dtmf; "
+    "otherwise listen, respond briefly if speech is required, or end the call when complete."
+)
 
 # Poke (the MCP client) is an LLM agent: it reliably follows explicit next_action
 # directives embedded in tool RESULTS, but under-weights static tool descriptions. There
@@ -372,6 +378,10 @@ class CallService:
     @property
     def _sip_output_playing(self) -> set[str]:
         return self._activity.sip_output_playing
+
+    @property
+    def _input_speech_active(self) -> set[str]:
+        return self._activity.input_speech_active
 
     @property
     def _inflight_tools(self) -> set[str]:
@@ -941,6 +951,15 @@ class CallService:
         # so dispatcher-only paths (and sparse SIP sidebands) still refresh the watchdog.
         if event_type in ASSISTANT_SPEECH_EVENT_TYPES:
             self._activity.note(call_id, received)
+        if event_type == "input_audio_buffer.speech_started":
+            self._activity.note(call_id, received)
+            self._activity.input_speech_active.add(call_id)
+            # The expected post-DTMF IVR turn arrived. Semantic VAD will trigger the
+            # next model response when the turn ends, so a timeout recovery would race it.
+            self._activity.clear_dtmf_listen_grace(call_id)
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self._activity.note(call_id, received)
+            self._activity.input_speech_active.discard(call_id)
         if event_type in {
             "response.output_audio_transcript.delta",
             "response.output_audio_transcript.done",
@@ -956,6 +975,7 @@ class CallService:
             # session.update/session.updated handshake in handle_sideband_open.
             logger.debug("observed session.created call_id=%s", call_id)
         elif event_type == "conversation.item.input_audio_transcription.completed":
+            self._activity.input_speech_active.discard(call_id)
             text = event.get("transcript", "").strip()
             if text:
                 await self.db.add_transcript_turn(
@@ -998,6 +1018,8 @@ class CallService:
                 event_key=str(event.get("call_id") or event_id),
             )
         elif event_type == "response.created":
+            # Any model turn proves the post-DTMF deadlock has resolved.
+            self._activity.clear_dtmf_listen_grace(call_id)
             if call_id in self._tool_seen_calls:
                 self._tool_seen_calls.discard(call_id)
                 await self.db.mark_tool_continuation_observed(call_id)
@@ -1161,7 +1183,7 @@ class CallService:
         advisory_outcome: dict[str, Any] | None = None,
         continue_response: bool = True,
         continuation_instructions: str | None = None,
-    ) -> None:
+    ) -> bool:
         # Begin the one durable tool write before yielding to the WebSocket, but do not
         # put SQLite on the response path. Await it before returning so the FIFO dispatcher
         # cannot process response.created before tool_call_count is committed.
@@ -1191,16 +1213,15 @@ class CallService:
                     {"accepted": False, "error": "outcome could not be persisted"},
                 )
                 raise
-            await self._guarded_send_tool_result(
+            return await self._guarded_send_tool_result(
                 call_id,
                 tool_call_id,
                 output,
                 continue_response=continue_response,
                 continuation_instructions=continuation_instructions,
             )
-            return
         try:
-            await self._guarded_send_tool_result(
+            return await self._guarded_send_tool_result(
                 call_id,
                 tool_call_id,
                 output,
@@ -1266,7 +1287,22 @@ class CallService:
                 )
                 return
 
+            if call_id in self._activity.input_speech_active:
+                # Do not inject tones into a prompt that is still playing. Returning the
+                # tool result without response.create lets semantic VAD resume the model
+                # after the callee's current speech turn finishes.
+                await self._send_nontransfer_tool_result(
+                    call_id,
+                    tool_call_id,
+                    {"ok": False, "error": "callee_speaking", "retryable": True},
+                    received=received,
+                    event_key=event_key,
+                    continue_response=False,
+                )
+                return
+
             self._note_call_activity(call_id)
+            self._activity.clear_dtmf_listen_grace(call_id)
             self._inflight_tools.add(call_id)
             try:
                 await self.twilio.send_dtmf(
@@ -1288,21 +1324,24 @@ class CallService:
             finally:
                 self._inflight_tools.discard(call_id)
                 self._note_call_activity(call_id)
-            if output.get("ok"):
-                self._activity.begin_dtmf_listen_grace(
-                    call_id,
-                    seconds=POST_DTMF_LISTEN_GRACE_SECONDS,
-                )
-            await self._send_nontransfer_tool_result(
+            delivered = await self._send_nontransfer_tool_result(
                 call_id,
                 tool_call_id,
                 output,
                 received=received,
                 event_key=event_key,
-                # A response.create after successful DTMF invites a spoken acknowledgement.
-                # Let the next IVR audio turn trigger the model instead.
+                # A response.create immediately after successful DTMF invites a spoken
+                # acknowledgement. Wait for the IVR, then recover once if it stays silent.
                 continue_response=not output.get("ok", False),
             )
+            if output.get("ok") and delivered:
+                # Start the grace only after the model has received function_call_output.
+                # If the sideband write failed, normal teardown must handle the unresolved
+                # tool call instead of hiding it behind an in-memory silence exemption.
+                self._activity.begin_dtmf_listen_grace(
+                    call_id,
+                    seconds=POST_DTMF_LISTEN_GRACE_SECONDS,
+                )
         elif name == "record_call_outcome":
             await self._tool_record_call_outcome(
                 call_id, tool_call_id, arguments, received=received, event_key=event_key
@@ -3112,10 +3151,37 @@ class CallService:
                 call_id,
                 now_ns=now.monotonic_ns,
             ):
-                # Do not refresh last_event_at here. When the bounded grace expires,
-                # a still-silent call should become stale immediately rather than
-                # receiving an additional full watchdog window.
+                # Successful DTMF intentionally waits for the next IVR turn without
+                # inviting an immediate spoken acknowledgement from the model.
                 continue
+            if call_id in self._activity.dtmf_listen_deadlines_ns:
+                if self._activity.assistant_work_is_live(call_id):
+                    # A long IVR prompt or a response already in progress wins over the
+                    # silence deadline. Keep the expired marker so recovery remains
+                    # available if that work later ends without producing a model turn.
+                    self._activity.note(call_id, now)
+                    continue
+                if self._activity.consume_expired_dtmf_listen_grace(
+                    call_id,
+                    now_ns=now.monotonic_ns,
+                ):
+                    try:
+                        await self.realtime.request_response(
+                            call_id,
+                            instructions=POST_DTMF_RECOVERY_INSTRUCTIONS,
+                        )
+                    except Exception:
+                        # A broken sideband cannot recover the unresolved conversation;
+                        # fall through so the ordinary stale path can terminate it.
+                        logger.warning(
+                            "post-DTMF recovery could not be delivered call_id=%s",
+                            call_id,
+                            exc_info=True,
+                        )
+                    else:
+                        logger.info("requested post-DTMF recovery call_id=%s", call_id)
+                        self._activity.note(call_id, now)
+                        continue
             if datetime.fromisoformat(call["last_event_at"]) >= cutoff:
                 continue
             if self._activity.assistant_work_is_live(call_id):

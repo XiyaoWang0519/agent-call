@@ -70,7 +70,14 @@ class TwilioBridge:
                     call_id=call_id,
                     plan_id=plan_id,
                 ),
-                conference_status_callback_event=["start", "end", "join", "leave", "mute"],
+                conference_status_callback_event=[
+                    "start",
+                    "end",
+                    "join",
+                    "leave",
+                    "mute",
+                    "announcement",
+                ],
             )
 
         participant = await asyncio.to_thread(create)

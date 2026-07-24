@@ -41,6 +41,7 @@ class CallActivityTracker:
         self.tombstones: OrderedDict[str, int] = OrderedDict()
         self.active_response_ids: dict[str, str | None] = {}
         self.sip_output_playing: set[str] = set()
+        self.input_speech_active: set[str] = set()
         self.inflight_tools: set[str] = set()
         self.dtmf_listen_deadlines_ns: dict[str, int] = {}
 
@@ -62,15 +63,16 @@ class CallActivityTracker:
         return True
 
     def assistant_work_is_live(self, call_id: str) -> bool:
-        """True when the assistant is generating, playing SIP audio, or awaiting a tool.
+        """True while either party or an assistant tool is actively doing call work.
 
         The 15s stale watchdog only sees sideband/Twilio heartbeats. SIP media and
-        in-flight tool waits can leave that clock idle while the callee still hears
-        (or is about to hear) the assistant, so those states must count as live.
+        in-flight tool waits can leave that clock idle while either party is speaking
+        or the callee is about to hear the assistant, so those states must count as live.
         """
         return (
             call_id in self.active_response_ids
             or call_id in self.sip_output_playing
+            or call_id in self.input_speech_active
             or self._is_audio_drain_active(call_id)
             or call_id in self.inflight_tools
         )
@@ -95,17 +97,35 @@ class CallActivityTracker:
         if deadline_ns is None:
             return False
         observed_ns = monotonic_ns() if now_ns is None else now_ns
+        return observed_ns < deadline_ns
+
+    def consume_expired_dtmf_listen_grace(
+        self,
+        call_id: str,
+        *,
+        now_ns: int | None = None,
+    ) -> bool:
+        """Consume one expired post-DTMF wait so recovery can run exactly once."""
+
+        deadline_ns = self.dtmf_listen_deadlines_ns.get(call_id)
+        if deadline_ns is None:
+            return False
+        observed_ns = monotonic_ns() if now_ns is None else now_ns
         if observed_ns < deadline_ns:
-            return True
+            return False
         self.dtmf_listen_deadlines_ns.pop(call_id, None)
-        return False
+        return True
+
+    def clear_dtmf_listen_grace(self, call_id: str) -> None:
+        self.dtmf_listen_deadlines_ns.pop(call_id, None)
 
     def clear_assistant_work(self, call_id: str) -> None:
         self.active_response_ids.pop(call_id, None)
         self.sip_output_playing.discard(call_id)
+        self.input_speech_active.discard(call_id)
         self._clear_audio_drain(call_id)
         self.inflight_tools.discard(call_id)
-        self.dtmf_listen_deadlines_ns.pop(call_id, None)
+        self.clear_dtmf_listen_grace(call_id)
 
     def clear(self, call_id: str) -> None:
         self.latest.pop(call_id, None)
