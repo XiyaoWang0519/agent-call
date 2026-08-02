@@ -6,11 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.22.1",
-    "fastapi>=0.139.2",
+    "fastapi>=0.141.1",
     "fastmcp>=3.4.4",
     "httpx>=0.28.1",
-    "openai>=2.46.0",
-    "phonenumbers>=9.0.34",
+    "openai>=2.48.0",
+    "phonenumbers>=9.0.35",
     "pydantic-settings>=2.14.2",
     "python-multipart>=0.0.32",
     "twilio>=9.10.9",
@@ -21,7 +21,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "mypy>=1.17.0",
-    "pre-commit>=4.2.0",
+    "pre-commit>=4.6.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",

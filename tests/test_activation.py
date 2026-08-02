@@ -7,6 +7,7 @@ import pytest
 
 from app.db import LatencyMark
 from app.models import CallState, PreparePhoneCallInput
+from app.openai_realtime import RESPONSE_PURPOSE_METADATA_KEY, VOICEMAIL_RESPONSE_PURPOSE
 from tests.conftest import seed_call, wait_background
 
 
@@ -711,6 +712,27 @@ async def test_machine_waits_for_message_end_and_all_gates(service, packet):
 
 
 @pytest.mark.asyncio
+async def test_machine_end_other_resumes_ivr_instead_of_forcing_voicemail(service, packet):
+    call_id = await seed_call(service.db, packet)
+    await service.handle_sideband_open(call_id)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    assert service._test_realtime.events == [("opening", call_id)]
+
+    await service.handle_amd(call_id, "machine_end_other")
+
+    call = await service.db.get_call(call_id)
+    assert call["answered_by"] == "machine_end_other"
+    assert call["answer_handling"] == "assumed_human"
+    assert call["state"] == CallState.ACTIVE.value
+    assert ("voicemail", call_id) not in service._test_realtime.events
+    continuation_call_id, instructions = service._test_realtime.request_response_calls[-1]
+    assert continuation_call_id == call_id
+    assert instructions is not None
+    assert "automated menu" in instructions
+    assert "send_dtmf" in instructions
+
+
+@pytest.mark.asyncio
 async def test_voicemail_activation_never_enables_automatic_responses(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
@@ -849,9 +871,26 @@ async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.ACTIVE.value
 
+    # An unrelated completed response must not be mistaken for the voicemail response.
     await service.handle_realtime_event(
         call_id,
-        {"type": "response.done", "response": {"id": "resp_vm", "status": "completed"}},
+        {"type": "response.done", "response": {"id": "resp_other", "status": "completed"}},
+    )
+    await wait_background()
+    assert call_id not in service._audio_drain_terminations
+
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {
+                "id": "resp_vm",
+                "status": "completed",
+                "metadata": {
+                    RESPONSE_PURPOSE_METADATA_KEY: VOICEMAIL_RESPONSE_PURPOSE,
+                },
+            },
+        },
     )
     await wait_background()
     # The voicemail hangup waits for playback to drain so the message is not cut off.

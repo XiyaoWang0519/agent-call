@@ -70,6 +70,10 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     send_dtmf = payload["tools"][3]
     assert send_dtmf["parameters"]["required"] == ["digits"]
     assert send_dtmf["parameters"]["properties"]["digits"]["pattern"] == "^[0-9*#w]{1,32}$"
+    assert (
+        "explicitly requested short test sequence together"
+        in send_dtmf["parameters"]["properties"]["digits"]["description"]
+    )
     assert send_dtmf["parameters"]["additionalProperties"] is False
     end_call = payload["tools"][4]
     assert end_call["parameters"]["required"] == ["reason"]
