@@ -15,7 +15,7 @@ dependencies = [
     "python-multipart>=0.0.32",
     "twilio>=9.10.9",
     "uvicorn>=0.51.0",
-    "websockets>=16.1",
+    "websockets>=16.1.1",
 ]
 
 [dependency-groups]
