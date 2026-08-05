@@ -30,7 +30,7 @@ LIFESPAN_CLEANUP_STEP_TIMEOUT_SECONDS = 15.0
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
-    mcp = FastMCP("Poke Phone-Call Bridge")
+    mcp = FastMCP("Agent Phone-Call Bridge")
 
     def get_service() -> CallService:
         # `app` is assigned below; this closure is only ever invoked once the
@@ -121,7 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if cleanup_errors:
             raise BaseExceptionGroup("application lifespan cleanup failed", cleanup_errors)
 
-    app = FastAPI(title="Poke Phone-Call Bridge", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Agent Phone-Call Bridge", version="1.0.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.mcp = mcp
     app.include_router(openai_webhooks.router)

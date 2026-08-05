@@ -32,7 +32,7 @@ class Probe:
 
 PROBES: dict[str, Probe] = {}
 BEARER_TOKEN = environ["PROBE_BEARER_TOKEN"]
-mcp = FastMCP("Ask Poke No-Call Probe")
+mcp = FastMCP("Ask Agent No-Call Probe")
 
 
 class BearerAuthMiddleware:
@@ -108,19 +108,19 @@ def timing(probe: Probe) -> dict[str, float | None]:
     return {
         "start_to_wait_seconds": elapsed(probe.wait_entered_at, probe.started_at),
         "wait_to_question_seconds": elapsed(probe.question_returned_at, probe.wait_entered_at),
-        "poke_answer_seconds": elapsed(probe.answer_received_at, probe.question_returned_at),
+        "agent_answer_seconds": elapsed(probe.answer_received_at, probe.question_returned_at),
         "total_seconds": elapsed(probe.answer_received_at, probe.started_at),
     }
 
 
 @mcp.tool(
-    name="start_ask_poke_probe",
+    name="start_ask_agent_probe",
     description=(
-        "Start a no-phone-call test of Poke's ability to remain in an MCP tool chain, long-poll "
+        "Start a no-phone-call test of an agent's ability to remain in an MCP tool chain, long-poll "
         "for a question, and submit an answer. Always follow the returned next_action."
     ),
 )
-async def start_ask_poke_probe(question: str, delay_seconds: float = 5.0) -> dict:
+async def start_ask_agent_probe(question: str, delay_seconds: float = 5.0) -> dict:
     if not question.strip() or len(question) > 500:
         raise ValueError("question must contain 1-500 characters")
     if not 1 <= delay_seconds <= 25:
@@ -149,21 +149,21 @@ async def start_ask_poke_probe(question: str, delay_seconds: float = 5.0) -> dic
         "status": "started",
         "probe_id": probe_id,
         "next_action": (
-            "Immediately call wait_for_ask_poke_probe with this probe_id and "
+            "Immediately call wait_for_ask_agent_probe with this probe_id and "
             "timeout_seconds=20. If it returns status=idle, call it again. When it returns a "
-            "question, answer it using submit_ask_poke_probe_answer. Do not answer only in chat."
+            "question, answer it using submit_ask_agent_probe_answer. Do not answer only in chat."
         ),
     }
 
 
 @mcp.tool(
-    name="wait_for_ask_poke_probe",
+    name="wait_for_ask_agent_probe",
     description=(
         "Long-poll for a no-call probe question. On status=idle, call this tool again. On "
-        "status=question, use submit_ask_poke_probe_answer with the same probe_id."
+        "status=question, use submit_ask_agent_probe_answer with the same probe_id."
     ),
 )
-async def wait_for_ask_poke_probe(probe_id: str, timeout_seconds: float = 20.0) -> dict:
+async def wait_for_ask_agent_probe(probe_id: str, timeout_seconds: float = 20.0) -> dict:
     probe = require_probe(probe_id)
     if probe.answer_received_at is not None:
         return {"status": "answered", "probe_id": probe_id, "timing": timing(probe)}
@@ -177,7 +177,7 @@ async def wait_for_ask_poke_probe(probe_id: str, timeout_seconds: float = 20.0) 
         return {
             "status": "idle",
             "probe_id": probe_id,
-            "next_action": "Call wait_for_ask_poke_probe again with the same probe_id.",
+            "next_action": "Call wait_for_ask_agent_probe again with the same probe_id.",
         }
     if probe.question_returned_at is None:
         probe.question_returned_at = time.monotonic()
@@ -186,20 +186,20 @@ async def wait_for_ask_poke_probe(probe_id: str, timeout_seconds: float = 20.0) 
         "probe_id": probe_id,
         "question": probe.question,
         "next_action": (
-            "Answer this question now using submit_ask_poke_probe_answer. Pass the same probe_id "
+            "Answer this question now using submit_ask_agent_probe_answer. Pass the same probe_id "
             "and your answer. Do not answer only in chat."
         ),
     }
 
 
 @mcp.tool(
-    name="submit_ask_poke_probe_answer",
-    description="Submit Poke's answer to a no-call probe and return exact end-to-end timing.",
+    name="submit_ask_agent_probe_answer",
+    description="Submit the agent's answer to a no-call probe and return exact end-to-end timing.",
 )
-async def submit_ask_poke_probe_answer(probe_id: str, answer: str) -> dict:
+async def submit_ask_agent_probe_answer(probe_id: str, answer: str) -> dict:
     probe = require_probe(probe_id)
     if probe.question_returned_at is None:
-        raise ValueError("question has not been returned to Poke yet")
+        raise ValueError("question has not been returned to the agent yet")
     if not answer.strip() or len(answer) > 4096:
         raise ValueError("answer must contain 1-4096 characters")
     if probe.answer_received_at is None:
@@ -213,8 +213,8 @@ async def submit_ask_poke_probe_answer(probe_id: str, answer: str) -> dict:
     }
 
 
-@mcp.tool(name="get_ask_poke_probe_result")
-async def get_ask_poke_probe_result(probe_id: str) -> dict:
+@mcp.tool(name="get_ask_agent_probe_result")
+async def get_ask_agent_probe_result(probe_id: str) -> dict:
     probe = require_probe(probe_id)
     return {"probe": asdict(probe), "timing": timing(probe)}
 

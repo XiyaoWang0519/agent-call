@@ -38,15 +38,19 @@ Copy `.env.example` to `.env.local`; never commit secrets, transcripts, or datab
 If a deploy breaks production, do not redeploy a fix while debugging. Roll back first:
 
 1. Confirm no active calls (or wait for them to finish); this POST acquires the deployment lease and fails with HTTP 409 while calls are active:
-   `curl --fail-with-body -sS --request POST -H "Authorization: Bearer $DEPLOY_GUARD_TOKEN" https://poke-call.fly.dev/internal/deployment-lock`
+   `curl --fail-with-body -sS --request POST -H "Authorization: Bearer $DEPLOY_GUARD_TOKEN" https://agent-call.fly.dev/internal/deployment-lock`
 2. List recent releases with image references:
-   `flyctl releases --image -a poke-call`
+   `flyctl releases --image -a agent-call`
 3. Redeploy the previous healthy image (no rebuild):
-   `flyctl deploy --image <previous-image-reference> -a poke-call --ha=false --remote-only`
+   `flyctl deploy --image <previous-image-reference> -a agent-call --ha=false --remote-only`
 4. Verify:
-   `curl -fsS https://poke-call.fly.dev/healthz`
+   `curl -fsS https://agent-call.fly.dev/healthz`
 
 Redeploying a prior image restores only the application image without a full rebuild; it does not roll back the current Fly configuration, environment variables, or secrets. Only ship a new build after calls are idle and the fix is verified locally (`ruff` + `mypy` + `pytest`).
+
+### poke-call → agent-call cutover
+
+Production migration steps (new Fly app, secrets, webhook re-point, OpenClaw/Hermes client config, old-app teardown) live in [docs/agent_call_migration.md](docs/agent_call_migration.md). Do not run that cutover while a call is active.
 
 ## Agent-Specific Notes
 
@@ -55,4 +59,4 @@ Notes below cover gotchas that are non-obvious from the sections above.
 - Booting the app requires every variable in `Settings.require_runtime_configuration` (`app/settings.py`) or the lifespan aborts at startup. For local dev, copy `.env.example` to `.env.local` and fill dummy values (`.env.local` is gitignored); real Twilio/OpenAI credentials + a public HTTPS tunnel are only needed for live calls.
 - Startup gotcha: do NOT put `ALLOWED_COUNTRY_CODES` in `.env.local` (or any dotenv file). pydantic-settings JSON-decodes list-typed fields from dotenv files, so `ALLOWED_COUNTRY_CODES=+1` crashes boot with a `SettingsError`. Omit it and rely on the `+1` default.
 - The full end-to-end SIP canary (`scripts/run_sip_canary.py`) places a real billable call and needs real credentials, a public tunnel, and a human with a phone; do not run it in CI or an unattended environment. Practical verification is: `ruff format --check` + `ruff check`, `pytest -q` (all externals are mocked in `tests/conftest.py`, temp SQLite), boot the server, and drive the MCP tools via `scripts/live_smoke.sh`.
-- MCP smoke test: the endpoint is `/mcp/` (Streamable HTTP) and requires both `Authorization: Bearer <MCP_BEARER_TOKEN>` and `X-Poke-User-Id: <ALLOWED_POKE_USER_ID>`. `prepare_phone_call` runs without any external service (validates destination policy + persists a plan to SQLite); its `context.owner.callback_number` and `escalation.owner_phone` must equal `OWNER_PHONE_E164`, and a persisted `plan_id` is only returned once `authority_basis` (or `requested_by_owner`) is supplied.
+- MCP smoke test: the endpoint is `/mcp/` (Streamable HTTP) and requires both `Authorization: Bearer <MCP_BEARER_TOKEN>` and `X-Agent-User-Id: <ALLOWED_AGENT_USER_ID>`. `prepare_phone_call` runs without any external service (validates destination policy + persists a plan to SQLite); its `context.owner.callback_number` and `escalation.owner_phone` must equal `OWNER_PHONE_E164`, and a persisted `plan_id` is only returned once `authority_basis` (or `requested_by_owner`) is supplied.

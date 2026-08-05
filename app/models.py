@@ -119,7 +119,7 @@ class StartPhoneCallOutput(BaseModel):
         "use answer_call_question once with only the final, ready-to-relay result and source "
         "attestation, never an intermediate 'I'm checking' update, then resume the "
         "wait_for_call_event loop. Do not end your turn and do not stop polling until the "
-        "call is terminal — if you stop, mid-call questions from the phone agent (ask_poke) "
+        "call is terminal — if you stop, mid-call questions from the phone agent (ask_agent) "
         "will time out and the call may fail its objective. When terminal, call "
         "get_call_result."
     )
@@ -257,7 +257,7 @@ class RealtimeFunctionTool(BaseModel):
         "record_call_outcome",
         "search_web",
         "send_dtmf",
-        "ask_poke",
+        "ask_agent",
         "report_hold",
         "end_call",
     ]
@@ -341,7 +341,7 @@ class QuestionResolution(StrEnum):
 
 
 class QuestionSource(StrEnum):
-    POKE_MEMORY = "poke_memory"
+    AGENT_MEMORY = "agent_memory"
     CONVERSATION_HISTORY = "conversation_history"
     EMAIL = "email"
     CALENDAR = "calendar"
@@ -349,7 +349,7 @@ class QuestionSource(StrEnum):
     OTHER = "other"
 
 
-class AskPokeRequest(BaseModel):
+class AskAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=5, max_length=500)
@@ -389,7 +389,7 @@ class AnswerCallQuestionRequest(BaseModel):
         max_length=len(QuestionSource),
         description=(
             "Sources actually checked before submitting. For owner-specific facts, search "
-            "poke_memory and conversation_history before relevant integrations."
+            "agent_memory and conversation_history before relevant integrations."
         ),
     )
 
@@ -409,7 +409,7 @@ class AnswerCallQuestionRequest(BaseModel):
             raise ValueError("sources_checked must not contain duplicates")
         if self.resolution is QuestionResolution.NOT_FOUND:
             required = {
-                QuestionSource.POKE_MEMORY,
+                QuestionSource.AGENT_MEMORY,
                 QuestionSource.CONVERSATION_HISTORY,
             }
             missing = required.difference(self.sources_checked)

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for considering a contribution to the Poke Phone-Call Bridge.
+Thanks for considering a contribution to the Agent Phone-Call Bridge.
 
 ## Getting started
 
@@ -20,7 +20,7 @@ Thanks for considering a contribution to the Poke Phone-Call Bridge.
 
    `.env.local` is gitignored. Fill dummy values for local boots; you do not
    need real credentials to run the test suite — every external service
-   (OpenAI, Twilio, Exa, Poke) is mocked in `tests/conftest.py`, and tests
+   (OpenAI, Twilio, Exa; the agent webhook is mocked) is mocked in `tests/conftest.py`, and tests
    run against a temporary SQLite database. Real credentials plus a public
    HTTPS tunnel are only needed to place a live call.
 

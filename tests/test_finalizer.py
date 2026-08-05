@@ -353,9 +353,9 @@ async def test_concurrent_finalization_runs_extractor_once(settings, service, pa
 @respx.mock
 async def test_optional_push_http_failure_never_changes_stored_result(settings, service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
-    settings.poke_push_enabled = True
-    settings.poke_api_key = SecretStr("poke-test")
-    route = respx.post("https://poke.com/api/v1/inbound/api-message").mock(
+    settings.agent_push_enabled = True
+    settings.agent_webhook_token = SecretStr("agent-webhook-test")
+    route = respx.post("https://hooks.example.test/hooks/agent").mock(
         return_value=httpx.Response(503)
     )
     finalizer = Finalizer(
@@ -375,9 +375,9 @@ async def test_optional_push_http_failure_never_changes_stored_result(settings, 
 @respx.mock
 async def test_optional_push_sends_owner_summary_text(settings, service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
-    settings.poke_push_enabled = True
-    settings.poke_api_key = SecretStr("poke-test")
-    route = respx.post("https://poke.com/api/v1/inbound/api-message").mock(
+    settings.agent_push_enabled = True
+    settings.agent_webhook_token = SecretStr("agent-webhook-test")
+    route = respx.post("https://hooks.example.test/hooks/agent").mock(
         return_value=httpx.Response(200)
     )
     parsed = ExtractedCallResult(
@@ -404,10 +404,12 @@ async def test_optional_push_sends_owner_summary_text(settings, service, packet)
 
     assert route.called
     body = json.loads(route.calls[-1].request.content)
+    assert body["name"] == "Agent Call"
+    assert body["wakeMode"] == "now"
     assert isinstance(body["message"], str)
     assert "Booked table for 2 at 7pm." in body["message"]
     assert "Confirmation #48" in body["message"]
-    assert body == {"message": format_owner_summary(result)}
+    assert body["message"] == format_owner_summary(result)
 
 
 @pytest.mark.asyncio

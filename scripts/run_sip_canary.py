@@ -30,7 +30,7 @@ async def run(args: argparse.Namespace) -> int:
     settings.require_runtime_configuration()
     base_url = (args.base_url or settings.public_base_url or "").rstrip("/")
     target = args.target or settings.owner_phone_e164
-    nonce = f"POKE-{secrets.token_hex(3).upper()}"
+    nonce = f"AGENT-{secrets.token_hex(3).upper()}"
     use_outcome_tool = args.mode == "full"
     tool_instruction = (
         "After hearing the nonce, call record_call_outcome once before wrapping up."
@@ -57,7 +57,7 @@ async def run(args: argparse.Namespace) -> int:
     }
     headers = {
         "Authorization": f"Bearer {Settings.reveal(settings.mcp_bearer_token)}",
-        "X-Poke-User-Id": settings.allowed_poke_user_id or "",
+        "X-Agent-User-Id": settings.allowed_agent_user_id or "",
     }
     transport = StreamableHttpTransport(f"{base_url}/mcp/", headers=headers)
     async with Client(transport, timeout=30) as client:

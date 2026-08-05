@@ -24,7 +24,7 @@ from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-RESPONSE_PURPOSE_METADATA_KEY = "poke_call_purpose"
+RESPONSE_PURPOSE_METADATA_KEY = "agent_call_purpose"
 VOICEMAIL_RESPONSE_PURPOSE = "voicemail"
 
 EventHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -172,13 +172,13 @@ class RealtimeBridge:
                 },
             },
         ]
-        if self.settings.ask_poke_enabled:
+        if self.settings.ask_agent_enabled:
             tools.append(
                 {
                     "type": "function",
-                    "name": "ask_poke",
+                    "name": "ask_agent",
                     "description": (
-                        "Ask the owner's assistant (Poke) one question it can answer from the "
+                        "Ask the owner's assistant agent one question it can answer from the "
                         "owner's information — account details, preferences, confirmations not "
                         "in your approved context. Tell the callee you are checking BEFORE "
                         "calling this. You will receive the answer or a timeout as the function "
@@ -253,7 +253,7 @@ class RealtimeBridge:
         return AcceptPayload(
             instructions=realtime_instructions(
                 packet,
-                ask_poke_enabled=self.settings.ask_poke_enabled,
+                ask_agent_enabled=self.settings.ask_agent_enabled,
                 hold_detection_enabled=self.settings.hold_detection_enabled,
             ),
             audio=RealtimeAudio(

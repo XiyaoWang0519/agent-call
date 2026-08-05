@@ -403,7 +403,7 @@ async def test_plan_can_only_be_claimed_once(service, packet):
     prepared = await service.prepare(
         PreparePhoneCallInput(
             context=packet,
-            authority_basis="Owner asked Poke to place this call",
+            authority_basis="Owner asked the agent to place this call",
             requested_by_owner=True,
         )
     )
@@ -427,7 +427,7 @@ async def test_start_rejects_confirmation_text_from_another_plan(service, packet
     prepared = await service.prepare(
         PreparePhoneCallInput(
             context=packet,
-            authority_basis="Owner asked Poke to place this call",
+            authority_basis="Owner asked the agent to place this call",
             requested_by_owner=True,
         )
     )
