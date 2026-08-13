@@ -14,7 +14,7 @@ dependencies = [
     "pydantic-settings>=2.14.2",
     "python-multipart>=0.0.32",
     "twilio>=9.10.9",
-    "uvicorn>=0.52.0",
+    "uvicorn>=0.52.1",
     "websockets>=17.0.1",
 ]
 
