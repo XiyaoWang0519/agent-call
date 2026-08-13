@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from functools import cached_property
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -20,6 +21,18 @@ SUPPORTED_TRANSCRIPTION_MODELS = frozenset(
     }
 )
 TRANSCRIPTION_DELAYS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+_LOOPBACK_HOSTS = frozenset({"localhost", "localhost."})
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    if hostname.casefold() in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 class Settings(BaseSettings):
@@ -121,6 +134,31 @@ class Settings(BaseSettings):
             raise ValueError("PUBLIC_BASE_URL must be an HTTPS origin without a path or query")
         return value.rstrip("/")
 
+    @field_validator("agent_webhook_url")
+    @classmethod
+    def validate_agent_webhook_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        parsed = urlsplit(stripped)
+        loopback = _is_loopback_host(parsed.hostname)
+        https_ok = parsed.scheme == "https"
+        http_loopback_ok = parsed.scheme == "http" and loopback
+        if (
+            not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not (https_ok or http_loopback_ok)
+        ):
+            raise ValueError(
+                "AGENT_WEBHOOK_URL must be an HTTPS URL without credentials or a "
+                "fragment; http:// is allowed only for localhost"
+            )
+        return stripped
+
     @field_validator("input_transcription_model")
     @classmethod
     def validate_transcription_model(cls, value: str) -> str:
@@ -143,6 +181,18 @@ class Settings(BaseSettings):
         if self.openai_connect_timeout_seconds > self.openai_http_timeout_seconds:
             raise ValueError(
                 "OPENAI_CONNECT_TIMEOUT_SECONDS cannot exceed OPENAI_HTTP_TIMEOUT_SECONDS"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_agent_push_configuration(self) -> Settings:
+        if not self.agent_push_enabled:
+            return self
+        token = self.agent_webhook_token
+        token_missing = token is None or not token.get_secret_value().strip()
+        if not self.agent_webhook_url or token_missing:
+            raise ValueError(
+                "AGENT_PUSH_ENABLED requires AGENT_WEBHOOK_URL and AGENT_WEBHOOK_TOKEN"
             )
         return self
 
