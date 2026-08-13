@@ -7,6 +7,7 @@ import json
 import time
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
@@ -83,6 +84,32 @@ def test_mcp_rejects_missing_user_header(settings):
             },
         )
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("allowed_agent_user_id", [None, "", "   "])
+def test_mcp_auth_fails_closed_when_allowed_user_id_is_unset(settings, allowed_agent_user_id):
+    app = create_app(settings)
+    with TestClient(app) as client:
+        settings.allowed_agent_user_id = allowed_agent_user_id
+        omitted = client.post(
+            "/mcp/",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={
+                "Authorization": "Bearer mcp-test",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        empty = client.post(
+            "/mcp/",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={
+                "Authorization": "Bearer mcp-test",
+                "X-Agent-User-Id": "",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+    assert omitted.status_code == 401
+    assert empty.status_code == 401
 
 
 def test_blocked_destination_is_structured_mcp_error_without_call(settings, packet):
