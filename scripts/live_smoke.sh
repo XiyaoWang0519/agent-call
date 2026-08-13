@@ -13,11 +13,11 @@ trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; wait
 export OPENAI_API_KEY="sk-dummy" OPENAI_WEBHOOK_SECRET="whsec_dummy" OPENAI_PROJECT_ID="proj_dummy"
 export EXA_API_KEY="exa-dummy"
 export TWILIO_ACCOUNT_SID="ACdummy" TWILIO_AUTH_TOKEN="dummy" TWILIO_CALLER_ID="+15550000000"
-export OWNER_PHONE_E164="+15550000001" ALLOWED_POKE_USER_ID="smoke-user"
+export OWNER_PHONE_E164="+15550000001" ALLOWED_AGENT_USER_ID="smoke-user"
 export MCP_BEARER_TOKEN="smoke-bearer" DEBUG_API_TOKEN="smoke-debug" DEPLOY_GUARD_TOKEN="smoke-deploy"
 export PUBLIC_BASE_URL="https://smoke.example.com"
 export DATABASE_URL="sqlite:///$WORKDIR/smoke.db"
-export POKE_API_KEY="dummy" POKE_PUSH_ENABLED="false" ASK_POKE_ENABLED="true"
+export AGENT_PUSH_ENABLED="false" ASK_AGENT_ENABLED="true"
 
 cd "$ROOT"
 uv run uvicorn app.main:app --host 127.0.0.1 --port "$PORT" >"$WORKDIR/server.log" 2>&1 &
@@ -34,7 +34,7 @@ curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null || { echo "FAIL: /healthz"
 echo "OK /healthz"
 
 MCP_URL="http://127.0.0.1:$PORT/mcp/"
-HDR=(-H "Authorization: Bearer smoke-bearer" -H "X-Poke-User-Id: smoke-user"
+HDR=(-H "Authorization: Bearer smoke-bearer" -H "X-Agent-User-Id: smoke-user"
      -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
 mcp_call() { # $1=json body, $2=session id (optional)

@@ -50,8 +50,8 @@ class LatencyStage(StrEnum):
     TOOL_CALL_RECEIVED = "tool_call_received"
     EXA_SEARCH_STARTED = "exa_search_started"
     EXA_SEARCH_COMPLETED = "exa_search_completed"
-    ASK_POKE_ASKED = "ask_poke_asked"
-    ASK_POKE_RESOLVED = "ask_poke_resolved"
+    ASK_AGENT_ASKED = "ask_agent_asked"
+    ASK_AGENT_RESOLVED = "ask_agent_resolved"
     TOOL_RESULT_SENT = "tool_result_sent"
 
 

@@ -55,7 +55,7 @@ def test_realtime_instructions_render_at_max_context_packet_size(packet: Context
     """Regression: a legal ContextPacket right at CONTEXT_PACKET_MAX_BYTES (approved at
     plan-approval time) must still render realtime instructions without raising. The
     instructions budget must have headroom for the full context budget plus the fixed
-    template (including the optional ask_poke guidance), not just whatever the base
+    template (including the optional ask_agent guidance), not just whatever the base
     template happened to measure at when the constant was last picked."""
     data = packet.model_dump(mode="json")
     data["relevant_facts"] = [""]
@@ -67,7 +67,7 @@ def test_realtime_instructions_render_at_max_context_packet_size(packet: Context
     max_packet = ContextPacket.model_validate(data)
     assert len(max_packet.approved_context_json().encode("utf-8")) == CONTEXT_PACKET_MAX_BYTES
 
-    instructions = realtime_instructions(max_packet, ask_poke_enabled=True)
+    instructions = realtime_instructions(max_packet, ask_agent_enabled=True)
 
     assert len(instructions.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
 
@@ -121,36 +121,36 @@ def test_realtime_instructions_bound_send_dtmf_behavior(packet: ContextPacket):
     assert "Never enter payment card numbers, PINs, passwords" in flattened
 
 
-def test_realtime_instructions_gate_ask_poke_guidance(packet: ContextPacket):
-    disabled = realtime_instructions(packet, ask_poke_enabled=False)
-    enabled = realtime_instructions(packet, ask_poke_enabled=True)
+def test_realtime_instructions_gate_ask_agent_guidance(packet: ContextPacket):
+    disabled = realtime_instructions(packet, ask_agent_enabled=False)
+    enabled = realtime_instructions(packet, ask_agent_enabled=True)
 
-    assert "Use ask_poke for facts only the owner" not in disabled
-    assert "Use ask_poke for facts only the owner" in enabled
+    assert "Use ask_agent for facts only the owner" not in disabled
+    assert "Use ask_agent for facts only the owner" in enabled
     assert "never guess or invent the pending answer" in enabled.replace("\n", " ")
     assert "One question at a time" in enabled
-    assert "ask_poke" not in disabled.split("# Approved context")[0]
+    assert "ask_agent" not in disabled.split("# Approved context")[0]
     assert len(enabled.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
 
 
-def test_realtime_instructions_drop_ask_poke_guidance_before_overflowing(
+def test_realtime_instructions_drop_ask_agent_guidance_before_overflowing(
     packet: ContextPacket, monkeypatch: pytest.MonkeyPatch
 ):
     base_size = len(realtime_instructions(packet).encode("utf-8"))
-    with_guidance = len(realtime_instructions(packet, ask_poke_enabled=True).encode("utf-8"))
+    with_guidance = len(realtime_instructions(packet, ask_agent_enabled=True).encode("utf-8"))
     assert with_guidance > base_size
 
     # A context that fits the base template but not the optional guidance must keep
     # working with the flag on: the guidance is dropped instead of failing the accept.
     monkeypatch.setattr(prompts, "REALTIME_INSTRUCTIONS_MAX_BYTES", with_guidance - 1)
-    instructions = realtime_instructions(packet, ask_poke_enabled=True)
-    assert "Use ask_poke for facts only the owner" not in instructions
+    instructions = realtime_instructions(packet, ask_agent_enabled=True)
+    assert "Use ask_agent for facts only the owner" not in instructions
     assert len(instructions.encode("utf-8")) == base_size
 
     # A context that cannot fit even the base template still raises.
     monkeypatch.setattr(prompts, "REALTIME_INSTRUCTIONS_MAX_BYTES", base_size - 1)
     with pytest.raises(ValueError, match=r"Realtime instructions exceed"):
-        realtime_instructions(packet, ask_poke_enabled=True)
+        realtime_instructions(packet, ask_agent_enabled=True)
 
 
 def test_realtime_instructions_enforce_final_byte_limit(
@@ -190,7 +190,7 @@ def test_semantic_vad_defaults_to_auto_and_rejects_unknown_value():
 async def test_oversized_context_is_rejected_before_plan_persistence(service, packet):
     raw_request = {
         "context": _oversized_packet_data(packet, "x" * CONTEXT_PACKET_MAX_BYTES),
-        "authority_basis": "Owner asked Poke to place this call",
+        "authority_basis": "Owner asked the agent to place this call",
         "requested_by_owner": True,
     }
 

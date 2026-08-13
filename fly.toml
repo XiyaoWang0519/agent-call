@@ -1,13 +1,13 @@
-app = 'poke-call'
+app = 'agent-call'
 primary_region = 'lax'
 
 [build]
 
 [env]
   ALLOWED_COUNTRY_CODES = '["+1"]'
-  ASK_POKE_ENABLED = 'true'
-  DATABASE_URL = 'sqlite:////data/poke_call.db'
-  PUBLIC_BASE_URL = 'https://poke-call.fly.dev'
+  ASK_AGENT_ENABLED = 'true'
+  DATABASE_URL = 'sqlite:////data/agent_call.db'
+  PUBLIC_BASE_URL = 'https://agent-call.fly.dev'
 
 [http_service]
   internal_port = 8000
@@ -25,7 +25,7 @@ primary_region = 'lax'
     timeout = '5s'
 
 [mounts]
-  source = 'poke_call_data'
+  source = 'agent_call_data'
   destination = '/data'
   initial_size = '1gb'
   snapshot_retention = 5

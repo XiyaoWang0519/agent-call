@@ -25,11 +25,12 @@ class MCPAuthMiddleware:
             return
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         authorization = headers.get(b"authorization", b"").decode("latin-1")
-        poke_user_id = headers.get(b"x-poke-user-id", b"").decode("latin-1")
+        agent_user_id = headers.get(b"x-agent-user-id", b"").decode("latin-1")
         expected_auth = f"Bearer {Settings.reveal(self.settings.mcp_bearer_token)}"
+        expected_user_id = (self.settings.allowed_agent_user_id or "").strip()
         auth_matches = constant_time_equal(authorization, expected_auth)
-        user_matches = not poke_user_id or constant_time_equal(
-            poke_user_id, self.settings.allowed_poke_user_id or ""
+        user_matches = bool(expected_user_id) and constant_time_equal(
+            agent_user_id, expected_user_id
         )
         authorized = auth_matches and user_matches
         if authorized:

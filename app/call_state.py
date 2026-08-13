@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 from openai.types.webhooks import UnwrapWebhookEvent
 from twilio.base.exceptions import TwilioRestException
 
+from app.agent_push import push_message_to_agent
 from app.call_activity import CallActivityTracker
 from app.costs import compute_call_cost
 from app.db import (
@@ -30,7 +31,7 @@ from app.finalizer import Finalizer
 from app.models import (
     TERMINAL_STATES,
     AdvisoryOutcome,
-    AskPokeRequest,
+    AskAgentRequest,
     CallSnapshot,
     CallState,
     ContextPacket,
@@ -50,7 +51,6 @@ from app.openai_realtime import (
     RealtimeBridge,
 )
 from app.owner_transfer import OwnerTransferCoordinator
-from app.poke_push import push_message_to_poke
 from app.policy import validate_context
 from app.settings import Settings
 from app.twilio_bridge import TwilioBridge
@@ -75,15 +75,17 @@ WATCHDOG_QUESTION_GRACE_SECONDS = 2 * REALTIME_SEND_TIMEOUT_SECONDS + 5.0
 # wait its own bounded watchdog carve-out instead of treating it as a dead call.
 POST_DTMF_LISTEN_GRACE_SECONDS = 30.0
 
-# Poke (the MCP client) is an LLM agent: it reliably follows explicit next_action
-# directives embedded in tool RESULTS, but under-weights static tool descriptions. There
-# is no reliable out-of-band push to wake a Poke turn that has already ended, so every
-# response for a non-terminal call must repeat this warning to keep Poke long-polling —
-# otherwise a mid-call ask_poke question can arrive with nobody listening and time out.
-ASK_POKE_POLL_WARNING = (
+# The MCP client is an LLM agent: it reliably follows explicit next_action directives
+# embedded in tool RESULTS, but under-weights static tool descriptions. Optional agent
+# push can wake OpenClaw, but polling via wait_for_call_event remains the canonical path
+# (and the only path for clients without inbound webhooks), so every response for a
+# non-terminal call must repeat this warning — otherwise a mid-call ask_agent question
+# can arrive with nobody listening and time out.
+ASK_AGENT_POLL_WARNING = (
     "Do not end your turn and do not stop polling until the call reaches a terminal "
-    "state — if you stop, mid-call questions from the phone agent (ask_poke) will "
-    "time out and the call may fail its objective."
+    "state — if you stop, mid-call questions from the phone agent (ask_agent) will "
+    "time out and the call may fail its objective. Prefer answering via "
+    "answer_call_question; optional push is best-effort only."
 )
 
 # DetectMessageEnd can report machine_end_other for long IVR prompts as well as machines.
@@ -216,7 +218,7 @@ class CallService:
         self._watchdog_task: asyncio.Task[None] | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
         self._hold_state: dict[str, HoldState] = {}
-        # Answered questions whose tool result never reached the sideband; a Poke retry
+        # Answered questions whose tool result never reached the sideband; an agent retry
         # of answer_call_question re-attempts delivery instead of reporting already_answered.
         self._undelivered_answers: dict[str, set[str]] = {}
         self._event_notifiers: dict[str, asyncio.Event] = {}
@@ -536,7 +538,7 @@ class CallService:
                 )
             )
         call_id = f"call_{secrets.token_urlsafe(18)}"
-        conference_name = f"poke-{secrets.token_hex(16)}"
+        conference_name = f"agent-{secrets.token_hex(16)}"
         try:
             claimed = await self.db.claim_plan_and_create_call(
                 plan_id=plan_id,
@@ -843,7 +845,7 @@ class CallService:
         Conference Participant AMD runs asynchronously, so waiting for its callback leaves a
         human callee in several seconds of silence. Keep automatic responses disabled until AMD
         completes, but ask the model for an opening turn immediately. The application supplies no
-        response-specific script; the model chooses the opening from Poke's approved context.
+        response-specific script; the model chooses the opening from the approved context.
         """
         async with self._opening_transition_lock(call_id):
             call = await self.db.get_call(call_id)
@@ -1315,8 +1317,8 @@ class CallService:
             await self._tool_transfer_to_owner_branch(
                 call_id, tool_call_id, arguments, received=received, event_key=event_key
             )
-        elif name == "ask_poke":
-            await self._handle_ask_poke(
+        elif name == "ask_agent":
+            await self._handle_ask_agent(
                 call_id,
                 tool_call_id,
                 arguments,
@@ -1453,14 +1455,14 @@ class CallService:
             self._voice_end_fallback(call_id, tool_call_id),
             name=f"voice-end-fallback:{call_id}",
         )
-        # A pending ask_poke answer or timeout must not deliver into the goodbye
+        # A pending ask_agent answer or timeout must not deliver into the goodbye
         # turn; resolve the question now so both delivery paths lose their claims.
         self._clear_pending_question(call_id)
         try:
             cancelled = await self.db.cancel_pending_questions(call_id)
             for cancelled_row in cancelled:
                 logger.info(
-                    "ask_poke question cancelled call_id=%s question_id=%s reason=voice_end_call",
+                    "ask_agent question cancelled call_id=%s question_id=%s reason=voice_end_call",
                     call_id,
                     cancelled_row["question_id"],
                 )
@@ -1530,7 +1532,7 @@ class CallService:
             event_key=event_key,
         )
 
-    async def _reject_ask_poke(
+    async def _reject_ask_agent(
         self,
         call_id: str,
         tool_call_id: str,
@@ -1540,7 +1542,7 @@ class CallService:
         event_key: str,
     ) -> None:
         logger.info(
-            "ask_poke rejected call_id=%s tool_call_id=%s error=%s",
+            "ask_agent rejected call_id=%s tool_call_id=%s error=%s",
             call_id,
             tool_call_id,
             error,
@@ -1553,25 +1555,25 @@ class CallService:
             event_key=event_key,
         )
 
-    async def _register_ask_poke_question(
+    async def _register_ask_agent_question(
         self,
         call_id: str,
         tool_call_id: str,
-        request: AskPokeRequest,
+        request: AskAgentRequest,
         row: dict[str, Any],
         *,
         received: LatencyMark,
         event_key: str,
     ) -> None:
         """Register the accepted question in memory, persist the tool receipt, and
-        kick off its notifications (latency mark, Poke push, deadline watcher)."""
+        kick off its notifications (latency mark, agent push, deadline watcher)."""
         # Register the pending question and wake parked long-polls before any further
         # awaits, so a concurrent answer or termination sees (and can clear) the entry
         # instead of racing a registration that has not happened yet.
         self._pending_questions[call_id] = PendingQuestion(
             question_id=row["question_id"],
             tool_call_id=tool_call_id,
-            deadline_monotonic=time.monotonic() + self.settings.ask_poke_answer_timeout_seconds,
+            deadline_monotonic=time.monotonic() + self.settings.ask_agent_answer_timeout_seconds,
         )
         self._notify_call_event(call_id)
         try:
@@ -1581,15 +1583,15 @@ class CallService:
                 event_key=event_key,
             )
         except Exception:
-            logger.exception("ask_poke tool receipt persistence failed call_id=%s", call_id)
+            logger.exception("ask_agent tool receipt persistence failed call_id=%s", call_id)
         self._queue_latency(
             call_id,
-            LatencyStage.ASK_POKE_ASKED,
+            LatencyStage.ASK_AGENT_ASKED,
             LatencyMark.now(),
             event_key=str(row["question_id"]),
         )
         logger.info(
-            "ask_poke asked call_id=%s question_id=%s tool_call_id=%s sequence=%s "
+            "ask_agent asked call_id=%s question_id=%s tool_call_id=%s sequence=%s "
             "question_chars=%s reason_present=%s",
             call_id,
             row["question_id"],
@@ -1598,20 +1600,18 @@ class CallService:
             len(request.question),
             request.reason is not None,
         )
-        if self.settings.poke_push_enabled:
+        if self.settings.agent_push_enabled:
+            reason_line = f"\nReason: {request.reason}" if request.reason else ""
+            push_text = (
+                f"Mid-call question on call {call_id} (question_id={row['question_id']}, "
+                f"sequence={row['sequence_number']}).\n"
+                f"Question: {request.question}{reason_line}\n"
+                "Answer via the answer_call_question MCP tool with this call_id and "
+                "question_id, then resume wait_for_call_event."
+            )
             self._spawn(
-                push_message_to_poke(
-                    self.settings,
-                    {
-                        "type": "call_question",
-                        "call_id": call_id,
-                        "question_id": row["question_id"],
-                        "question": request.question,
-                        "reason": request.reason,
-                        "sequence_number": row["sequence_number"],
-                    },
-                ),
-                name=f"poke-push-question:{call_id}:{row['question_id']}",
+                push_message_to_agent(self.settings, push_text),
+                name=f"agent-push-question:{call_id}:{row['question_id']}",
             )
         self._spawn(
             self._question_deadline(call_id, row["question_id"]),
@@ -1619,7 +1619,7 @@ class CallService:
             must_finish=False,
         )
 
-    async def _handle_ask_poke(
+    async def _handle_ask_agent(
         self,
         call_id: str,
         tool_call_id: str,
@@ -1629,34 +1629,34 @@ class CallService:
         event_key: str,
     ) -> None:
         try:
-            request = AskPokeRequest.model_validate(arguments)
+            request = AskAgentRequest.model_validate(arguments)
         except Exception:
-            logger.info("invalid ask_poke tool arguments call_id=%s", call_id)
-            await self._reject_ask_poke(
+            logger.info("invalid ask_agent tool arguments call_id=%s", call_id)
+            await self._reject_ask_agent(
                 call_id, tool_call_id, "invalid_question", received=received, event_key=event_key
             )
             return
 
-        if not self.settings.ask_poke_enabled:
-            await self._reject_ask_poke(
+        if not self.settings.ask_agent_enabled:
+            await self._reject_ask_agent(
                 call_id,
                 tool_call_id,
-                "ask_poke_disabled",
+                "ask_agent_disabled",
                 received=received,
                 event_key=event_key,
             )
             return
         if call_id in self._voice_end_pending:
-            await self._reject_ask_poke(
+            await self._reject_ask_agent(
                 call_id, tool_call_id, "call_ending", received=received, event_key=event_key
             )
             return
 
         deadline_at = (
-            datetime.now(UTC) + timedelta(seconds=self.settings.ask_poke_answer_timeout_seconds)
+            datetime.now(UTC) + timedelta(seconds=self.settings.ask_agent_answer_timeout_seconds)
         ).isoformat()
         # The question quota is enforced inside create_question, after its duplicate
-        # tool_call_id check, so a redelivered ask_poke at the limit reuses the pending
+        # tool_call_id check, so a redelivered ask_agent at the limit reuses the pending
         # row instead of closing the still-open function call with question_limit_reached.
         row, error = await self.db.create_question(
             call_id,
@@ -1664,10 +1664,10 @@ class CallService:
             question=request.question,
             reason=request.reason,
             deadline_at=deadline_at,
-            max_questions=self.settings.ask_poke_max_questions_per_call,
+            max_questions=self.settings.ask_agent_max_questions_per_call,
         )
         if error is not None or row is None:
-            await self._reject_ask_poke(
+            await self._reject_ask_agent(
                 call_id,
                 tool_call_id,
                 error or "call_not_active",
@@ -1676,7 +1676,7 @@ class CallService:
             )
             return
 
-        # Redelivered ask_poke for an already-tracked pending question: leave the open
+        # Redelivered ask_agent for an already-tracked pending question: leave the open
         # function call alone so the eventual answer/timeout can deliver exactly once.
         existing_pending = self._pending_questions.get(call_id)
         if (
@@ -1685,14 +1685,14 @@ class CallService:
             and existing_pending.tool_call_id == tool_call_id
         ):
             logger.info(
-                "ask_poke redelivered call_id=%s question_id=%s tool_call_id=%s",
+                "ask_agent redelivered call_id=%s question_id=%s tool_call_id=%s",
                 call_id,
                 row["question_id"],
                 tool_call_id,
             )
             return
 
-        await self._register_ask_poke_question(
+        await self._register_ask_agent_question(
             call_id, tool_call_id, request, row, received=received, event_key=event_key
         )
         # Leave the OpenAI function call open — answer/timeout deliver out-of-band.
@@ -1815,7 +1815,7 @@ class CallService:
         if call_id in self._voice_end_pending:
             # The goodbye turn owns the sideband now; do not inject an answer relay.
             logger.info(
-                "ask_poke answer delivery suppressed during voice end call_id=%s question_id=%s",
+                "ask_agent answer delivery suppressed during voice end call_id=%s question_id=%s",
                 call_id,
                 question_id,
             )
@@ -1831,8 +1831,9 @@ class CallService:
             question_row["tool_call_id"],
             output,
             continuation_instructions=(
-                "Poke answered your question. Relay the relevant part to the callee naturally, "
-                "in one or two sentences. Do not read metadata or mention Poke by name."
+                "The owner's assistant answered your question. Relay the relevant part to "
+                "the callee naturally, in one or two sentences. Do not read metadata or "
+                "mention the assistant by name."
             ),
         )
         if delivered:
@@ -1843,13 +1844,13 @@ class CallService:
                     self._undelivered_answers.pop(call_id, None)
             self._queue_latency(
                 call_id,
-                LatencyStage.ASK_POKE_RESOLVED,
+                LatencyStage.ASK_AGENT_RESOLVED,
                 LatencyMark.now(),
                 event_key=str(question_id),
             )
             self._activity.note(call_id)
             logger.info(
-                "ask_poke answer delivered call_id=%s question_id=%s tool_call_id=%s "
+                "ask_agent answer delivered call_id=%s question_id=%s tool_call_id=%s "
                 "answer_chars=%s",
                 call_id,
                 question_id,
@@ -1858,11 +1859,11 @@ class CallService:
             )
         else:
             # The question is durably 'answered' but the model never saw the output.
-            # Remember it so a Poke retry re-attempts delivery instead of stopping at
+            # Remember it so an agent retry re-attempts delivery instead of stopping at
             # already_answered with the function call still open.
             self._undelivered_answers.setdefault(call_id, set()).add(question_id)
             logger.warning(
-                "ask_poke answer delivery failed call_id=%s question_id=%s tool_call_id=%s",
+                "ask_agent answer delivery failed call_id=%s question_id=%s tool_call_id=%s",
                 call_id,
                 question_id,
                 question_row["tool_call_id"],
@@ -1871,11 +1872,11 @@ class CallService:
         self._notify_call_event(call_id)
 
     async def _question_deadline(self, call_id: str, question_id: str) -> None:
-        await asyncio.sleep(self.settings.ask_poke_answer_timeout_seconds)
+        await asyncio.sleep(self.settings.ask_agent_answer_timeout_seconds)
         if call_id in self._voice_end_pending:
             # end_call already cancels pending questions; the goodbye owns the sideband.
             logger.info(
-                "ask_poke question cancelled call_id=%s question_id=%s "
+                "ask_agent question cancelled call_id=%s question_id=%s "
                 "reason=voice_end_pending_owns_cancellation",
                 call_id,
                 question_id,
@@ -1897,7 +1898,7 @@ class CallService:
             # resolution raced our registration. Not a cancellation — the winner
             # already owns the final status.
             logger.info(
-                "ask_poke question expiry claim lost call_id=%s question_id=%s "
+                "ask_agent question expiry claim lost call_id=%s question_id=%s "
                 "reason=expiry_claim_lost_race",
                 call_id,
                 question_id,
@@ -1910,7 +1911,7 @@ class CallService:
             row["tool_call_id"],
             {
                 "status": "timeout",
-                "error": "no_answer_from_poke",
+                "error": "no_answer_from_agent",
                 "guidance": "Owner's assistant did not respond in time.",
             },
             continuation_instructions=(
@@ -1921,13 +1922,13 @@ class CallService:
         )
         self._queue_latency(
             call_id,
-            LatencyStage.ASK_POKE_RESOLVED,
+            LatencyStage.ASK_AGENT_RESOLVED,
             LatencyMark.now(),
             event_key=question_id,
         )
         self._activity.note(call_id)
         logger.info(
-            "ask_poke timed out call_id=%s question_id=%s tool_call_id=%s",
+            "ask_agent timed out call_id=%s question_id=%s tool_call_id=%s",
             call_id,
             question_id,
             row["tool_call_id"],
@@ -2000,31 +2001,31 @@ class CallService:
                     question_event = pending_events[-1]
                     answer_remaining = _seconds_until(question_event["deadline_at"])
                     if answer_remaining is None:
-                        answer_remaining = self.settings.ask_poke_answer_timeout_seconds
+                        answer_remaining = self.settings.ask_agent_answer_timeout_seconds
                     next_action = (
                         "Begin the required retrieval now for "
                         f"question_id={question_event['question_id']}; you have "
                         f"~{max(0, round(answer_remaining))}s. Accuracy is more important than "
-                        "speed within that window. For owner-specific facts, search poke_memory "
+                        "speed within that window. For owner-specific facts, search agent_memory "
                         "and conversation_history first, then relevant integrations. A miss in one "
                         "source is not a not_found result, and call context such as 'this is a test' "
                         "does not make the question optional. Call answer_call_question once with "
                         "only the final, ready-to-relay result, its resolution, and the sources "
-                        "actually checked. resolution=not_found requires both poke_memory and "
+                        "actually checked. resolution=not_found requires both agent_memory and "
                         "conversation_history in sources_checked. Do not send a progress update. "
-                        + ASK_POKE_POLL_WARNING
+                        + ASK_AGENT_POLL_WARNING
                     )
                 elif events:
                     next_action = (
                         "New call events are available but none are pending questions. Call "
                         f"wait_for_call_event again NOW with after_sequence={next_after}. "
-                        + ASK_POKE_POLL_WARNING
+                        + ASK_AGENT_POLL_WARNING
                     )
                 else:
                     next_action = (
                         "No new events. Call wait_for_call_event again NOW with "
                         f"after_sequence={next_after}. The call is still in progress. "
-                        + ASK_POKE_POLL_WARNING
+                        + ASK_AGENT_POLL_WARNING
                     )
                 if events or terminal:
                     logger.info(
@@ -2088,7 +2089,7 @@ class CallService:
                 "question_id": question_id,
                 "next_action": (
                     "Answer accepted. Resume polling: call wait_for_call_event with "
-                    f"after_sequence={row['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                    f"after_sequence={row['sequence_number']}. " + ASK_AGENT_POLL_WARNING
                 ),
             }
 
@@ -2140,7 +2141,7 @@ class CallService:
                     "question_id": question_id,
                     "next_action": (
                         "Answer accepted. Resume polling: call wait_for_call_event with "
-                        f"after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                        f"after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
                     ),
                 }
             logger.info(
@@ -2152,7 +2153,7 @@ class CallService:
                 "status": "already_answered",
                 "next_action": (
                     "Question already answered. Resume polling: call wait_for_call_event "
-                    f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                    f"with after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
                 ),
             }
         if status == "expired":
@@ -2166,7 +2167,7 @@ class CallService:
                 "detail": "timeout already sent to the agent",
                 "next_action": (
                     "Answer window already expired. Resume polling: call wait_for_call_event "
-                    f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                    f"with after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
                 ),
             }
         if status == "cancelled":
@@ -2187,7 +2188,7 @@ class CallService:
             )
             return {"status": "call_ended"}
         # Pending claim lost to a concurrent race without a readable winner — treat as
-        # already handled so Poke can advance rather than retry forever.
+        # already handled so the agent can advance rather than retry forever.
         logger.info(
             "answer_call_question already_answered after race call_id=%s question_id=%s",
             call_id,
@@ -2197,7 +2198,7 @@ class CallService:
             "status": "already_answered",
             "next_action": (
                 "Question already handled. Resume polling: call wait_for_call_event "
-                f"with after_sequence={existing['sequence_number']}. " + ASK_POKE_POLL_WARNING
+                f"with after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
             ),
         }
 
@@ -2503,7 +2504,7 @@ class CallService:
                     cancelled = await self.db.cancel_pending_questions(call_id)
                     for cancelled_row in cancelled:
                         logger.info(
-                            "ask_poke question cancelled call_id=%s question_id=%s "
+                            "ask_agent question cancelled call_id=%s question_id=%s "
                             "reason=termination_claim reason_code=%s",
                             call_id,
                             cancelled_row["question_id"],
@@ -2728,7 +2729,7 @@ class CallService:
             cancelled = await self.db.cancel_pending_questions(call_id)
             for cancelled_row in cancelled:
                 logger.info(
-                    "ask_poke question cancelled call_id=%s question_id=%s "
+                    "ask_agent question cancelled call_id=%s question_id=%s "
                     "reason=termination_finished reason_code=%s",
                     call_id,
                     cancelled_row["question_id"],
@@ -2997,7 +2998,7 @@ class CallService:
             cancelled = await self.db.cancel_all_pending_questions()
             for cancelled_row in cancelled:
                 logger.info(
-                    "ask_poke question cancelled call_id=%s question_id=%s reason=startup_recovery",
+                    "ask_agent question cancelled call_id=%s question_id=%s reason=startup_recovery",
                     cancelled_row["call_id"],
                     cancelled_row["question_id"],
                 )
@@ -3091,7 +3092,7 @@ class CallService:
                 pending.delivering
                 or time.monotonic() < pending.deadline_monotonic + WATCHDOG_QUESTION_GRACE_SECONDS
             ):
-                # Outstanding ask_poke: silence is expected until answer/deadline delivery
+                # Outstanding ask_agent: silence is expected until answer/deadline delivery
                 # finishes (delivering) or deadline+grace (covers cancel+send bounds).
                 continue
             hold = self._hold_state.get(call_id)

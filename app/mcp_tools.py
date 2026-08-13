@@ -21,12 +21,12 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 CONTEXT_GUIDANCE = (
-    "Assemble only call-relevant facts from Poke memory and integrations. Resolve relative dates "
-    "to explicit datetimes in the owner's timezone. Never invent phone numbers or facts. Never "
-    "include passwords, authentication codes, payment credentials, or government identifiers. "
-    "Write the objective from the agent's perspective as the caller: who the agent calls and what "
-    "the agent, acting for the owner, must achieve. Avoid parentheticals or phrasing that could "
-    "reassign roles between the agent and the callee."
+    "Assemble only call-relevant facts from your memory and connected integrations. Resolve "
+    "relative dates to explicit datetimes in the owner's timezone. Never invent phone numbers or "
+    "facts. Never include passwords, authentication codes, payment credentials, or government "
+    "identifiers. Write the objective from the agent's perspective as the caller: who the agent "
+    "calls and what the agent, acting for the owner, must achieve. Avoid parentheticals or "
+    "phrasing that could reassign roles between the agent and the callee."
 )
 
 
@@ -66,7 +66,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
             "answer_call_question, continue waiting with the returned cursor, and call "
             "get_call_result once the call is terminal. Do not end your turn between calls: "
             "this tool starts a live phone call, and the phone agent on the call may ask a "
-            "question (via ask_poke) at any moment that only YOU can answer by staying in the "
+            "question (via ask_agent) at any moment that only YOU can answer by staying in the "
             "wait_for_call_event loop — if you stop polling, that question times out and the "
             "call can fail its objective. " + CONTEXT_GUIDANCE
         ),
@@ -127,7 +127,7 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
             "next_after_sequence immediately, in a loop, for as long as the call is "
             "non-terminal; read and follow the response's next_action field every time, which "
             "tells you exactly what to do next. Never end your turn while the call is "
-            "non-terminal: the phone agent can raise a mid-call question (ask_poke) at any "
+            "non-terminal: the phone agent can raise a mid-call question (ask_agent) at any "
             "moment, and if nothing is polling, that question times out and the call can fail "
             "its objective. Only stop once a response reports terminal=true, then call "
             "get_call_result. " + CONTEXT_GUIDANCE
@@ -182,13 +182,13 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
             "Submit the final answer to one pending mid-call question from the voice agent — "
             "the callee is waiting live on the phone. Begin retrieval immediately, but prioritize "
             "accuracy over speed within the remaining deadline. For owner-specific facts, search "
-            "Poke memory and conversation history first, then relevant integrations such as "
+            "agent_memory and conversation history first, then relevant integrations such as "
             "email. A miss in one source does not mean the answer is unavailable, and call context "
             "such as 'this is a test' does not make the requested fact optional. The answer is "
             "relayed to the callee immediately and accepted exactly once, so it must contain only "
             "the final, ready-to-relay result. Never submit a progress update, partial result, or "
             "promise to keep checking. Set resolution=not_found only after checking both "
-            "poke_memory and conversation_history and include them in sources_checked; otherwise "
+            "agent_memory and conversation_history and include them in sources_checked; otherwise "
             "the submission is rejected and the question remains pending. A second accepted answer "
             "returns already_answered; late answers after timeout return expired. After answering, "
             "immediately resume the wait_for_call_event loop until the call is terminal; do not end "

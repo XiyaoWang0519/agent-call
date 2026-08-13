@@ -373,6 +373,61 @@ def test_public_base_url_must_be_exact_https_origin(settings, url):
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        "http://hooks.example.test/hooks/agent",
+        "http://10.0.0.1/hooks/agent",
+        "ftp://hooks.example.test/hooks/agent",
+        "https://user:pass@hooks.example.test/hooks/agent",
+        "https://hooks.example.test/hooks/agent#frag",
+        "not-a-url",
+    ],
+)
+def test_agent_webhook_url_rejects_cleartext_and_credentials(settings, url):
+    values = settings.model_dump()
+    values["agent_webhook_url"] = url
+    with pytest.raises(ValueError, match="AGENT_WEBHOOK_URL"):
+        Settings(**values)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://hooks.example.test/hooks/agent",
+        "https://hooks.example.test:8443/hooks/agent?wake=1",
+        "http://127.0.0.1:18789/hooks/agent",
+        "http://localhost/hooks/agent",
+        "http://[::1]/hooks/agent",
+    ],
+)
+def test_agent_webhook_url_allows_https_and_loopback_http(settings, url):
+    values = settings.model_dump()
+    values["agent_webhook_url"] = url
+    loaded = Settings(**values)
+    assert loaded.agent_webhook_url == url
+
+
+def test_blank_agent_webhook_url_is_treated_as_unset(settings):
+    values = settings.model_dump()
+    values["agent_webhook_url"] = "  "
+    loaded = Settings(**values)
+    assert loaded.agent_webhook_url is None
+
+
+def test_agent_push_enabled_requires_url_and_token(settings):
+    values = settings.model_dump()
+    values["agent_push_enabled"] = True
+    values["agent_webhook_url"] = None
+    with pytest.raises(ValueError, match="AGENT_PUSH_ENABLED"):
+        Settings(**values)
+
+    values["agent_webhook_url"] = "https://hooks.example.test/hooks/agent"
+    values["agent_webhook_token"] = None
+    with pytest.raises(ValueError, match="AGENT_PUSH_ENABLED"):
+        Settings(**values)
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("setup_deadline_seconds", 61),
@@ -403,7 +458,7 @@ async def test_plan_can_only_be_claimed_once(service, packet):
     prepared = await service.prepare(
         PreparePhoneCallInput(
             context=packet,
-            authority_basis="Owner asked Poke to place this call",
+            authority_basis="Owner asked the agent to place this call",
             requested_by_owner=True,
         )
     )
@@ -427,7 +482,7 @@ async def test_start_rejects_confirmation_text_from_another_plan(service, packet
     prepared = await service.prepare(
         PreparePhoneCallInput(
             context=packet,
-            authority_basis="Owner asked Poke to place this call",
+            authority_basis="Owner asked the agent to place this call",
             requested_by_owner=True,
         )
     )

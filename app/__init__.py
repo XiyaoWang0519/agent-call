@@ -1,1 +1,1 @@
-"""Poke phone-call bridge service."""
+"""Agent phone-call bridge service."""

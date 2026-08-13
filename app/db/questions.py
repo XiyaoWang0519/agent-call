@@ -42,7 +42,7 @@ class QuestionsMixin:
             if call_row is None or call_row[0] != CallState.ACTIVE.value:
                 await conn.rollback()
                 return None, "call_not_active"
-            # Same tool_call_id first: a redelivered ask_poke must reuse the pending row
+            # Same tool_call_id first: a redelivered ask_agent must reuse the pending row
             # instead of returning question_pending and closing the open function call.
             cursor = await conn.execute(
                 """SELECT * FROM call_questions
@@ -65,7 +65,7 @@ class QuestionsMixin:
                 await conn.rollback()
                 return None, "question_pending"
             # Quota is enforced after the same-tool_call_id reuse check so a redelivered
-            # ask_poke at the limit is treated as the original ask, not a new rejection.
+            # ask_agent at the limit is treated as the original ask, not a new rejection.
             cursor = await conn.execute(
                 "SELECT COUNT(*) FROM call_questions WHERE call_id=?",
                 (call_id,),

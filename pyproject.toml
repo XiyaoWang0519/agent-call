@@ -1,7 +1,7 @@
 [project]
-name = "poke-call"
+name = "agent-call"
 version = "0.1.0"
-description = "Single-user Poke outbound phone-call bridge"
+description = "Single-user agent outbound phone-call bridge"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

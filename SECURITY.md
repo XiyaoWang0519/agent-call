@@ -24,7 +24,7 @@ in repository settings (**Settings → Code security → Private vulnerability
 reporting**) so the Security-tab flow above works for external reporters.
 
 This project bridges live phone calls and handles third-party API credentials
-(Twilio, OpenAI, Poke), so responsible disclosure matters — a public issue
+(Twilio, OpenAI, and the agent webhook token), so responsible disclosure matters — a public issue
 could expose an exploitable path before a fix ships. We'll acknowledge
 reports as quickly as we can and work with you on a fix and disclosure
 timeline.

@@ -12,6 +12,7 @@ from openai import (
     AsyncOpenAI,
 )
 
+from app.agent_push import push_message_to_agent
 from app.db import Database
 from app.models import (
     CallState,
@@ -39,7 +40,7 @@ _OUTCOME_LABELS: dict[str, str] = {
 
 
 def format_owner_summary(result: StoredCallResult) -> str:
-    """Short owner-facing text for the post-call Poke push."""
+    """Short owner-facing text for the post-call agent push."""
     lines: list[str] = []
     summary = result.summary.strip()
     label = _OUTCOME_LABELS.get(result.outcome, "Outcome unknown")
@@ -294,6 +295,4 @@ class Finalizer:
         raise RuntimeError("unreachable")
 
     async def _maybe_push(self, result: StoredCallResult) -> None:
-        from app.poke_push import push_message_to_poke
-
-        await push_message_to_poke(self.settings, format_owner_summary(result))
+        await push_message_to_agent(self.settings, format_owner_summary(result))

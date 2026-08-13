@@ -49,17 +49,26 @@ jobs:
           DEPLOY_GUARD_TOKEN: ${{ secrets.DEPLOY_GUARD_TOKEN }}
         run: |
           response_file="${RUNNER_TEMP}/deployment-lock.json"
+          unreachable=0
           for attempt in $(seq 1 60); do
             if ! status=$(curl --silent --show-error \
               --output "$response_file" \
               --write-out '%{http_code}' \
               --request POST \
               --header "Authorization: Bearer ${DEPLOY_GUARD_TOKEN}" \
-              https://poke-call.fly.dev/internal/deployment-lock); then
+              https://agent-call.fly.dev/internal/deployment-lock); then
+              unreachable=$((unreachable + 1))
+              if [ "$unreachable" -ge 3 ]; then
+                echo "Deployment lease endpoint is unreachable after ${unreachable} attempts."
+                echo "Create and first-deploy the agent-call app per docs/agent_call_migration.md,"
+                echo "then re-run this workflow. Merging before that cutover is expected to fail here."
+                exit 1
+              fi
               echo "Deployment lease endpoint was temporarily unreachable; retrying."
               sleep 10
               continue
             fi
+            unreachable=0
             if [ "$status" = "200" ]; then
               echo "acquired=true" >> "$GITHUB_OUTPUT"
               echo "Deployment lease acquired."
@@ -81,13 +90,13 @@ jobs:
       - name: Deploy merged main to Fly.io
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --app poke-call --ha=false --remote-only
+        run: flyctl deploy --app agent-call --ha=false --remote-only
 
       - name: Verify production health
         run: |
           curl --fail --silent --show-error \
             --retry 10 --retry-delay 3 --retry-all-errors \
-            https://poke-call.fly.dev/healthz
+            https://agent-call.fly.dev/healthz
 
       - name: Release deployment lease after failure
         if: ${{ failure() && steps.deployment_lock.outputs.acquired == 'true' }}
@@ -98,4 +107,4 @@ jobs:
             --retry 5 --retry-delay 3 --retry-all-errors \
             --request DELETE \
             --header "Authorization: Bearer ${DEPLOY_GUARD_TOKEN}" \
-            https://poke-call.fly.dev/internal/deployment-lock || true
+            https://agent-call.fly.dev/internal/deployment-lock || true

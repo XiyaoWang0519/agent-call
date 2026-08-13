@@ -7,6 +7,7 @@ import json
 import time
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
@@ -36,12 +37,12 @@ def test_mcp_rejects_bad_bearer_and_wrong_user(settings):
         bad_bearer = client.post(
             "/mcp/",
             json=payload,
-            headers={"Authorization": "Bearer wrong", "X-Poke-User-Id": "poke-user-1"},
+            headers={"Authorization": "Bearer wrong", "X-Agent-User-Id": "agent-user-1"},
         )
         wrong_user = client.post(
             "/mcp/",
             json=payload,
-            headers={"Authorization": "Bearer mcp-test", "X-Poke-User-Id": "wrong"},
+            headers={"Authorization": "Bearer mcp-test", "X-Agent-User-Id": "wrong"},
         )
     assert bad_bearer.status_code == 401
     assert wrong_user.status_code == 401
@@ -55,7 +56,7 @@ def test_authorized_mcp_endpoint_exposes_exact_tool_set(settings):
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Authorization": "Bearer mcp-test",
-                "X-Poke-User-Id": "poke-user-1",
+                "X-Agent-User-Id": "agent-user-1",
                 "Accept": "application/json, text/event-stream",
             },
         )
@@ -71,7 +72,7 @@ def test_authorized_mcp_endpoint_exposes_exact_tool_set(settings):
     }
 
 
-def test_mcp_allows_poke_followup_without_user_header(settings):
+def test_mcp_rejects_missing_user_header(settings):
     app = create_app(settings)
     with TestClient(app) as client:
         response = client.post(
@@ -82,7 +83,33 @@ def test_mcp_allows_poke_followup_without_user_header(settings):
                 "Accept": "application/json, text/event-stream",
             },
         )
-    assert response.status_code == 200
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("allowed_agent_user_id", [None, "", "   "])
+def test_mcp_auth_fails_closed_when_allowed_user_id_is_unset(settings, allowed_agent_user_id):
+    app = create_app(settings)
+    with TestClient(app) as client:
+        settings.allowed_agent_user_id = allowed_agent_user_id
+        omitted = client.post(
+            "/mcp/",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={
+                "Authorization": "Bearer mcp-test",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        empty = client.post(
+            "/mcp/",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={
+                "Authorization": "Bearer mcp-test",
+                "X-Agent-User-Id": "",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+    assert omitted.status_code == 401
+    assert empty.status_code == 401
 
 
 def test_blocked_destination_is_structured_mcp_error_without_call(settings, packet):
@@ -107,7 +134,7 @@ def test_blocked_destination_is_structured_mcp_error_without_call(settings, pack
             },
             headers={
                 "Authorization": "Bearer mcp-test",
-                "X-Poke-User-Id": "poke-user-1",
+                "X-Agent-User-Id": "agent-user-1",
                 "Accept": "application/json, text/event-stream",
             },
         )
@@ -298,7 +325,7 @@ async def test_exactly_seven_mcp_tools(settings):
     assert "only the final, ready-to-relay result" in description
     assert "never submit a progress update" in description
     assert "prioritize accuracy over speed" in description
-    assert "search poke memory and conversation history first" in description
+    assert "search agent_memory and conversation history first" in description
     assert "resolution=not_found" in description
     assert "question remains pending" in description
 

@@ -47,7 +47,7 @@ async def _ask(
 
     await service.handle_realtime_event(
         call_id,
-        _tool_event(tool_call_id, "ask_poke", json.dumps(payload)),
+        _tool_event(tool_call_id, "ask_agent", json.dumps(payload)),
     )
 
 
@@ -64,7 +64,7 @@ def test_start_phone_call_output_routes_monitoring_through_event_poll():
 
 @pytest.fixture
 async def ask_service(service):
-    service.settings.ask_poke_enabled = True
+    service.settings.ask_agent_enabled = True
     return service
 
 
@@ -100,7 +100,7 @@ async def test_question_event_prioritizes_required_sources_over_speed(ask_servic
 
     assert len(result["events"]) == 1
     assert "accuracy is more important than speed" in result["next_action"].lower()
-    assert "search poke_memory and conversation_history first" in result["next_action"]
+    assert "search agent_memory and conversation_history first" in result["next_action"]
     assert "this is a test" in result["next_action"]
     assert "only the final, ready-to-relay result" in result["next_action"]
     assert "resolution=not_found requires both" in result["next_action"]
@@ -122,7 +122,7 @@ def test_not_found_answer_requires_memory_and_conversation_history():
         answer="I could not find the building after checking the available records.",
         resolution=QuestionResolution.NOT_FOUND,
         sources_checked=[
-            QuestionSource.POKE_MEMORY,
+            QuestionSource.AGENT_MEMORY,
             QuestionSource.CONVERSATION_HISTORY,
             QuestionSource.EMAIL,
         ],
@@ -138,7 +138,7 @@ async def test_mcp_rejects_unsupported_not_found_without_claiming_question(ask_s
     await wait_background()
     rows = await ask_service.db.get_questions_after(call_id, 0)
     question_id = rows[0]["question_id"]
-    mcp = FastMCP("test-ask-poke-source-validation")
+    mcp = FastMCP("test-ask-agent-source-validation")
     register_tools(mcp, lambda: ask_service)
 
     with pytest.raises(ToolError, match="question remains pending"):
@@ -191,7 +191,7 @@ async def test_answer_delivers_correlated_output_and_continuation(ask_service, p
 
 @pytest.mark.asyncio
 async def test_timeout_exactly_once_then_answer_is_expired(ask_service, packet):
-    ask_service.settings.ask_poke_answer_timeout_seconds = 0.05
+    ask_service.settings.ask_agent_answer_timeout_seconds = 0.05
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_timeout")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -203,7 +203,7 @@ async def test_timeout_exactly_once_then_answer_is_expired(ask_service, packet):
     timeout_results = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_timeout"]
     assert len(timeout_results) == 1
     assert timeout_results[0][2]["status"] == "timeout"
-    assert timeout_results[0][2]["error"] == "no_answer_from_poke"
+    assert timeout_results[0][2]["error"] == "no_answer_from_agent"
     row = await ask_service.db.get_question(question_id)
     assert row["status"] == "expired"
 
@@ -217,7 +217,7 @@ async def test_timeout_exactly_once_then_answer_is_expired(ask_service, packet):
 
 @pytest.mark.asyncio
 async def test_answer_timeout_race_exactly_one_output(ask_service, packet):
-    ask_service.settings.ask_poke_answer_timeout_seconds = 0.05
+    ask_service.settings.ask_agent_answer_timeout_seconds = 0.05
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_race")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -282,7 +282,7 @@ async def test_second_ask_while_pending_returns_error_and_keeps_call_active(ask_
 
 @pytest.mark.asyncio
 async def test_question_limit_returns_error(ask_service, packet):
-    ask_service.settings.ask_poke_max_questions_per_call = 1
+    ask_service.settings.ask_agent_max_questions_per_call = 1
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_limit_1")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -302,7 +302,7 @@ async def test_question_limit_returns_error(ask_service, packet):
 
 @pytest.mark.asyncio
 async def test_termination_cancels_pending_and_late_answer_is_call_ended(ask_service, packet):
-    ask_service.settings.ask_poke_answer_timeout_seconds = 30.0
+    ask_service.settings.ask_agent_answer_timeout_seconds = 30.0
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_term")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -382,7 +382,7 @@ async def test_watchdog_carve_out_skips_while_question_delivering(ask_service, p
 
 
 @pytest.mark.asyncio
-async def test_ask_poke_while_voice_end_pending_returns_call_ending(ask_service, packet):
+async def test_ask_agent_while_voice_end_pending_returns_call_ending(ask_service, packet):
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     ask_service._voice_end_pending[call_id] = ("end_tool", None)
 
@@ -394,15 +394,15 @@ async def test_ask_poke_while_voice_end_pending_returns_call_ending(ask_service,
 
 
 @pytest.mark.asyncio
-async def test_ask_poke_disabled_returns_error_and_tool_absent_from_payload(
+async def test_ask_agent_disabled_returns_error_and_tool_absent_from_payload(
     service, packet, settings
 ):
-    assert service.settings.ask_poke_enabled is False
+    assert service.settings.ask_agent_enabled is False
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await _ask(service, call_id, tool_call_id="tc_disabled")
     await wait_background()
     result = [r for r in service._test_realtime.tool_results if r[1] == "tc_disabled"]
-    assert result[-1][2] == {"status": "error", "error": "ask_poke_disabled"}
+    assert result[-1][2] == {"status": "error", "error": "ask_agent_disabled"}
 
     async def _noop(*args, **kwargs) -> None:
         return None
@@ -415,7 +415,7 @@ async def test_ask_poke_disabled_returns_error_and_tool_absent_from_payload(
         on_fatal=_noop,
     )
     names = [tool.name for tool in bridge.build_accept_payload(packet).tools]
-    assert "ask_poke" not in names
+    assert "ask_agent" not in names
 
 
 @pytest.mark.asyncio
@@ -483,7 +483,7 @@ async def test_wait_for_call_event_terminating_is_not_terminal(ask_service, pack
     assert "get_call_result" not in result["next_action"]
     assert "Call wait_for_call_event again NOW" in result["next_action"]
     assert "do not stop polling" in result["next_action"]
-    assert "ask_poke" in result["next_action"]
+    assert "ask_agent" in result["next_action"]
 
 
 @pytest.mark.asyncio
@@ -517,12 +517,12 @@ async def test_wait_for_call_event_timeout_returns_empty_events(ask_service, pac
     assert result["events"] == []
     assert result["terminal"] is False
     assert result["state"] == CallState.ACTIVE.value
-    # The idle-timeout response must still drive Poke to keep polling — an empty
-    # events list is not a stopping condition (see the ask_poke keep-polling incident).
+    # The idle-timeout response must still drive the agent to keep polling — an empty
+    # events list is not a stopping condition (see the ask_agent keep-polling incident).
     assert "Call wait_for_call_event again NOW" in result["next_action"]
     assert "after_sequence=0" in result["next_action"]
     assert "do not stop polling" in result["next_action"]
-    assert "ask_poke" in result["next_action"]
+    assert "ask_agent" in result["next_action"]
 
 
 @pytest.mark.asyncio
@@ -572,7 +572,7 @@ async def test_answer_delivery_cancels_active_response(ask_service, packet):
 
 @pytest.mark.asyncio
 async def test_end_call_cancels_pending_question(ask_service, packet):
-    ask_service.settings.ask_poke_answer_timeout_seconds = 30.0
+    ask_service.settings.ask_agent_answer_timeout_seconds = 30.0
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_pending")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -658,7 +658,7 @@ async def test_redelivered_pending_ask_is_idempotent(ask_service, packet):
 
 @pytest.mark.asyncio
 async def test_redelivered_pending_ask_at_question_limit_is_idempotent(ask_service, packet):
-    ask_service.settings.ask_poke_max_questions_per_call = 1
+    ask_service.settings.ask_agent_max_questions_per_call = 1
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_quota_redeliver")
     await wait_background()
@@ -688,7 +688,7 @@ async def test_redelivered_pending_ask_at_question_limit_is_idempotent(ask_servi
 
 @pytest.mark.asyncio
 async def test_expiry_does_not_claim_once_call_is_terminating(ask_service, packet):
-    ask_service.settings.ask_poke_answer_timeout_seconds = 0.05
+    ask_service.settings.ask_agent_answer_timeout_seconds = 0.05
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_expire_term")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -755,7 +755,7 @@ def _messages(caplog: pytest.LogCaptureFixture, *, logger_name: str) -> list[str
 
 
 @pytest.mark.asyncio
-async def test_ask_poke_lifecycle_emits_trace_logs(ask_service, packet, caplog):
+async def test_ask_agent_lifecycle_emits_trace_logs(ask_service, packet, caplog):
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
 
     with caplog.at_level(logging.INFO, logger="app.call_state"):
@@ -774,16 +774,16 @@ async def test_ask_poke_lifecycle_emits_trace_logs(ask_service, packet, caplog):
     assert waited["events"]
     assert answered["status"] == "accepted"
     messages = _messages(caplog, logger_name="app.call_state")
-    assert any("ask_poke asked" in message and question_id in message for message in messages)
+    assert any("ask_agent asked" in message and question_id in message for message in messages)
     assert any("wait_for_call_event returned" in message for message in messages)
     assert any("answer_call_question received" in message for message in messages)
     assert any("answer_call_question accepted" in message for message in messages)
-    assert any("ask_poke answer delivered" in message for message in messages)
+    assert any("ask_agent answer delivered" in message for message in messages)
 
 
 @pytest.mark.asyncio
-async def test_ask_poke_reject_and_timeout_emit_trace_logs(ask_service, packet, caplog):
-    ask_service.settings.ask_poke_answer_timeout_seconds = 0.05
+async def test_ask_agent_reject_and_timeout_emit_trace_logs(ask_service, packet, caplog):
+    ask_service.settings.ask_agent_answer_timeout_seconds = 0.05
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
 
     with caplog.at_level(logging.INFO, logger="app.call_state"):
@@ -792,7 +792,7 @@ async def test_ask_poke_reject_and_timeout_emit_trace_logs(ask_service, packet, 
         await asyncio.sleep(0.12)
         await wait_background()
 
-        ask_service.settings.ask_poke_answer_timeout_seconds = 30.0
+        ask_service.settings.ask_agent_answer_timeout_seconds = 30.0
         await _ask(
             ask_service,
             call_id,
@@ -809,21 +809,21 @@ async def test_ask_poke_reject_and_timeout_emit_trace_logs(ask_service, packet, 
         await wait_background()
 
     messages = _messages(caplog, logger_name="app.call_state")
-    assert any("ask_poke timed out" in message for message in messages)
+    assert any("ask_agent timed out" in message for message in messages)
     assert any(
-        "ask_poke rejected" in message and "question_pending" in message for message in messages
+        "ask_agent rejected" in message and "question_pending" in message for message in messages
     )
 
 
 @pytest.mark.asyncio
-async def test_mcp_ask_poke_tools_emit_invocation_logs(ask_service, packet, caplog):
+async def test_mcp_ask_agent_tools_emit_invocation_logs(ask_service, packet, caplog):
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_mcp_log")
     await wait_background()
     rows = await ask_service.db.get_questions_after(call_id, 0)
     question_id = rows[0]["question_id"]
 
-    mcp = FastMCP("test-ask-poke-logging")
+    mcp = FastMCP("test-ask-agent-logging")
     register_tools(mcp, lambda: ask_service)
 
     with caplog.at_level(logging.INFO, logger="app.mcp_tools"):
@@ -838,7 +838,7 @@ async def test_mcp_ask_poke_tools_emit_invocation_logs(ask_service, packet, capl
                 "question_id": question_id,
                 "answer": "CVS on Market Street",
                 "resolution": "found",
-                "sources_checked": ["poke_memory"],
+                "sources_checked": ["agent_memory"],
             },
         )
         await wait_background()
@@ -856,7 +856,7 @@ async def test_mcp_ask_poke_tools_emit_invocation_logs(ask_service, packet, capl
     assert any(
         "mcp tool answer_call_question call_id=" in message
         and "resolution=found" in message
-        and "sources_checked=poke_memory" in message
+        and "sources_checked=agent_memory" in message
         for message in messages
     )
     assert any(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from functools import cached_property
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -20,6 +21,18 @@ SUPPORTED_TRANSCRIPTION_MODELS = frozenset(
     }
 )
 TRANSCRIPTION_DELAYS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+_LOOPBACK_HOSTS = frozenset({"localhost", "localhost."})
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    if hostname.casefold() in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 class Settings(BaseSettings):
@@ -41,15 +54,16 @@ class Settings(BaseSettings):
     twilio_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     owner_phone_e164: str | None = None
     owner_display_name: str = "the owner"
-    allowed_poke_user_id: str | None = None
+    allowed_agent_user_id: str | None = None
     mcp_bearer_token: SecretStr | None = None
     debug_api_token: SecretStr | None = None
     deploy_guard_token: SecretStr | None = None
-    poke_api_key: SecretStr | None = None
-    poke_push_enabled: bool = False
-    ask_poke_enabled: bool = False
-    ask_poke_answer_timeout_seconds: float = Field(default=60.0, gt=0, le=120)
-    ask_poke_max_questions_per_call: int = Field(default=5, ge=1, le=20)
+    agent_webhook_url: str | None = None
+    agent_webhook_token: SecretStr | None = None
+    agent_push_enabled: bool = False
+    ask_agent_enabled: bool = False
+    ask_agent_answer_timeout_seconds: float = Field(default=60.0, gt=0, le=120)
+    ask_agent_max_questions_per_call: int = Field(default=5, ge=1, le=20)
     hold_detection_enabled: bool = False
     hold_max_seconds: float = Field(default=300.0, gt=0, le=600)
     wait_for_call_event_max_seconds: float = Field(default=20.0, gt=0, le=25)
@@ -62,7 +76,7 @@ class Settings(BaseSettings):
     openai_keepalive_expiry_seconds: float | None = Field(default=60.0, ge=5, le=300)
     openai_extraction_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
     extractor_model: str = "gpt-5.4-nano-2026-03-17"
-    database_url: str = "sqlite:///./poke_call.db"
+    database_url: str = "sqlite:///./agent_call.db"
     public_base_url: str | None = None
     realtime_model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
     mini_models_enabled: bool = False
@@ -120,6 +134,31 @@ class Settings(BaseSettings):
             raise ValueError("PUBLIC_BASE_URL must be an HTTPS origin without a path or query")
         return value.rstrip("/")
 
+    @field_validator("agent_webhook_url")
+    @classmethod
+    def validate_agent_webhook_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        parsed = urlsplit(stripped)
+        loopback = _is_loopback_host(parsed.hostname)
+        https_ok = parsed.scheme == "https"
+        http_loopback_ok = parsed.scheme == "http" and loopback
+        if (
+            not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not (https_ok or http_loopback_ok)
+        ):
+            raise ValueError(
+                "AGENT_WEBHOOK_URL must be an HTTPS URL without credentials or a "
+                "fragment; http:// is allowed only for localhost"
+            )
+        return stripped
+
     @field_validator("input_transcription_model")
     @classmethod
     def validate_transcription_model(cls, value: str) -> str:
@@ -145,6 +184,18 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_agent_push_configuration(self) -> Settings:
+        if not self.agent_push_enabled:
+            return self
+        token = self.agent_webhook_token
+        token_missing = token is None or not token.get_secret_value().strip()
+        if not self.agent_webhook_url or token_missing:
+            raise ValueError(
+                "AGENT_PUSH_ENABLED requires AGENT_WEBHOOK_URL and AGENT_WEBHOOK_TOKEN"
+            )
+        return self
+
     @cached_property
     def database_path(self) -> Path:
         prefix = "sqlite:///"
@@ -164,7 +215,7 @@ class Settings(BaseSettings):
             "TWILIO_AUTH_TOKEN": self.twilio_auth_token,
             "TWILIO_CALLER_ID": self.twilio_caller_id,
             "OWNER_PHONE_E164": self.owner_phone_e164,
-            "ALLOWED_POKE_USER_ID": self.allowed_poke_user_id,
+            "ALLOWED_AGENT_USER_ID": self.allowed_agent_user_id,
             "MCP_BEARER_TOKEN": self.mcp_bearer_token,
             "DEBUG_API_TOKEN": self.debug_api_token,
             "DEPLOY_GUARD_TOKEN": self.deploy_guard_token,

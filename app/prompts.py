@@ -7,13 +7,13 @@ from app.models import ContextPacket
 logger = logging.getLogger(__name__)
 
 REALTIME_INSTRUCTIONS_MAX_BYTES = 24 * 1024
-"""Fixed template text is ~5.9KB with ask_poke guidance included; CONTEXT_PACKET_MAX_BYTES
+"""Fixed template text is ~5.9KB with ask_agent guidance included; CONTEXT_PACKET_MAX_BYTES
 (app.models) adds up to 16KB of approved-context JSON on top. 24KB keeps comfortable headroom
 above that ~22KB worst case so a legal approved context can never overflow the instructions
 budget by construction."""
 
-ASK_POKE_TOOL_GUIDANCE = (
-    "Use ask_poke for facts only the owner or their assistant would know (account details already "
+ASK_AGENT_TOOL_GUIDANCE = (
+    "Use ask_agent for facts only the owner or their assistant would know (account details already "
     "on file, confirmations, preferences) that are not in the approved context and not "
     "web-searchable — search_web remains the tool for public facts. Before calling it, tell the "
     'callee you will check ("one sec, let me check"). While waiting, keep responding to the '
@@ -33,7 +33,7 @@ HOLD_TOOL_GUIDANCE = (
 def realtime_instructions(
     packet: ContextPacket,
     *,
-    ask_poke_enabled: bool = False,
+    ask_agent_enabled: bool = False,
     hold_detection_enabled: bool = False,
 ) -> str:
     approved = packet.approved_context_json()
@@ -100,7 +100,7 @@ The conversation is finished when the approved objective is complete and the cal
 further, or when the callee declines, the number is wrong, or the objective cannot be completed.
 A pending question or request from the callee means the conversation is not finished: answer it
 fully as a normal turn first, and never fold new content into the goodbye. Once the conversation
-is finished, end promptly with end_call. Do not wait for the callee or the outer Poke client to
+is finished, end promptly with end_call. Do not wait for the callee or the outer agent client to
 hang up. After the function succeeds, the application will prompt you to deliver one brief natural
 goodbye before it disconnects. If the callee interrupts that closing, address them and use end_call
 again only when the conversation is actually finished.
@@ -131,7 +131,7 @@ Use end_call when the conversation is finished; the application coordinates the 
 {approved}
 """
 
-    optional_guidance = ("\n" + ASK_POKE_TOOL_GUIDANCE if ask_poke_enabled else "") + (
+    optional_guidance = ("\n" + ASK_AGENT_TOOL_GUIDANCE if ask_agent_enabled else "") + (
         "\n" + HOLD_TOOL_GUIDANCE if hold_detection_enabled else ""
     )
     instructions = compose(optional_guidance)
@@ -161,5 +161,5 @@ Every commitment, confirmation number, and follow-up must cite at least one tran
 evidence_turn_ids must contain turn_id values copied verbatim from the provided transcript entries; never invent, alter, or abbreviate an id.
 If evidence is thin or missing, use unknown or needs_follow_up and lower confidence.
 Do not treat the realtime advisory outcome as ground truth; use it only when transcript evidence supports it.
-Treat mid-call Poke answers relayed by the agent as agent-asserted, same evidentiary tier as the advisory outcome (do not treat as ground truth).
+Treat mid-call agent answers relayed by the voice agent as agent-asserted, same evidentiary tier as the advisory outcome (do not treat as ground truth).
 """
