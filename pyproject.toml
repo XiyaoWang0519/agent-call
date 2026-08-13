@@ -1,9 +1,30 @@
 [project]
 name = "agent-call"
 version = "0.1.0"
-description = "Single-user agent outbound phone-call bridge"
+description = "Self-hosted single-owner MCP bridge for outbound phone calls via OpenAI Realtime SIP and Twilio"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "XiyaoWang0519" }]
+keywords = [
+    "mcp",
+    "openai-realtime",
+    "twilio",
+    "voice-agent",
+    "fastapi",
+    "sip",
+    "ai-agents",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Telephony",
+    "Typing :: Typed",
+]
 dependencies = [
     "aiosqlite>=0.22.1",
     "fastapi>=0.141.1",
@@ -17,6 +38,14 @@ dependencies = [
     "uvicorn>=0.52.0",
     "websockets>=17.0.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/XiyaoWang0519/agent-call"
+Repository = "https://github.com/XiyaoWang0519/agent-call"
+Issues = "https://github.com/XiyaoWang0519/agent-call/issues"
+Documentation = "https://github.com/XiyaoWang0519/agent-call/blob/main/README.md"
+Changelog = "https://github.com/XiyaoWang0519/agent-call/blob/main/CHANGELOG.md"
+Security = "https://github.com/XiyaoWang0519/agent-call/blob/main/SECURITY.md"
 
 [dependency-groups]
 dev = [

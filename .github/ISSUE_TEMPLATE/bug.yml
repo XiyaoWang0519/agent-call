@@ -1,0 +1,71 @@
+name: Bug report
+description: Report something that is not working as expected
+title: "[Bug]: "
+labels: ["type/bug", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for a report. Do **not** include API keys, bearer tokens, webhook secrets, real phone numbers, recordings, or transcripts. Redact configuration values.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Prefer dummy credentials and reserved/test numbers.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: dropdown
+    id: live-call
+    attributes:
+      label: Did this involve a live phone call?
+      options:
+        - "No — tests, docs, or local dummy boot only"
+        - "Yes — a real call was placed (redact all call data)"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or version
+      placeholder: git rev-parse --short HEAD
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Python version
+      placeholder: "macOS 15, Python 3.13, uv 0.9.27"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration names
+      description: Names only (for example PUBLIC_BASE_URL, ASK_AGENT_ENABLED). No values, secrets, or phone numbers.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Strip tokens, phone numbers, and transcript text before pasting.
+      render: text
+    validations:
+      required: false

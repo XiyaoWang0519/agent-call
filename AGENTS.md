@@ -23,7 +23,7 @@ Use four-space indentation, Python type hints, and `from __future__ import annot
 
 ## Testing Guidelines
 
-Tests use pytest, `pytest-asyncio` in auto mode, `respx`, and temporary SQLite databases. Name files `test_<area>.py` and tests `test_<behavior>`. Add regression coverage for state transitions, signed webhook handling, payload shapes, recovery, and teardown. No numeric coverage threshold is configured; new behavior should still exercise both success and failure paths.
+Tests use pytest, `pytest-asyncio` in auto mode, `respx`, and temporary SQLite databases. Name files `test_<area>.py` and tests `test_<behavior>`. Add regression coverage for state transitions, signed webhook handling, payload shapes, recovery, and teardown. CI enforces an 85% coverage floor on `app` via `pytest --cov=app`; new behavior should still exercise both success and failure paths.
 
 ## Commit & Pull Request Guidelines
 
