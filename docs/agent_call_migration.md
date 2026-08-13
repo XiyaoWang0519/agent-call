@@ -1,7 +1,17 @@
 # poke-call → agent-call infra migration
 
-Run this **after** the rebrand code is merged and there are **no active calls**.
-Configs in the repo already target `agent-call` / `agent-call.fly.dev`.
+Run this when there are **no active calls**. Configs in the repo already target
+`agent-call` / `agent-call.fly.dev`.
+
+Merging this rebrand before the new Fly app exists will fail the GitHub
+**Deploy production** workflow: it waits on `https://agent-call.fly.dev` for a
+deployment lease, then exits after a few unreachable attempts. That is
+expected. Production stays on `poke-call` until you finish this cutover and
+re-run the workflow (or deploy with `flyctl` as below).
+
+To keep auto-deploy green on the merge commit, complete steps 2–5 first so the
+lease endpoint exists, then merge. Otherwise merge first, ignore that failed
+deploy run, and continue here.
 
 ## 1. Lock the old app
 
