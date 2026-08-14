@@ -1,0 +1,11 @@
+{
+  "name": "agent-call",
+  "install": "set -eu; export PATH=\"$HOME/.local/bin:$PATH\"; if [ \"$(uv --version 2>/dev/null || true)\" != \"uv 0.9.27\" ]; then curl -LsSf https://astral.sh/uv/0.9.27/install.sh | sh; fi; [ \"$(uv --version)\" = \"uv 0.9.27\" ]; uv sync --all-groups --frozen --python 3.13",
+  "terminals": [
+    {
+      "name": "server",
+      "command": "scripts/dev_server.sh 8000"
+    }
+  ],
+  "ports": [8000]
+}
