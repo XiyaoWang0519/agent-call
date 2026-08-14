@@ -1,0 +1,36 @@
+name: Usage question
+description: Ask how to evaluate, configure, or self-host Agent Call
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and read the [README](https://github.com/XiyaoWang0519/agent-call/blob/main/README.md) and [self-hosting guide](https://github.com/XiyaoWang0519/agent-call/blob/main/docs/self-hosting.md) first.
+
+        Do **not** paste secrets, phone numbers, or transcripts. There is no public support email and no guaranteed response time.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you already tried
+      description: Commands and redacted output. The credential-free path is `uv sync --all-groups --frozen` plus Ruff, mypy, and pytest.
+    validations:
+      required: false
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or version
+    validations:
+      required: false
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Python version
+    validations:
+      required: false

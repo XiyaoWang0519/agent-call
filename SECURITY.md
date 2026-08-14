@@ -1,32 +1,53 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-Only the latest commit on `main` is supported. There are no maintained release
-branches; always run against current `main`.
+Only the latest commit on `main` is supported. There are no tagged releases or
+maintained release branches yet. Operators should run current `main` (or a
+commit they have reviewed) rather than assuming a stable version line.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-Please report security vulnerabilities privately rather than in a public
-issue.
+Please report security vulnerabilities **privately**. Do not open a public
+issue, pull request, or discussion for an exploitable finding.
 
-**Preferred:** GitHub private vulnerability reporting — open the
-repository's **Security** tab and use **"Report a vulnerability"**.
+**Preferred, when the repository offers it:** GitHub private vulnerability
+reporting. Open the repository **Security** tab and, if the button is present,
+use **Report a vulnerability**. This channel is the GitHub-recommended path
+once a maintainer has enabled it in repository settings. Do not assume the
+button is available until you see it.
 
-**Fallback:** If that button is unavailable, open a private channel with the
-repository owner via their [GitHub profile](https://github.com/XiyaoWang0519)
-(email or other contact listed there). Do not file a public issue for
-exploitable findings.
+**Fallback:** If that button is missing, open a private channel with the
+repository owner using a contact method listed on their
+[GitHub profile](https://github.com/XiyaoWang0519). Do not invent or guess an
+email address, and do not file a public issue for exploitable findings.
 
-**Maintainer prerequisite before making this repository public:** enable
-[private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)
-in repository settings (**Settings → Code security → Private vulnerability
-reporting**) so the Security-tab flow above works for external reporters.
+This project bridges live phone calls and holds third-party API credentials
+(Twilio, OpenAI, and agent/MCP tokens), so responsible disclosure matters. A
+public issue could expose an exploitable path before a fix ships. Reports will
+be acknowledged as quickly as practical, with a fix and disclosure timeline
+worked out with the reporter.
 
-This project bridges live phone calls and handles third-party API credentials
-(Twilio, OpenAI, and the agent webhook token), so responsible disclosure matters — a public issue
-could expose an exploitable path before a fix ships. We'll acknowledge
-reports as quickly as we can and work with you on a fix and disclosure
-timeline.
+There is no bounty program; reports are still appreciated.
 
-There is no bounty program; reports are still very much appreciated.
+## What to include
+
+- A description of the issue and its impact (for example: unauthenticated MCP
+  access, webhook forgery, replay, destination-policy bypass, secret leakage).
+- The commit hash or approximate date you tested.
+- Reproduction steps that use **dummy** credentials and reserved/test phone
+  numbers where possible.
+- Expected versus actual behavior.
+
+## What not to include unless the maintainer asks
+
+Do **not** send real API keys, bearer tokens, webhook secrets, production
+`.env` files, real E.164 phone numbers, call recordings, or transcripts in the
+initial report. Redact them. If a proof truly requires a live artifact, say so
+and wait for a private follow-up channel.
+
+## Scope notes
+
+Please preserve, and do not bypass in a public PoC, the existing controls:
+webhook signature checks, OpenAI delivery-id replay protection, destination
+policy, explicit call confirmation, and MCP bearer plus agent-user-id checks.

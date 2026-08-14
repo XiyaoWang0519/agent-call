@@ -1,5 +1,10 @@
 # poke-call → agent-call infra migration
 
+> Maintainer-only cutover notes for the private Fly.io rename. **Public users
+> and forks should ignore this file.** Provision your own Fly app name and
+> follow [self-hosting.md](self-hosting.md). Do not deploy to the maintainer's
+> `agent-call` application.
+
 Run this when there are **no active calls**. Configs in the repo already target
 `agent-call` / `agent-call.fly.dev`.
 

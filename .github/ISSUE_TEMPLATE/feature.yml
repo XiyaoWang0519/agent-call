@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest an idea or improvement
+title: "[Feature]: "
+labels: ["type/feature", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Agent Call is a single-owner, self-hosted reference implementation. Please read the README non-goals before proposing multi-tenant or hosted-product features.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve, and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Primary surface
+      options:
+        - MCP tools / agent behavior
+        - Call lifecycle / Twilio / OpenAI Realtime
+        - Persistence / configuration
+        - Security / policy / privacy
+        - Documentation / DX
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints you have considered
+      options:
+        - label: This can work in a single-owner, one-instance, SQLite deployment
+        - label: This does not require placing a live call to be designed
+        - label: This does not store or log extra personal call data by default

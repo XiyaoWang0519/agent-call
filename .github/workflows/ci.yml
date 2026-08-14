@@ -36,4 +36,5 @@ jobs:
         run: |
           uv run ruff format --check app tests scripts
           uv run ruff check app tests scripts
+          uv run mypy app
           uv run pytest -q --cov=app
