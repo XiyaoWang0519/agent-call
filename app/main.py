@@ -13,7 +13,7 @@ from app.db import Database
 from app.mcp_tools import register_tools
 from app.openai_client import create_openai_client
 from app.routes import debug, deployment, openai_webhooks, twilio_webhooks
-from app.security import MCPAuthMiddleware
+from app.security import MCPAuthMiddleware, WebhookBodyLimitMiddleware
 from app.settings import Settings
 
 logging.basicConfig(
@@ -122,6 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise BaseExceptionGroup("application lifespan cleanup failed", cleanup_errors)
 
     app = FastAPI(title="Agent Phone-Call Bridge", version="1.0.0", lifespan=lifespan)
+    app.add_middleware(WebhookBodyLimitMiddleware)
     app.state.settings = settings
     app.state.mcp = mcp
     app.include_router(openai_webhooks.router)

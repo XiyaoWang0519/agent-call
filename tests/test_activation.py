@@ -75,6 +75,132 @@ async def test_unmapped_incoming_sip_call_is_explicitly_rejected(service):
 
 
 @pytest.mark.asyncio
+async def test_incoming_sip_requires_exact_call_and_plan_headers(service, packet):
+    call_id = await seed_call(service.db, packet, openai_call_id=None)
+    plan_id = f"plan_{call_id}"
+
+    with pytest.raises(LookupError):
+        await service.handle_openai_incoming(
+            "rtc_missing_call_header",
+            [
+                {"name": "X-Plan-Id", "value": plan_id},
+                {"name": "X-Unrelated", "value": f"prefix {call_id} suffix"},
+            ],
+        )
+    with pytest.raises(LookupError):
+        await service.handle_openai_incoming(
+            "rtc_missing_plan_header",
+            [{"name": "X-Bridge-Call-Id", "value": call_id}],
+        )
+    with pytest.raises(LookupError):
+        await service.handle_openai_incoming(
+            "rtc_duplicate_header",
+            [
+                {"name": "X-Plan-Id", "value": plan_id},
+                {"name": "X-Bridge-Call-Id", "value": call_id},
+                {"name": "X-Bridge-Call-Id", "value": "call_other"},
+            ],
+        )
+    with pytest.raises(LookupError):
+        await service.handle_openai_incoming(
+            "rtc_malformed_header",
+            [
+                {"name": "X-Plan-Id", "value": plan_id},
+                {"name": "X-Bridge-Call-Id", "value": f"{call_id} extra"},
+            ],
+        )
+
+    assert service._test_realtime.rejects == [
+        "rtc_missing_call_header",
+        "rtc_missing_plan_header",
+        "rtc_duplicate_header",
+        "rtc_malformed_header",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_incoming_sip_binding_is_atomic(service, packet):
+    call_id = await seed_call(service.db, packet, openai_call_id=None)
+    plan_id = f"plan_{call_id}"
+    headers = [
+        {"name": "X-Plan-Id", "value": plan_id},
+        {"name": "X-Bridge-Call-Id", "value": call_id},
+    ]
+
+    results = await asyncio.gather(
+        service.handle_openai_incoming("rtc_first", headers),
+        service.handle_openai_incoming("rtc_second", headers),
+        return_exceptions=True,
+    )
+
+    assert sum(result == call_id for result in results) == 1
+    assert sum(isinstance(result, RuntimeError) for result in results) == 1
+    call = await service.db.get_call(call_id)
+    assert call["openai_call_id"] in {"rtc_first", "rtc_second"}
+    assert len(service._test_realtime.accepts) == 1
+    assert len(service._test_realtime.rejects) == 1
+
+
+@pytest.mark.asyncio
+async def test_realtime_error_logs_exclude_raw_provider_events(service, packet, caplog):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    provider_secret = "sk-provider-secret-123456789"
+
+    with caplog.at_level("INFO", logger="app.call_state"):
+        await service.handle_realtime_event(
+            call_id,
+            {
+                "type": "error",
+                "event_id": "evt_secret",
+                "error": {
+                    "code": "provider_error",
+                    "type": "invalid_request_error",
+                    "message": f"api_key={provider_secret}\ninvalid request",
+                },
+            },
+        )
+    await wait_background()
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "provider_error" in messages
+    assert "invalid_request_error" in messages
+    assert provider_secret not in messages
+    assert "evt_secret" not in messages
+
+
+@pytest.mark.asyncio
+async def test_failed_response_logs_exclude_raw_status_details(service, packet, caplog):
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    provider_secret = "whsec_provider-secret-123456789"
+
+    with caplog.at_level("ERROR", logger="app.call_state"):
+        await service.handle_realtime_event(
+            call_id,
+            {
+                "type": "response.done",
+                "event_id": "evt_secret",
+                "response": {
+                    "id": "resp_failed",
+                    "status": "failed",
+                    "status_details": {
+                        "error": {
+                            "code": "response_failed",
+                            "type": "server_error",
+                            "message": f"secret={provider_secret}",
+                        }
+                    },
+                },
+            },
+        )
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "response_failed" in messages
+    assert "server_error" in messages
+    assert provider_secret not in messages
+    assert "evt_secret" not in messages
+
+
+@pytest.mark.asyncio
 async def test_initial_session_update_mismatch_terminates_before_dialing(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.db.update_call(
