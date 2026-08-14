@@ -226,6 +226,52 @@ async def test_realtime_accept_has_a_total_wall_clock_deadline(settings, packet)
 
 
 @pytest.mark.asyncio
+async def test_realtime_accept_logs_only_allowlisted_response_metadata(settings, packet, caplog):
+    provider_secret = "sk-provider-secret-123456789"
+
+    async def accept(*args, **kwargs):
+        return SimpleNamespace(
+            status_code=200,
+            headers={
+                "x-request-id": "req_safe_123",
+                "authorization": f"Bearer {provider_secret}",
+            },
+            text=f"sensitive response {provider_secret}",
+        )
+
+    client = SimpleNamespace(
+        realtime=SimpleNamespace(
+            calls=SimpleNamespace(with_raw_response=SimpleNamespace(accept=accept))
+        )
+    )
+    bridge = RealtimeBridge(
+        settings,
+        client,
+        on_event=lambda *args: None,
+        on_open=lambda *args: None,
+        on_fatal=lambda *args: None,
+    )
+
+    async def no_sideband(_runtime):
+        return None
+
+    bridge._run = no_sideband
+    with caplog.at_level("INFO", logger="app.openai_realtime"):
+        await bridge.accept_and_connect(
+            call_id="call_1",
+            openai_call_id="rtc_1",
+            packet=packet,
+        )
+        await asyncio.sleep(0)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "status=200" in messages
+    assert "request_id=req_safe_123" in messages
+    assert provider_secret not in messages
+    assert "sensitive response" not in messages
+
+
+@pytest.mark.asyncio
 async def test_call_service_closes_only_internally_created_api_clients(settings, monkeypatch):
     owned = SimpleNamespace(closed=False)
     owned_exa = SimpleNamespace(closed=False)

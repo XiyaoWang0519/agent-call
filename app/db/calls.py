@@ -135,6 +135,16 @@ class CallsMixin:
         params.append(call_id)
         return await self._execute_cas(f"UPDATE calls SET {columns} WHERE call_id=?", params)
 
+    async def bind_openai_call(
+        self: DatabaseAccess, *, call_id: str, plan_id: str, openai_call_id: str
+    ) -> bool:
+        """Atomically bind one expected prewarming call to one OpenAI SIP call."""
+        return await self._execute_cas(
+            """UPDATE calls SET openai_call_id=?, last_event_at=?
+               WHERE call_id=? AND plan_id=? AND state=? AND openai_call_id IS NULL""",
+            (openai_call_id, _iso_now(), call_id, plan_id, CallState.PREWARMING.value),
+        )
+
     async def add_realtime_usage(
         self: DatabaseAccess,
         call_id: str,

@@ -28,6 +28,7 @@ from app.db import (
 )
 from app.exa_search import ExaSearchClient, ExaSearchError
 from app.finalizer import Finalizer
+from app.logging_safety import provider_error_fields
 from app.models import (
     TERMINAL_STATES,
     AdvisoryOutcome,
@@ -56,6 +57,9 @@ from app.settings import Settings
 from app.twilio_bridge import TwilioBridge
 
 logger = logging.getLogger(__name__)
+
+_CALL_ID_PATTERN = re.compile(r"^call_[A-Za-z0-9_-]{1,128}$")
+_PLAN_ID_PATTERN = re.compile(r"^plan_[A-Za-z0-9_-]{1,128}$")
 
 # Over SIP, response.done marks the end of audio *generation*; playback to the phone lags
 # behind because OpenAI drains a server-side output buffer in real time. Termination after a
@@ -589,24 +593,41 @@ class CallService:
     async def handle_openai_incoming(
         self, openai_call_id: str, sip_headers: list[dict[str, str]]
     ) -> str:
-        headers = {item.get("name", "").lower(): item.get("value", "") for item in sip_headers}
-        call_id = headers.get("x-bridge-call-id") or headers.get("x_bridge_call_id")
-        plan_id = headers.get("x-plan-id") or headers.get("x_plan_id")
-        if call_id is None:
-            joined = " ".join(headers.values())
-            for candidate in await self.db.list_nonterminal_calls():
-                if candidate["call_id"] in joined or candidate["plan_id"] in joined:
-                    call_id = candidate["call_id"]
-                    break
-        call = await self.db.get_call(call_id) if call_id else None
-        if call is None or call_id is None or (plan_id and call["plan_id"] != plan_id):
+        def exact_header(name: str) -> str | None:
+            values = [
+                item.get("value", "").strip()
+                for item in sip_headers
+                if item.get("name", "").strip().lower() == name
+            ]
+            return values[0] if len(values) == 1 else None
+
+        call_id = exact_header("x-bridge-call-id")
+        plan_id = exact_header("x-plan-id")
+        if (
+            call_id is None
+            or plan_id is None
+            or not _CALL_ID_PATTERN.fullmatch(call_id)
+            or not _PLAN_ID_PATTERN.fullmatch(plan_id)
+        ):
             await self.realtime.reject(openai_call_id)
             raise LookupError("incoming SIP call could not be mapped to an approved plan")
-        if call.get("openai_call_id") and call["openai_call_id"] != openai_call_id:
+
+        if not await self.db.bind_openai_call(
+            call_id=call_id,
+            plan_id=plan_id,
+            openai_call_id=openai_call_id,
+        ):
+            call = await self.db.get_call(call_id)
             await self.realtime.reject(openai_call_id)
-            raise RuntimeError("call already mapped to a different OpenAI call")
+            if call is not None and call.get("openai_call_id"):
+                raise RuntimeError("call already mapped to an OpenAI call")
+            raise LookupError("incoming SIP call could not be mapped to an approved plan")
+
+        call = await self.db.get_call(call_id)
+        if call is None:
+            await self.realtime.reject(openai_call_id)
+            raise LookupError("incoming SIP call could not be mapped to an approved plan")
         mapped_call_id = call_id
-        await self.db.update_call(mapped_call_id, openai_call_id=openai_call_id)
         plan = await self.db.get_plan(call["plan_id"])
         if plan is None:
             await self.realtime.reject(openai_call_id)
@@ -1019,11 +1040,15 @@ class CallService:
             if status in {"cancelled", "canceled"}:
                 await self.db.update_call(call_id, interruption_observed=1)
             elif status == "failed":
+                error_code, error_type, error_message = provider_error_fields(
+                    response.get("status_details")
+                )
                 logger.error(
-                    "realtime response failed call_id=%s status_details=%s event=%s",
+                    "realtime response failed call_id=%s error_code=%s error_type=%s message=%s",
                     call_id,
-                    response.get("status_details"),
-                    event,
+                    error_code,
+                    error_type,
+                    error_message,
                 )
             if event_type == "response.done":
                 await self._handle_voice_end_response_done(call_id, event)
@@ -1058,9 +1083,16 @@ class CallService:
             error = event.get("error") or {}
             if error.get("code") == "response_cancel_not_active":
                 # Benign race: the response we tried to cancel finished on its own.
-                logger.info("stale response.cancel ignored call_id=%s event=%s", call_id, event)
+                logger.info("stale response.cancel ignored call_id=%s", call_id)
                 return
-            logger.error("realtime error event call_id=%s event=%s", call_id, event)
+            error_code, error_type, error_message = provider_error_fields(error)
+            logger.error(
+                "realtime error call_id=%s error_code=%s error_type=%s message=%s",
+                call_id,
+                error_code,
+                error_type,
+                error_message,
+            )
             self._spawn(
                 self.terminate_call(call_id, "openai_fatal_error"),
                 name=f"terminate:{call_id}:openai-error",

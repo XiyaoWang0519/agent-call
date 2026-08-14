@@ -97,6 +97,16 @@ flyctl apps create YOUR_APP_NAME
 # If agent-call is taken — it is, for the maintainer — pick another name.
 # Update fly.toml `app`, `[env].PUBLIC_BASE_URL`, and any CI that references the app.
 flyctl volumes create agent_call_data --region lax --size 1 -a YOUR_APP_NAME
+
+# The service runs as fixed non-root UID 10001. The entrypoint also repairs
+# legacy root-owned volume contents during upgrades.
+flyctl machine run python:3.13-slim sleep infinity \
+  --app YOUR_APP_NAME --region lax --volume agent_call_data:/data \
+  --restart no --detach
+flyctl machine list -a YOUR_APP_NAME
+flyctl ssh console -a YOUR_APP_NAME -C \
+  'chown 10001:10001 /data && chmod 750 /data'
+flyctl machine destroy <maintenance-machine-id> -a YOUR_APP_NAME --force
 ```
 
 `fly.toml` as committed defines production at `https://agent-call.fly.dev`: one always-on shared-CPU machine, 512 MB RAM, a 1 GB volume at `/data`, and SQLite at `sqlite:////data/agent_call.db`. Change `app` and `PUBLIC_BASE_URL` before deploying a fork.

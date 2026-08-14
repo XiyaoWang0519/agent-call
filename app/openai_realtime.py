@@ -11,6 +11,7 @@ from typing import Any
 import websockets
 from openai import APIStatusError, AsyncOpenAI
 
+from app.logging_safety import provider_error_fields, request_id_from_headers, sanitize_log_text
 from app.models import (
     AcceptPayload,
     ContextPacket,
@@ -277,12 +278,21 @@ class RealtimeBridge:
                     openai_call_id, **payload.model_dump(exclude_none=True)
                 )
         except APIStatusError as exc:
+            error_code, error_type, error_message = provider_error_fields(
+                getattr(exc, "body", None)
+            )
+            request_id = request_id_from_headers(exc.response.headers)
+            if request_id is None:
+                request_id = sanitize_log_text(getattr(exc, "request_id", None), max_length=100)
             logger.error(
-                "OpenAI call accept response call_id=%s status=%s headers=%s body=%r",
+                "OpenAI call accept failed call_id=%s status=%s request_id=%s "
+                "error_code=%s error_type=%s message=%s",
                 call_id,
                 exc.status_code,
-                dict(exc.response.headers),
-                exc.response.text,
+                request_id,
+                error_code,
+                error_type,
+                error_message,
             )
             raise
         except TimeoutError:
@@ -292,13 +302,11 @@ class RealtimeBridge:
                 self.settings.openai_http_timeout_seconds,
             )
             raise
-        # The accept response is bodyless today; log every non-secret response field.
         logger.info(
-            "OpenAI call accept response call_id=%s status=%s headers=%s body=%r",
+            "OpenAI call accept response call_id=%s status=%s request_id=%s",
             call_id,
             raw.status_code,
-            dict(raw.headers),
-            raw.text,
+            request_id_from_headers(raw.headers),
         )
         if raw.status_code < 200 or raw.status_code >= 300:
             raise RuntimeError(f"OpenAI accept failed with HTTP {raw.status_code}")

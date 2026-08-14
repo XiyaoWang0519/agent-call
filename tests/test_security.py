@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
 from app.main import create_app
+from app.security import WebhookBodyLimitMiddleware
 from app.settings import Settings
 from tests.conftest import seed_call
 
@@ -206,6 +207,73 @@ def test_unsigned_and_invalid_openai_webhooks_rejected(settings):
         )
     assert unsigned.status_code == 400
     assert invalid.status_code == 400
+
+
+def test_oversized_openai_webhook_is_rejected_before_signature_parsing(settings):
+    app = create_app(settings)
+    body = b"x" * (256 * 1024 + 1)
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/openai",
+            content=body,
+            headers=_openai_headers(settings, body, "wh_oversized"),
+        )
+    assert response.status_code == 413
+
+
+def test_oversized_twilio_webhook_is_rejected_before_form_parsing(settings):
+    app = create_app(settings)
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/twilio/amd?call_id=call_none&plan_id=plan_none",
+            content=b"field=" + b"x" * (64 * 1024),
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+    assert response.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_chunked_webhook_body_cannot_bypass_size_limit():
+    downstream_called = False
+
+    async def downstream(scope, receive, send):
+        nonlocal downstream_called
+        downstream_called = True
+        while True:
+            message = await receive()
+            if not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    chunks = iter(
+        [
+            {"type": "http.request", "body": b"x" * (256 * 1024), "more_body": True},
+            {"type": "http.request", "body": b"x", "more_body": False},
+        ]
+    )
+    sent = []
+
+    async def receive():
+        return next(chunks)
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = WebhookBodyLimitMiddleware(downstream)
+    await middleware(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/webhooks/openai",
+            "headers": [],
+        },
+        receive,
+        send,
+    )
+
+    assert downstream_called is True
+    assert sent[0]["status"] == 413
 
 
 def test_openai_webhook_replay_is_rejected(settings):
