@@ -98,7 +98,8 @@ flyctl apps create YOUR_APP_NAME
 # Update fly.toml `app`, `[env].PUBLIC_BASE_URL`, and any CI that references the app.
 flyctl volumes create agent_call_data --region lax --size 1 -a YOUR_APP_NAME
 
-# The image runs as fixed non-root UID 10001. Initialize the empty volume once.
+# The service runs as fixed non-root UID 10001. The entrypoint also repairs
+# legacy root-owned volume contents during upgrades.
 flyctl machine run python:3.13-slim sleep infinity \
   --app YOUR_APP_NAME --region lax --volume agent_call_data:/data \
   --restart no --detach
