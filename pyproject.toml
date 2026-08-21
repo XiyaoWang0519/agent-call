@@ -27,6 +27,7 @@ classifiers = [
 ]
 dependencies = [
     "aiosqlite>=0.22.1",
+    "argon2-cffi>=23.1.0",
     "fastapi>=0.141.1",
     "fastmcp>=3.4.5",
     "httpx>=0.28.1",

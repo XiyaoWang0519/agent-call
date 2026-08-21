@@ -155,6 +155,88 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_call_questions_one_pending
     ON call_questions(call_id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS call_questions_call_seq_idx
     ON call_questions(call_id, sequence_number);
+
+CREATE TABLE IF NOT EXISTS oauth_runtime_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_sentinel TEXT NOT NULL,
+    owner_hash_fingerprint TEXT NOT NULL,
+    signing_key_fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    ciphertext TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_auth_transactions (
+    transaction_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL DEFAULT '',
+    csrf_hash TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_auth_transactions_expires_idx
+    ON oauth_auth_transactions(expires_at);
+
+CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
+    code_hash TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_authorization_codes_expires_idx
+    ON oauth_authorization_codes(expires_at);
+
+CREATE TABLE IF NOT EXISTS oauth_token_families (
+    family_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_token_families_expires_idx
+    ON oauth_token_families(expires_at);
+
+CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+    token_hash TEXT PRIMARY KEY,
+    family_id TEXT NOT NULL REFERENCES oauth_token_families(family_id),
+    client_id TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_refresh_tokens_family_idx
+    ON oauth_refresh_tokens(family_id);
+CREATE INDEX IF NOT EXISTS oauth_refresh_tokens_expires_idx
+    ON oauth_refresh_tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS oauth_access_jtis (
+    jti TEXT PRIMARY KEY,
+    family_id TEXT NOT NULL REFERENCES oauth_token_families(family_id),
+    expires_at TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_access_jtis_family_idx
+    ON oauth_access_jtis(family_id);
+
+CREATE TABLE IF NOT EXISTS oauth_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_audit_created_idx
+    ON oauth_audit(created_at);
 """
 
 
@@ -292,6 +374,16 @@ class DatabaseEngine:
             )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS calls_twilio_owner_idx ON calls(twilio_owner_call_sid)"
+        )
+        async with conn.execute("PRAGMA table_info(oauth_auth_transactions)") as cursor:
+            oauth_tx_cols = {row[1] for row in await cursor.fetchall()}
+        if "client_id" not in oauth_tx_cols:
+            await conn.execute(
+                "ALTER TABLE oauth_auth_transactions ADD COLUMN client_id TEXT NOT NULL DEFAULT ''"
+            )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS oauth_auth_transactions_client_idx "
+            "ON oauth_auth_transactions(client_id)"
         )
         await conn.commit()
 

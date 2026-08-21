@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.db.calls import CallsMixin
 from app.db.deployment import DEPLOYMENT_LOCK_TTL, DeploymentLockedError, DeploymentMixin
 from app.db.engine import DatabaseEngine
+from app.db.oauth import OAuthMixin
 from app.db.plans import PlansMixin
 from app.db.questions import QuestionsMixin
 from app.db.telemetry import LatencyMark, LatencyStage, TelemetryMixin
@@ -31,6 +32,7 @@ class Database(
     WebhooksMixin,
     TranscriptsMixin,
     QuestionsMixin,
+    OAuthMixin,
     DatabaseEngine,
 ):
     """Composed SQLite data-access facade; see app/db/engine.py and the per-concern mixins."""
