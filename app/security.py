@@ -8,10 +8,13 @@ from starlette.datastructures import FormData
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from twilio.request_validator import RequestValidator
 
+from app.grok_oauth.constants import CONSENT_BODY_MAX_BYTES, REGISTER_BODY_MAX_BYTES
 from app.settings import Settings
 
 OPENAI_WEBHOOK_BODY_MAX_BYTES = 256 * 1024
 TWILIO_WEBHOOK_BODY_MAX_BYTES = 64 * 1024
+GROK_OAUTH_CONSENT_BODY_MAX_BYTES = CONSENT_BODY_MAX_BYTES
+GROK_OAUTH_REGISTER_BODY_MAX_BYTES = REGISTER_BODY_MAX_BYTES
 
 
 class _RequestBodyTooLarge(Exception):
@@ -30,11 +33,19 @@ class WebhookBodyLimitMiddleware:
             return OPENAI_WEBHOOK_BODY_MAX_BYTES
         if path.startswith("/webhooks/twilio/"):
             return TWILIO_WEBHOOK_BODY_MAX_BYTES
+        if path == "/grok/oauth/consent":
+            return GROK_OAUTH_CONSENT_BODY_MAX_BYTES
+        if path == "/register":
+            return GROK_OAUTH_REGISTER_BODY_MAX_BYTES
         return None
 
     @staticmethod
-    async def _send_error(send: Send, status: int, detail: str) -> None:
-        body = f'{{"detail":"{detail}"}}'.encode()
+    async def _send_error(send: Send, status: int, detail: str, *, path: str = "") -> None:
+        if path == "/register":
+            error = "invalid_client_metadata" if status == 413 else "invalid_request"
+            body = f'{{"error":"{error}","error_description":"{detail}"}}'.encode()
+        else:
+            body = f'{{"detail":"{detail}"}}'.encode()
         await send(
             {
                 "type": "http.response.start",
@@ -51,7 +62,8 @@ class WebhookBodyLimitMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        limit = self._limit_for_path(str(scope.get("path", "")))
+        path = str(scope.get("path", ""))
+        limit = self._limit_for_path(path)
         if limit is None:
             await self.app(scope, receive, send)
             return
@@ -64,13 +76,13 @@ class WebhookBodyLimitMiddleware:
             try:
                 content_length = int(raw_content_length)
             except ValueError:
-                await self._send_error(send, 400, "invalid content-length")
+                await self._send_error(send, 400, "invalid content-length", path=path)
                 return
             if content_length < 0:
-                await self._send_error(send, 400, "invalid content-length")
+                await self._send_error(send, 400, "invalid content-length", path=path)
                 return
             if content_length > limit:
-                await self._send_error(send, 413, "request body too large")
+                await self._send_error(send, 413, "request body too large", path=path)
                 return
 
         received = 0
@@ -89,7 +101,7 @@ class WebhookBodyLimitMiddleware:
         try:
             await self.app(scope, limited_receive, send)
         except _RequestBodyTooLarge:
-            await self._send_error(send, 413, "request body too large")
+            await self._send_error(send, 413, "request body too large", path=path)
 
 
 def constant_time_equal(actual: str | None, expected: str) -> bool:

@@ -5,8 +5,15 @@ from collections.abc import Mapping
 from typing import Any
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]+")
-_NAMED_SECRET = re.compile(r"(?i)\b(authorization|api[_ -]?key|token|secret)\s*[:=]\s*\S+")
-_TOKEN_LIKE_VALUE = re.compile(r"\b(?:sk|whsec)[-_A-Za-z0-9]{12,}\b", re.IGNORECASE)
+_NAMED_SECRET = re.compile(
+    r"(?i)\b(authorization|api[_ -]?key|token|secret|owner_secret|code_verifier|"
+    r"refresh_token|access_token|client_secret)\s*[:=]\s*\S+"
+)
+_TOKEN_LIKE_VALUE = re.compile(
+    r"\b(?:sk|whsec)[-_A-Za-z0-9]{12,}\b|"
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+    re.IGNORECASE,
+)
 
 
 def sanitize_log_text(value: object, *, max_length: int = 240) -> str | None:

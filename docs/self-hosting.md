@@ -77,6 +77,8 @@ mcp_servers:
 
 Hermes has no inbound webhook today — leave `AGENT_PUSH_ENABLED=false` and rely on `wait_for_call_event` polling (fully supported; push is best-effort and non-canonical).
 
+**Grok Bot** (private custom MCP connector, not Grok Build): see [docs/grok-bot/README.md](grok-bot/README.md). OpenClaw and Hermes keep using `/mcp/` with both headers. Grok Bot should use the optional OAuth endpoint `/grok/mcp/` so the connector UI only needs Name and Server URL. OAuth is **off by default** and is a self-hosted, single-owner authorization flow — not a managed multi-tenant product. Leave `AGENT_PUSH_ENABLED=false` and poll `wait_for_call_event`.
+
 Manual MCP client config:
 
 ```text
@@ -87,6 +89,96 @@ Transport:       Streamable HTTP
 ```
 
 Both the bearer token and `X-Agent-User-Id` are required on every MCP request.
+
+## Optional Grok OAuth (self-hosted, single-owner)
+
+This is **not** the managed multi-tenant design. Each operator owns their
+deployment, domain, database, secrets, OAuth authorization, Twilio account, and
+OpenAI account. Operators who do not use Grok Bot leave OAuth disabled and keep
+the dual-header `/mcp/` setup.
+
+**Implemented locally; pending live Grok OAuth verification.**
+
+1. Generate a dedicated owner secret and store the plaintext only in a password
+   manager. Hash it; the server stores only the Argon2id hash:
+
+   ```bash
+   uv run python scripts/hash_grok_oauth_owner_secret.py
+   ```
+
+2. Generate signing and storage keys (`openssl rand -hex 32` for each).
+3. Set:
+
+   ```text
+   GROK_MCP_OAUTH_ENABLED=true
+   GROK_MCP_OAUTH_OWNER_SECRET_HASH=<argon2id hash>
+   GROK_MCP_OAUTH_SIGNING_KEY=<32+ character secret>
+   GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY=<32+ character secret>
+   GROK_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
+   GROK_MCP_OAUTH_REFRESH_TOKEN_TTL_DAYS=90
+   GROK_MCP_OAUTH_AUTH_CODE_TTL_SECONDS=300
+   ```
+
+4. Confirm no active calls, then deploy only after explicit approval.
+5. In Grok, add a custom connector using **only Name and Server URL**:
+   `https://YOUR_HOST/grok/mcp/`
+6. Complete browser authorization on this Agent Call instance. The owner secret
+   is entered on Agent Call's page; it never passes through Grok chat.
+7. Verify with `tools/list`, then `prepare_phone_call` only. Do not call
+   `start_phone_call` until you intend to place a billable call.
+
+Exact URLs when OAuth is enabled (`PUBLIC_BASE_URL=https://YOUR_HOST`):
+
+| Purpose | URL |
+| --- | --- |
+| Grok MCP (Streamable HTTP) | `https://YOUR_HOST/grok/mcp/` |
+| Protected resource metadata | `https://YOUR_HOST/.well-known/oauth-protected-resource/grok/mcp/` |
+| Authorization server metadata | `https://YOUR_HOST/.well-known/oauth-authorization-server` |
+| Authorize | `https://YOUR_HOST/authorize` |
+| Owner consent | `https://YOUR_HOST/grok/oauth/consent` |
+| Token | `https://YOUR_HOST/token` |
+| Client registration | `https://YOUR_HOST/register` |
+| Token revocation | `https://YOUR_HOST/revoke` |
+| Revoke all Grok families | `POST https://YOUR_HOST/internal/grok-oauth/revoke-all` with `Authorization: Bearer $DEBUG_API_TOKEN` |
+| Legacy MCP (unchanged) | `https://YOUR_HOST/mcp/` |
+
+Access tokens last **1 hour**. Refresh tokens last up to **90 days** and rotate
+on every use, so a normal access-token expiry does **not** require another owner
+login. Reauthentication is required when the refresh-token maximum lifetime
+expires, authorization is revoked, refresh-token reuse is detected, the
+connector is removed, the OAuth signing key or owner secret is rotated, or
+persistent OAuth state is cleared.
+
+Public `/register` (dynamic client registration) stays compatible with Grok's
+connector UI: there is no extra callback-URI allowlist. To keep SQLite bounded,
+the host stores at most **64** OAuth clients. Unused clients older than **30
+days** are evicted first; if the table is still full, the oldest unused clients
+are evicted to make room. A client counts as in use while it has an unrevoked
+refresh family that has not expired. If every remaining client is still in use,
+further registration is rejected.
+
+Each successful registration (and other OAuth lifecycle events) appends an
+`oauth_audit` row. Rows older than **90 days** are removed, and the table is
+capped at the **2048** newest records. Expired authorization codes, access
+JTIs, refresh tokens (consumed or not), and token families are deleted at
+process start and whenever a token pair is issued; valid durable refresh
+families are left untouched.
+
+Residual: unauthenticated DCR can still cause **bounded churn** (creating and
+evicting unused clients, rotating the newest 2048 audit rows). It cannot grow
+`oauth_clients` or `oauth_audit` without bound. Expired OAuth rows other than
+audit may linger until the next token issuance or process start if the host
+never issues tokens.
+
+Rotating `GROK_MCP_OAUTH_OWNER_SECRET_HASH` or `GROK_MCP_OAUTH_SIGNING_KEY`
+revokes existing Grok families on the next boot. Rotating
+`GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY` fails closed until the OAuth tables are
+intentionally cleared. Do not change these secrets while a call is active.
+
+Rollback: if a Grok OAuth deploy misbehaves, set `GROK_MCP_OAUTH_ENABLED=false`
+(or roll back the previous image) after the deployment lease is acquired. Legacy
+`/mcp/` clients are unaffected. Grok Voice remains out of scope. Real calls
+remain billable.
 
 ## Deploying (your own Fly app)
 

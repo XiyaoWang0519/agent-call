@@ -3,16 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 from fastmcp import FastMCP
 
 from app.call_state import CallService
 from app.db import Database
+from app.grok_oauth.constants import GROK_MCP_PATH
+from app.grok_oauth.provider import GrokOAuthProvider
 from app.mcp_tools import register_tools
 from app.openai_client import create_openai_client
-from app.routes import debug, deployment, openai_webhooks, twilio_webhooks
+from app.routes import debug, deployment, grok_oauth, openai_webhooks, twilio_webhooks
 from app.security import MCPAuthMiddleware, WebhookBodyLimitMiddleware
 from app.settings import Settings
 
@@ -50,6 +52,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     protected_mcp = MCPAuthMiddleware(mcp_http_app, settings)
 
+    grok_oauth_provider: GrokOAuthProvider | None = None
+    grok_mcp_app = None
+    if settings.grok_mcp_oauth_enabled:
+        grok_oauth_provider = GrokOAuthProvider(settings)
+        grok_mcp = FastMCP("Agent Phone-Call Bridge", auth=grok_oauth_provider)
+        register_tools(grok_mcp, get_service)
+        grok_mcp_app = grok_mcp.http_app(
+            path=GROK_MCP_PATH,
+            transport="streamable-http",
+            stateless_http=True,
+            json_response=True,
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.require_runtime_configuration()
@@ -63,13 +78,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             openai = create_openai_client(settings)
             service = CallService(settings, db, openai=openai)
             app.state.call_service = service
+            if grok_oauth_provider is not None:
+                grok_oauth_provider.attach_database(db)
+                await grok_oauth_provider.prepare_storage()
             # Recovery happens before the server accepts traffic.
             await service.recover_startup()
             # A successful restart completes the deployment lease. Failed or canceled
             # deployments are also bounded by the database lock's TTL.
             await db.release_deployment_lock()
             await service.start_watchdog()
-            async with mcp_http_app.lifespan(app):
+            async with AsyncExitStack() as stack:
+                await stack.enter_async_context(mcp_http_app.lifespan(app))
+                if grok_mcp_app is not None:
+                    await stack.enter_async_context(grok_mcp_app.lifespan(app))
                 yield
         except BaseException as exc:
             primary_error = exc
@@ -129,11 +150,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(twilio_webhooks.router)
     app.include_router(debug.router)
     app.include_router(deployment.router)
-    app.mount("/mcp", protected_mcp)
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    app.mount("/mcp", protected_mcp)
+    if grok_oauth_provider is not None and grok_mcp_app is not None:
+        app.state.grok_oauth = grok_oauth_provider
+        app.include_router(grok_oauth.router)
+        # Mounted last so FastAPI routes and /mcp keep precedence over the
+        # authenticated Grok app, whose OAuth discovery lives at the host root.
+        app.mount("/", grok_mcp_app)
 
     return app
 
