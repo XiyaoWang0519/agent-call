@@ -34,7 +34,7 @@ dependencies = [
     "phonenumbers>=9.0.37",
     "pydantic-settings>=2.14.2",
     "python-multipart>=0.0.32",
-    "twilio>=9.10.9",
+    "twilio>=9.11.0",
     "uvicorn>=0.52.3",
     "websockets>=17.0.1",
 ]
