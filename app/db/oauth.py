@@ -138,13 +138,56 @@ class OAuthMixin:
         csrf_hash: str,
         ciphertext: str,
         expires_at: str,
+        client_id: str = "",
     ) -> None:
         await self.execute(
             """INSERT INTO oauth_auth_transactions
-               (transaction_id, csrf_hash, ciphertext, expires_at, consumed, created_at)
-               VALUES (?, ?, ?, ?, 0, ?)""",
-            (transaction_id, csrf_hash, ciphertext, expires_at, _iso_now()),
+               (transaction_id, client_id, csrf_hash, ciphertext, expires_at, consumed, created_at)
+               VALUES (?, ?, ?, ?, ?, 0, ?)""",
+            (transaction_id, client_id, csrf_hash, ciphertext, expires_at, _iso_now()),
         )
+
+    async def oauth_create_transaction_with_quota(
+        self: DatabaseAccess,
+        *,
+        transaction_id: str,
+        client_id: str,
+        csrf_hash: str,
+        ciphertext: str,
+        expires_at: str,
+        max_transactions: int,
+        max_per_client: int,
+        now: str,
+    ) -> bool:
+        """Insert an authorization transaction after purging expired or consumed rows.
+
+        Returns False without inserting when the global or per-client outstanding
+        count is already at the configured bound.
+        """
+        async with self._immediate_transaction() as conn:
+            await conn.execute(
+                "DELETE FROM oauth_auth_transactions WHERE expires_at < ? OR consumed = 1",
+                (now,),
+            )
+            async with conn.execute("SELECT COUNT(*) FROM oauth_auth_transactions") as cursor:
+                count_row = await cursor.fetchone()
+            if int(count_row[0] if count_row else 0) >= max_transactions:
+                return False
+            async with conn.execute(
+                "SELECT COUNT(*) FROM oauth_auth_transactions WHERE client_id = ?",
+                (client_id,),
+            ) as cursor:
+                client_row = await cursor.fetchone()
+            if int(client_row[0] if client_row else 0) >= max_per_client:
+                return False
+            await conn.execute(
+                """INSERT INTO oauth_auth_transactions
+                   (transaction_id, client_id, csrf_hash, ciphertext, expires_at,
+                    consumed, created_at)
+                   VALUES (?, ?, ?, ?, ?, 0, ?)""",
+                (transaction_id, client_id, csrf_hash, ciphertext, expires_at, now),
+            )
+            return True
 
     async def oauth_get_transaction(
         self: DatabaseAccess, transaction_id: str

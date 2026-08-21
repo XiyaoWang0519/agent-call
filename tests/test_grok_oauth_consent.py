@@ -167,6 +167,31 @@ def test_interleaved_wrong_secrets_and_denies_cannot_reset_limiter(oauth_setting
         assert blocked.status_code == 429
 
 
+def test_invalid_transaction_posts_do_not_lock_out_owner(oauth_settings):
+    app = create_app(oauth_settings)
+    with TestClient(app) as client:
+        _, page = _begin_consent(client, oauth_settings)
+        for _ in range(FAILED_ATTEMPT_LIMIT):
+            bogus = submit_consent(
+                client,
+                html=page.text,
+                tx="bogus-transaction",
+                csrf_token="bogus-csrf",
+                owner_secret="nope",
+            )
+            assert bogus.status_code == 400
+        for _ in range(FAILED_ATTEMPT_LIMIT):
+            bad_csrf = submit_consent(
+                client,
+                html=page.text,
+                csrf_token="tampered-csrf",
+                owner_secret="nope",
+            )
+            assert bad_csrf.status_code == 400
+        approved = submit_consent(client, html=page.text)
+        assert approved.status_code == 302
+
+
 def test_owner_secret_limiter_is_account_wide_across_client_ips(oauth_settings):
     app = create_app(oauth_settings)
     with TestClient(app) as client:

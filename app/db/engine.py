@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 
 CREATE TABLE IF NOT EXISTS oauth_auth_transactions (
     transaction_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL DEFAULT '',
     csrf_hash TEXT NOT NULL,
     ciphertext TEXT NOT NULL,
     expires_at TEXT NOT NULL,
@@ -373,6 +374,16 @@ class DatabaseEngine:
             )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS calls_twilio_owner_idx ON calls(twilio_owner_call_sid)"
+        )
+        async with conn.execute("PRAGMA table_info(oauth_auth_transactions)") as cursor:
+            oauth_tx_cols = {row[1] for row in await cursor.fetchall()}
+        if "client_id" not in oauth_tx_cols:
+            await conn.execute(
+                "ALTER TABLE oauth_auth_transactions ADD COLUMN client_id TEXT NOT NULL DEFAULT ''"
+            )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS oauth_auth_transactions_client_idx "
+            "ON oauth_auth_transactions(client_id)"
         )
         await conn.commit()
 

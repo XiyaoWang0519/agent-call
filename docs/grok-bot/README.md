@@ -86,7 +86,8 @@ Set `PUBLIC_BASE_URL` to the tunnel origin (no trailing slash) before any live
 call. Prepare-only MCP checks do not need Twilio or OpenAI to succeed.
 
 Free-tier tunnel URLs change on restart; remove the old Grok connector and add
-the new URL.
+the new URL. Encrypted OAuth storage is not bound to `PUBLIC_BASE_URL`, so a
+tunnel restart does not require clearing OAuth tables.
 
 ## 2. Enable OAuth and add a Grok Bot custom MCP connector
 
@@ -98,9 +99,10 @@ On the Agent Call host (see [self-hosting](../self-hosting.md#optional-grok-oaut
    encryption key. Access tokens last one hour; refresh tokens last up to 90
    days and rotate on every use, so expiry of the access token does not require
    another login. Public `/register` is capped at 64 clients (unused clients
-   older than 30 days are eligible for eviction). OAuth audit rows are kept for
-   90 days and capped at 2048 newest records. Unauthenticated DCR can still
-   cause bounded churn but cannot grow those tables without bound. See
+   older than 30 days are eligible for eviction). Outstanding authorization
+   transactions are capped at 64 globally and 8 per client. OAuth audit rows are
+   kept for 90 days and capped at 2048 newest records. Unauthenticated DCR can
+   still cause bounded churn but cannot grow those tables without bound. See
    [self-hosting](../self-hosting.md#optional-grok-oauth-self-hosted-single-owner).
 4. Confirm no active calls, then deploy only after explicit approval.
 

@@ -159,17 +159,23 @@ further registration is rejected.
 
 Each successful registration (and other OAuth lifecycle events) appends an
 `oauth_audit` row. Rows older than **90 days** are removed, and the table is
-capped at the **2048** newest records. Expired authorization codes, access
-JTIs, refresh tokens (consumed or not), and token families are deleted at
-process start and whenever a token pair is issued; valid durable refresh
-families are left untouched.
+capped at the **2048** newest records. Outstanding authorization transactions
+are capped at **64** globally and **8** per client; expired or consumed
+transactions are deleted at process start, on each `/authorize`, and whenever a
+token pair is issued. Expired authorization codes, access JTIs, refresh tokens
+(consumed or not), and token families are deleted at process start and whenever
+a token pair is issued; valid durable refresh families are left untouched.
 
 Residual: unauthenticated DCR can still cause **bounded churn** (creating and
-evicting unused clients, rotating the newest 2048 audit rows). It cannot grow
-`oauth_clients` or `oauth_audit` without bound. Expired OAuth rows other than
-audit may linger until the next token issuance or process start if the host
-never issues tokens.
+evicting unused clients, rotating the newest 2048 audit rows, filling the
+authorization-transaction cap until rows expire). It cannot grow
+`oauth_clients`, `oauth_audit`, or `oauth_auth_transactions` without bound.
+Expired OAuth rows other than audit and authorization transactions may linger
+until the next token issuance or process start if the host never issues tokens.
 
+Changing `PUBLIC_BASE_URL` (including a free-tier tunnel restart) does not
+re-derive the storage encryption key. Existing OAuth ciphertext stays readable;
+the operator still removes the old Grok connector and adds the new URL.
 Rotating `GROK_MCP_OAUTH_OWNER_SECRET_HASH` or `GROK_MCP_OAUTH_SIGNING_KEY`
 revokes existing Grok families on the next boot. Rotating
 `GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY` fails closed until the OAuth tables are

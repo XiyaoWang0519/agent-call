@@ -31,6 +31,7 @@ from app.grok_oauth.constants import (
     GROK_OAUTH_CONSENT_PATH,
     GROK_OAUTH_SCOPE,
     GROK_OAUTH_SUBJECT,
+    OAUTH_STORAGE_KEY_SALT,
     OWNER_SECRET_RATE_LIMIT_KEY,
 )
 from app.grok_oauth.crypto import (
@@ -95,8 +96,8 @@ class GrokOAuthProvider(OAuthProvider):
         signing_material = Settings.reveal(settings.grok_mcp_oauth_signing_key)
         storage_material = Settings.reveal(settings.grok_mcp_oauth_storage_encryption_key)
         self._owner_secret_hash = owner_hash
-        self._fernet = derive_storage_fernet(storage_material, salt=issuer)
-        self._mac_key = derive_mac_key(storage_material, salt=issuer)
+        self._fernet = derive_storage_fernet(storage_material, salt=OAUTH_STORAGE_KEY_SALT)
+        self._mac_key = derive_mac_key(storage_material, salt=OAUTH_STORAGE_KEY_SALT)
         self._issuer = AccessTokenIssuer(
             issuer=issuer,
             audience=resource,
@@ -246,7 +247,8 @@ class GrokOAuthProvider(OAuthProvider):
         scopes = self._scopes(params.scopes)
         transaction_id = new_token()
         csrf_token = new_token()
-        expires_at = datetime.now(UTC) + timedelta(seconds=self.auth_code_ttl)
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=self.auth_code_ttl)
         payload = {
             "client_id": client.client_id,
             "client_name": client.client_name,
@@ -258,12 +260,21 @@ class GrokOAuthProvider(OAuthProvider):
             "code_challenge": params.code_challenge,
             "csrf_token": csrf_token,
         }
-        await self._store().oauth_create_transaction(
+        inserted = await self._store().oauth_create_transaction_with_quota(
             transaction_id=transaction_id,
+            client_id=client.client_id,
             csrf_hash=self.hash_secret_material(csrf_token),
             ciphertext=self.encrypt_payload(payload),
             expires_at=expires_at.isoformat(),
+            max_transactions=grok_oauth_constants.OAUTH_TRANSACTION_MAX_COUNT,
+            max_per_client=grok_oauth_constants.OAUTH_TRANSACTION_MAX_PER_CLIENT,
+            now=now.isoformat(),
         )
+        if not inserted:
+            raise AuthorizeError(
+                error="invalid_request",
+                error_description="authorization request quota exceeded",
+            )
         logger.info(
             "oauth authorization started client_id=%s transaction_id=%s",
             client.client_id,

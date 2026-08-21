@@ -516,6 +516,28 @@ def test_oauth_logs_do_not_contain_secrets(oauth_settings, caplog):
     assert registered["client_secret"] not in combined
 
 
+def test_public_base_url_change_keeps_encrypted_oauth_storage(oauth_settings):
+    app = create_app(oauth_settings)
+    with TestClient(app) as client:
+        registered = register_test_client(client)
+    values = oauth_settings.model_dump()
+    values["public_base_url"] = "https://new-tunnel.example.test"
+    rotated = Settings(**values)
+    restarted = create_app(rotated)
+    with TestClient(restarted) as client:
+        assert client.get("/healthz").status_code == 200
+        _, challenge = pkce_pair()
+        authorize = start_authorization(
+            client,
+            client_id=registered["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=grok_mcp_resource(rotated.public_base_url or ""),
+        )
+        assert authorize.status_code == 302
+        assert GROK_OAUTH_CONSENT_PATH in authorize.headers["location"]
+
+
 def test_wrong_storage_key_fails_closed(oauth_settings):
     app = create_app(oauth_settings)
     with TestClient(app) as client:
@@ -692,6 +714,96 @@ def test_registration_quota_evicts_unused_clients_and_rejects_when_full(
         assert _client_count(oauth_settings.database_path) == 2
 
 
+def test_authorization_transactions_are_purged_and_bounded(oauth_settings, monkeypatch):
+    monkeypatch.setattr("app.grok_oauth.constants.OAUTH_TRANSACTION_MAX_COUNT", 2)
+    monkeypatch.setattr("app.grok_oauth.constants.OAUTH_TRANSACTION_MAX_PER_CLIENT", 2)
+    app = create_app(oauth_settings)
+    resource = grok_mcp_resource(oauth_settings.public_base_url or "")
+    with TestClient(app) as client:
+        registered = register_test_client(client)
+        _, challenge = pkce_pair()
+        first = start_authorization(
+            client,
+            client_id=registered["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=resource,
+        )
+        second = start_authorization(
+            client,
+            client_id=registered["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=resource,
+        )
+        assert first.status_code == 302
+        assert second.status_code == 302
+        blocked = start_authorization(
+            client,
+            client_id=registered["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=resource,
+        )
+        _assert_pkce_rejected(client, blocked)
+        assert _table_count(oauth_settings.database_path, "oauth_auth_transactions") == 2
+
+        past = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        conn = sqlite3.connect(oauth_settings.database_path)
+        try:
+            conn.execute("UPDATE oauth_auth_transactions SET expires_at = ?", (past,))
+            conn.commit()
+        finally:
+            conn.close()
+        after_purge = start_authorization(
+            client,
+            client_id=registered["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=resource,
+        )
+        assert after_purge.status_code == 302
+        assert GROK_OAUTH_CONSENT_PATH in after_purge.headers["location"]
+        assert _table_count(oauth_settings.database_path, "oauth_auth_transactions") == 1
+
+
+def test_authorization_transaction_quota_is_per_client(oauth_settings, monkeypatch):
+    monkeypatch.setattr("app.grok_oauth.constants.OAUTH_TRANSACTION_MAX_COUNT", 8)
+    monkeypatch.setattr("app.grok_oauth.constants.OAUTH_TRANSACTION_MAX_PER_CLIENT", 1)
+    app = create_app(oauth_settings)
+    resource = grok_mcp_resource(oauth_settings.public_base_url or "")
+    with TestClient(app) as client:
+        first = register_test_client(client, client_name="one")
+        second = register_test_client(client, client_name="two")
+        _, challenge = pkce_pair()
+        allowed = start_authorization(
+            client,
+            client_id=first["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=resource,
+        )
+        blocked = start_authorization(
+            client,
+            client_id=first["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=resource,
+        )
+        other = start_authorization(
+            client,
+            client_id=second["client_id"],
+            redirect_uri="https://grok.example/callback",
+            challenge=challenge,
+            resource=resource,
+        )
+        assert allowed.status_code == 302
+        _assert_pkce_rejected(client, blocked)
+        assert other.status_code == 302
+        assert GROK_OAUTH_CONSENT_PATH in other.headers["location"]
+        assert _table_count(oauth_settings.database_path, "oauth_auth_transactions") == 2
+
+
 def test_registration_retention_purges_unused_clients(oauth_settings, monkeypatch):
     monkeypatch.setattr("app.grok_oauth.constants.OAUTH_CLIENT_UNUSED_RETENTION_SECONDS", 0)
     app = create_app(oauth_settings)
@@ -738,6 +850,56 @@ async def test_oauth_audit_insert_prunes_old_rows_and_caps_newest(database, monk
     assert len(rows) == 3
     assert all(row["event"] == "client_registered" for row in rows)
     assert [json.loads(str(row["metadata_json"]))["n"] for row in rows] == [3, 4, 5]
+
+
+async def test_oauth_create_transaction_with_quota_purges_and_enforces_bounds(database):
+    now = datetime.now(UTC)
+    past = (now - timedelta(minutes=10)).isoformat()
+    future = (now + timedelta(minutes=5)).isoformat()
+    await database.oauth_create_transaction(
+        transaction_id="expired-tx",
+        client_id="client-1",
+        csrf_hash="csrf",
+        ciphertext="cipher",
+        expires_at=past,
+    )
+    inserted = await database.oauth_create_transaction_with_quota(
+        transaction_id="live-tx",
+        client_id="client-1",
+        csrf_hash="csrf",
+        ciphertext="cipher",
+        expires_at=future,
+        max_transactions=1,
+        max_per_client=1,
+        now=now.isoformat(),
+    )
+    assert inserted is True
+    blocked = await database.oauth_create_transaction_with_quota(
+        transaction_id="overflow-tx",
+        client_id="client-1",
+        csrf_hash="csrf",
+        ciphertext="cipher",
+        expires_at=future,
+        max_transactions=8,
+        max_per_client=1,
+        now=now.isoformat(),
+    )
+    assert blocked is False
+    other = await database.oauth_create_transaction_with_quota(
+        transaction_id="other-tx",
+        client_id="client-2",
+        csrf_hash="csrf",
+        ciphertext="cipher",
+        expires_at=future,
+        max_transactions=8,
+        max_per_client=1,
+        now=now.isoformat(),
+    )
+    assert other is True
+    rows = await database.fetch_all(
+        "SELECT transaction_id FROM oauth_auth_transactions ORDER BY transaction_id"
+    )
+    assert [row["transaction_id"] for row in rows] == ["live-tx", "other-tx"]
 
 
 async def test_oauth_purge_expired_removes_unconsumed_refresh_and_expired_families(database):

@@ -52,7 +52,6 @@ async def grok_oauth_consent_submit(request: Request) -> Response:
     owner_secret = str(form.get("owner_secret") or "")
     transaction = await provider.load_transaction(transaction_id)
     if transaction is None or not provider.verify_csrf(transaction, csrf_token):
-        provider.record_failed_attempt(key)
         return secure_html(consent_error_page(GENERIC_FAILURE), status_code=400)
 
     if action == "deny":
