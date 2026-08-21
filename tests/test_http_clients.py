@@ -73,7 +73,7 @@ def test_openai_client_has_bounded_timeouts_and_no_sdk_retries(settings, monkeyp
         observed["client_options"] = kwargs
         return SimpleNamespace()
 
-    monkeypatch.setattr("app.openai_client.httpx.AsyncClient", fake_http_client)
+    monkeypatch.setattr("app.openai_client.DefaultAsyncHttpx2Client", fake_http_client)
     monkeypatch.setattr("app.openai_client.AsyncOpenAI", fake_openai)
 
     create_openai_client(settings)
@@ -96,7 +96,7 @@ def test_openai_control_timeouts_are_configurable(settings, monkeypatch):
     configured = Settings(**values)
     observed: dict[str, object] = {}
     monkeypatch.setattr(
-        "app.openai_client.httpx.AsyncClient",
+        "app.openai_client.DefaultAsyncHttpx2Client",
         lambda **kwargs: observed.update(transport_options=kwargs) or object(),
     )
     monkeypatch.setattr(
@@ -126,7 +126,7 @@ def test_openai_keepalive_expiry_is_configurable(settings, monkeypatch):
         observed["client_options"] = kwargs
         return SimpleNamespace()
 
-    monkeypatch.setattr("app.openai_client.httpx.AsyncClient", fake_http_client)
+    monkeypatch.setattr("app.openai_client.DefaultAsyncHttpx2Client", fake_http_client)
     monkeypatch.setattr("app.openai_client.AsyncOpenAI", fake_openai)
 
     create_openai_client(configured)
