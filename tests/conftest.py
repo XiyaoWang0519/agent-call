@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from argon2 import PasswordHasher
 from pydantic import SecretStr
 
 from app.call_state import CallService
@@ -48,6 +49,25 @@ def settings(tmp_path: Path) -> Settings:
         setup_deadline_seconds=60,
         watchdog_stale_seconds=15,
     )
+
+
+GROK_OAUTH_OWNER_SECRET = "owner-secret-for-tests"
+_GROK_OAUTH_HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
+GROK_OAUTH_OWNER_SECRET_HASH = _GROK_OAUTH_HASHER.hash(GROK_OAUTH_OWNER_SECRET)
+
+
+@pytest.fixture
+def oauth_settings(settings: Settings) -> Settings:
+    values = settings.model_dump()
+    values.update(
+        {
+            "grok_mcp_oauth_enabled": True,
+            "grok_mcp_oauth_owner_secret_hash": SecretStr(GROK_OAUTH_OWNER_SECRET_HASH),
+            "grok_mcp_oauth_signing_key": SecretStr("s" * 64),
+            "grok_mcp_oauth_storage_encryption_key": SecretStr("e" * 64),
+        }
+    )
+    return Settings(**values)
 
 
 @pytest.fixture

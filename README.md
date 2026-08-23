@@ -8,7 +8,7 @@
 
 Agent Call is a **self-hosted, single-owner MCP bridge** that connects an AI agent to outbound phone calls through [OpenAI Realtime SIP](https://developers.openai.com/api/docs/guides/realtime-sip) and [Twilio](https://www.twilio.com).
 
-An MCP client such as OpenClaw or Hermes Agent prepares, confirms, starts, monitors, and ends calls. Twilio places an OpenAI SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite stores plans, call state, ordered transcripts, and deterministic final results.
+An MCP client such as OpenClaw, Hermes Agent, or a private Grok Bot custom MCP connector prepares, confirms, starts, monitors, and ends calls. Twilio places an OpenAI SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite stores plans, call state, ordered transcripts, and deterministic final results.
 
 ## Project status
 
@@ -39,7 +39,7 @@ This is an **early-stage / v0.x self-hosted reference implementation**. Package 
 
 ## Safety properties
 
-- The MCP endpoint requires its bearer token **and** a matching `X-Agent-User-Id` on every request.
+- The legacy MCP endpoint (`/mcp/`) requires its bearer token **and** a matching `X-Agent-User-Id` on every request. Optional Grok OAuth on `/grok/mcp/` is disabled by default and does not replace that gate.
 - Every OpenAI and Twilio webhook is signature-verified; OpenAI delivery IDs are replay-protected.
 - A call cannot start without an unexpired prepared plan **and** explicit confirmation text.
 - Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
@@ -66,7 +66,7 @@ uv run pytest -q --cov=app
 
 CI on pull requests runs the Ruff and coverage-gated pytest commands above (85% `app` coverage floor). `mypy` is required by local pre-commit hooks and by the production deploy workflow; it is not a job in `.github/workflows/ci.yml`.
 
-Optional dummy-credential boot (still no real call): `scripts/live_smoke.sh` starts the app with placeholder secrets and drives `/healthz` plus a few MCP requests.
+Optional dummy-credential boot (still no real call): `scripts/live_smoke.sh` starts the app with placeholder secrets and drives `/healthz` plus a Grok-compatible Streamable HTTP MCP handshake (`initialize`, exactly seven tools, `prepare_phone_call` with a persisted `plan_id`, rejection when either MCP credential is missing, and confirmation that Grok OAuth stays closed when disabled).
 
 ## How a call happens
 
@@ -147,6 +147,7 @@ Both exit nonzero if any gate fails. The debug evidence endpoint they use requir
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | Components, state machine, SQLite, webhooks, confirmation, finalization |
 | [docs/self-hosting.md](docs/self-hosting.md) | Environment, tunnels, Fly.io/Render, rollback, tuning, live-schema notes |
+| [docs/grok-bot/README.md](docs/grok-bot/README.md) | Private Grok Bot custom MCP connector, optional OAuth, copy-paste skill, Dev Phone |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Credential-free setup, lint/test commands, PR expectations |
 | [SECURITY.md](SECURITY.md) | Vulnerability reporting |
 | [SUPPORT.md](SUPPORT.md) | Questions and bug reports |
@@ -161,7 +162,7 @@ Maintainer-only notes for the private poke-call → agent-call Fly rename live i
 
 | Piece | Job |
 | --- | --- |
-| OpenClaw / Hermes Agent | MCP client, call intent, optional OpenClaw webhook wake |
+| OpenClaw / Hermes Agent / Grok Bot | MCP client, call intent, optional OpenClaw webhook wake |
 | [OpenAI Realtime SIP](https://developers.openai.com/api/docs/guides/realtime-sip) | Voice agent, accept, sideband control |
 | [Twilio](https://www.twilio.com) | Conference, callee dial, answering-machine detection |
 | [Exa](https://exa.ai) | In-call public-web search |

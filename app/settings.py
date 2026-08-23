@@ -10,6 +10,17 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.grok_oauth.constants import (
+    ACCESS_TOKEN_TTL_MAX_SECONDS,
+    ACCESS_TOKEN_TTL_MIN_SECONDS,
+    AUTH_CODE_TTL_MAX_SECONDS,
+    AUTH_CODE_TTL_MIN_SECONDS,
+    DEPLOYMENT_SECRET_MIN_LENGTH,
+    REFRESH_TOKEN_TTL_MAX_DAYS,
+    REFRESH_TOKEN_TTL_MIN_DAYS,
+)
+from app.grok_oauth.crypto import is_argon2id_hash
+
 SUPPORTED_TRANSCRIPTION_MODELS = frozenset(
     {
         "whisper-1",
@@ -41,6 +52,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     openai_api_key: SecretStr | None = None
@@ -85,6 +97,14 @@ class Settings(BaseSettings):
     plan_ttl_seconds: Literal[600] = 600
     max_call_seconds: Literal[600] = 600
     owner_timezone: str = "America/Los_Angeles"
+
+    grok_mcp_oauth_enabled: bool = False
+    grok_mcp_oauth_owner_secret_hash: SecretStr | None = None
+    grok_mcp_oauth_signing_key: SecretStr | None = None
+    grok_mcp_oauth_storage_encryption_key: SecretStr | None = None
+    grok_mcp_oauth_access_token_ttl_seconds: int = 3600
+    grok_mcp_oauth_refresh_token_ttl_days: int = 90
+    grok_mcp_oauth_auth_code_ttl_seconds: int = 300
 
     # Cost tracking (estimated pricing, USD per 1M tokens unless noted)
     realtime_text_input_price_per_1m: float = Field(default=4.00, ge=0)
@@ -196,6 +216,53 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_grok_oauth_configuration(self) -> Settings:
+        if not self.grok_mcp_oauth_enabled:
+            return self
+        missing: list[str] = []
+        owner_hash = self.grok_mcp_oauth_owner_secret_hash
+        signing_key = self.grok_mcp_oauth_signing_key
+        storage_key = self.grok_mcp_oauth_storage_encryption_key
+        if owner_hash is None or not owner_hash.get_secret_value().strip():
+            missing.append("GROK_MCP_OAUTH_OWNER_SECRET_HASH")
+        if signing_key is None or not signing_key.get_secret_value().strip():
+            missing.append("GROK_MCP_OAUTH_SIGNING_KEY")
+        if storage_key is None or not storage_key.get_secret_value().strip():
+            missing.append("GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY")
+        if not self.public_base_url:
+            missing.append("PUBLIC_BASE_URL")
+        if missing:
+            raise ValueError("GROK_MCP_OAUTH_ENABLED requires " + ", ".join(missing))
+        assert owner_hash is not None
+        assert signing_key is not None
+        assert storage_key is not None
+        if not is_argon2id_hash(owner_hash.get_secret_value()):
+            raise ValueError("GROK_MCP_OAUTH_OWNER_SECRET_HASH must be an Argon2id hash")
+        if len(signing_key.get_secret_value().strip()) < DEPLOYMENT_SECRET_MIN_LENGTH:
+            raise ValueError("GROK_MCP_OAUTH_SIGNING_KEY is too short")
+        if len(storage_key.get_secret_value().strip()) < DEPLOYMENT_SECRET_MIN_LENGTH:
+            raise ValueError("GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY is too short")
+        if not (
+            ACCESS_TOKEN_TTL_MIN_SECONDS
+            <= self.grok_mcp_oauth_access_token_ttl_seconds
+            <= ACCESS_TOKEN_TTL_MAX_SECONDS
+        ):
+            raise ValueError("GROK_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS is outside the allowed range")
+        if not (
+            REFRESH_TOKEN_TTL_MIN_DAYS
+            <= self.grok_mcp_oauth_refresh_token_ttl_days
+            <= REFRESH_TOKEN_TTL_MAX_DAYS
+        ):
+            raise ValueError("GROK_MCP_OAUTH_REFRESH_TOKEN_TTL_DAYS is outside the allowed range")
+        if not (
+            AUTH_CODE_TTL_MIN_SECONDS
+            <= self.grok_mcp_oauth_auth_code_ttl_seconds
+            <= AUTH_CODE_TTL_MAX_SECONDS
+        ):
+            raise ValueError("GROK_MCP_OAUTH_AUTH_CODE_TTL_SECONDS is outside the allowed range")
+        return self
+
     @cached_property
     def database_path(self) -> Path:
         prefix = "sqlite:///"
@@ -230,6 +297,17 @@ class Settings(BaseSettings):
             if isinstance(value, str):
                 return not value.strip()
             return False
+
+        if self.grok_mcp_oauth_enabled:
+            required.update(
+                {
+                    "GROK_MCP_OAUTH_OWNER_SECRET_HASH": self.grok_mcp_oauth_owner_secret_hash,
+                    "GROK_MCP_OAUTH_SIGNING_KEY": self.grok_mcp_oauth_signing_key,
+                    "GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY": (
+                        self.grok_mcp_oauth_storage_encryption_key
+                    ),
+                }
+            )
 
         missing = [name for name, value in required.items() if is_missing(value)]
         if missing:
