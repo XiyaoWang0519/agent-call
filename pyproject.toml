@@ -31,6 +31,7 @@ dependencies = [
     "fastapi>=0.141.1",
     "fastmcp>=3.4.5",
     "httpx>=0.28.1",
+    "httpx2>=2.12.0",
     "openai>=2.51.0",
     "phonenumbers>=9.0.37",
     "pydantic-settings>=2.14.2",
