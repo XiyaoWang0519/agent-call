@@ -54,6 +54,17 @@ async def test_app_lifespan_bounds_a_hung_cleanup_step(settings, monkeypatch):
             attempts.append("service")
             await asyncio.Event().wait()
 
+    class ClosingClient:
+        async def close(self) -> None:
+            attempts.append("openai")
+
+    async def close_database(self) -> None:
+        attempts.append("database")
+
+    # Later cleanup steps inherit the same 50ms bound as the hung stop. Stub them
+    # so a slow runner cannot turn that single TimeoutError into an ExceptionGroup.
+    monkeypatch.setattr("app.main.create_openai_client", lambda _: ClosingClient())
+    monkeypatch.setattr("app.main.Database.close", close_database)
     monkeypatch.setattr("app.main.CallService", HangingStopService)
     application = create_app(settings)
 
@@ -64,7 +75,7 @@ async def test_app_lifespan_bounds_a_hung_cleanup_step(settings, monkeypatch):
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(run_lifespan(), timeout=5)
 
-    assert attempts == ["service"]
+    assert attempts == ["service", "openai", "database"]
 
 
 @pytest.mark.asyncio
