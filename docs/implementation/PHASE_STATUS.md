@@ -18,7 +18,7 @@
 
 | Field | Value |
 | --- | --- |
-| Commit SHA | `8e8f19989604e06efe032bb343dd237bb8f165a7` (dockerignore allowlist; doctor `ff56668`; squash `089ed0f`; origin/main `c2964b5`) |
+| Commit SHA | `0ee257e3a9059641f7b76160035e849e8f101b68` (verification record; allowlist `8e8f199`; doctor `ff56668`; squash `089ed0f`; origin/main `c2964b5`) |
 | Public artifact versions/digests | none published (no signed wheel/image in this increment) |
 | Database migration version | unchanged SQLite schema; no migration |
 | Enabled flags | `AGENT_CALL_PROFILE` is unset by default in Settings (`effective_profile` is `live`). `agent-call serve` uses that Settings object for bind policy and refuses an unset profile when any core runtime credential is present (process env or dotenv). Dummy/Compose set `evaluation` explicitly. |
