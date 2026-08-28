@@ -8,11 +8,11 @@ exit:0
 Success: no issues found in 51 source files
 exit:0
 === pytest --cov=app ===
-475 passed in 70.50s (0:01:10)
+482 passed in 68.90s (0:01:08)
 ================================ tests coverage ================================
 coverage: platform darwin, python 3.13.12-final-0
-TOTAL 5845 stmts, 701 miss, 88%
-Required test coverage of 85.0% reached. Total coverage: 88.01%
+TOTAL 5847 stmts, 700 miss, 88%
+Required test coverage of 85.0% reached. Total coverage: 88.03%
 pytest_exit:0
 === pre-commit run --all-files ===
 ruff (legacy alias)......................................................Passed
@@ -25,3 +25,8 @@ trim trailing whitespace.................................................Passed
 Detect hardcoded secrets.................................................Passed
 mypy.....................................................................Passed
 exit:0
+=== gitleaks git . --log-opts=HEAD --redact --no-banner ===
+104 commits scanned.
+scanned ~2204741 bytes (2.20 MB)
+no leaks found
+gitleaks_exit:0

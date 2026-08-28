@@ -2,6 +2,7 @@
 Docker Compose version v2.36.0-desktop.1
 === docker info ===
 docker_info_exit:1
+Cannot connect to the Docker daemon at unix:///Users/xiyaowang/.docker/run/docker.sock. Is the docker daemon running?
 === docker compose config ===
 compose_config_exit:0
 === docker compose up --build ===
@@ -9,3 +10,5 @@ skipped: Docker daemon is not running (docker info exit 1)
 up_exit:skipped
 === restart persistence probe ===
 skipped: Compose volume persistence was not exercised because the daemon is unavailable
+Image build context was not packed or sent. .dockerignore is enforced by
+tests/test_container_security.py, not by a live `docker build`.

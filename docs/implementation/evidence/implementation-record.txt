@@ -4,7 +4,7 @@ Branch: phase1-sanitized
 origin/main (ancestor): c2964b5868eccf593844336096f99a0f55914675
 Phase 1 squash: 089ed0f2821d839192897d286ade89aff95adb39
 SQLite doctor: ff56668911b98208c202e6275d5db210a3962acf
-Verification record: 3d89caa430f6cfaa91ee2f0d289ce0c1a21a5607
+Docker allowlist: 8e8f19989604e06efe032bb343dd237bb8f165a7
 Date: 2026-08-28
 
 Commands (all exit 0 unless noted):
@@ -13,10 +13,11 @@ Commands (all exit 0 unless noted):
 - uv run ruff check app tests scripts
 - uv run mypy app
 - uv run pytest -q --cov=app
-  Result: 475 passed, app coverage 88% (88.01%, fail_under 85)
+  Result: 482 passed, app coverage 88% (88.03%, fail_under 85)
 - uv run pre-commit run --all-files
 - docker compose config -q (exit 0)
 - git diff --check origin/main...HEAD
+- gitleaks git . --log-opts=HEAD --redact --no-banner (104 commits, no leaks)
 - uv run agent-call doctor --dummy
 - uv run python -m app doctor --dummy
 
@@ -25,7 +26,11 @@ Gating tests:
   17 passed)
 - tests/test_doctor.py (missing/blank/malformed; sqlite /dev/null, directory,
   corrupt file, connect/write failure, existing DB unchanged, new path with no
-  artifacts; invalid origin; mocked healthy HTTPS; no secret print; 32 passed)
+  artifacts, zero-byte file as new location, missing parent conservative
+  failure; invalid origin; mocked healthy HTTPS; no secret print; 34 passed)
+- tests/test_container_security.py (dockerignore exists; COPY sources kept;
+  .git/.env/.venv/caches/coverage/databases excluded; no COPY . .; no secret
+  config in COPY; 8 passed)
 - tests/test_fork_safety.py (golden paths plus upstream-maintainer-only workflow
   job guard; 5 passed)
 - tests/test_smoke_prepare.py (initialize, seven tools, prepare, never start;
@@ -36,22 +41,26 @@ Dummy boot (source):
 - AGENT_CALL_PROFILE=evaluation uvicorn app.main:app --host 127.0.0.1 --port 8767
 - GET /healthz twice -> {"status":"ok"}
   See healthz-1.json healthz-2.json
-  (source dummy boot from the prior increment; not re-run in this history rebuild)
+  (source dummy boot from the prior increment; not re-run in this increment)
 
-Compose:
+Compose / image build:
 - docker compose version v2.36.0-desktop.1
 - docker compose config -q -> 0
 - docker compose up --build skipped: Docker daemon not running
   See compose-launch.log
 - Persistence-after-restart not exercised
+- Actual image build and context packing are unverified (daemon offline).
+  .dockerignore matching is covered by tests/test_container_security.py.
 
-History (verified on this branch at ff56668911b98208c202e6275d5db210a3962acf):
+History (verified on this branch at 8e8f19989604e06efe032bb343dd237bb8f165a7):
 - git merge-base --is-ancestor origin/main HEAD
 - test ! -e docs/managed-self-hosted-product-plan.md
 - test -z "$(git log origin/main..HEAD --format='%H' -- docs/managed-self-hosted-product-plan.md)"
 - ! git rev-list origin/main..HEAD --objects | rg 'docs/managed-self-hosted-product-plan\.md'
 - ! git cat-file -e HEAD:docs/managed-self-hosted-product-plan.md
 - Private managed plan remains outside this public repository.
+- Local branches main and phase1-unsafe-source were not modified
+  (still b344c82438483254fe2f772c1f99b4221dd7b892).
 
 No secrets, full E.164 numbers, transcripts, or customer identifiers in this file.
 No call, deploy, webhook change, provider purchase, or push in this increment.

@@ -1,6 +1,8 @@
-................................                                         [100%]
-32 passed in 15.17s
+..................................                                       [100%]
+34 passed in 0.43s
 doctor exit:0
+zero-byte SQLite file treated as new location; missing parent remains a
+conservative failure. Transactional write probe unchanged for real DBs.
 === uv run agent-call doctor --dummy ===
 agent-call doctor --dummy
 PASS profile: evaluation
