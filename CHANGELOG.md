@@ -11,6 +11,17 @@ published release.
 
 ### Added
 
+- Evaluation/dummy profile (`AGENT_CALL_PROFILE=evaluation`) that boots without
+  real provider credentials, serves `/healthz`, allows MCP prepare, and returns
+  `live_calls_disabled` from `start_phone_call` before any OpenAI or Twilio
+  client request. Default evaluation bind is loopback.
+- Operator CLI via `uv run agent-call`: `serve`, `doctor --dummy|--prepare-only|--live-ready`,
+  and `smoke-prepare`. Doctor does not print secrets or full E.164 values.
+  `uv run python -m app` is equivalent.
+- `compose.yaml` dummy stack: named volume, host-loopback publish, healthcheck,
+  non-root runtime user, no credentials in the image.
+- Builder operating record under `docs/implementation/` (ADR-001 accepted;
+  ADRs 002–010 unresolved).
 - Optional self-hosted Grok Bot OAuth 2.1 for `/grok/mcp/`. Disabled by
   default. Existing `/mcp/` dual-header authentication is unchanged. Agent
   Call hosts the authorization page itself; there is no external identity
@@ -24,6 +35,33 @@ published release.
 
 ### Changed
 
+- `agent-call smoke-prepare` validates `--base-url` and `--mcp-path` before
+  reading environment credentials. Loopback `http://` is allowed; non-loopback
+  targets require `https://`. `--mcp-path` must be a same-origin path.
+- `agent-call doctor --live-ready` probes SQLite writability and public-origin
+  health, plus non-billable Twilio/OpenAI metadata. Exa and the OpenAI webhook
+  secret stay unverified. Run it after the live server and HTTPS origin exist.
+- Production Fly deploy workflow is upstream-maintainer-only
+  (`github.repository == 'XiyaoWang0519/agent-call'`).
+- `agent-call serve` no longer forces the evaluation profile. Settings and
+  `uvicorn` treat an unset `AGENT_CALL_PROFILE` as live. Dummy boot is
+  `--profile evaluation`. An unset profile with any core runtime credential
+  (dotenv or process environment) is refused; pass `--profile live` (this will
+  place billable calls) or `--profile evaluation`.
+- README presents Self-Hosted vs Managed (managed marked forthcoming/private).
+  Local and web golden paths no longer default-target a maintainer Fly app.
+  User `fly.toml` is a `YOUR_FLY_APP_NAME` template; maintainer production
+  overlay lives in `deploy/maintainer/`.
 - Pre-commit Gitleaks now scans the working tree (`--no-git`) so local extra
   branches do not fail the hook. GitHub Actions still runs a full-history
   Gitleaks scan.
+
+### Removed
+
+- Managed Agent Call remains a forthcoming private service and is not
+  configured in this public repository.
+- `AGENT_CALL_UNSAFE_BIND` is no longer read. Evaluation non-loopback bind is
+  CLI `--unsafe-bind` only.
+- `scripts/doctor.py` and `scripts/smoke_prepare.py` wrappers. Use
+  `uv run agent-call doctor` / `uv run agent-call smoke-prepare`, or
+  `uv run python -m app …`.

@@ -18,6 +18,7 @@ RUN apt-get update \
 COPY --from=ghcr.io/astral-sh/uv:0.9.27 /uv /usr/local/bin/uv
 COPY --chown=app:app pyproject.toml uv.lock README.md ./
 COPY --chown=app:app app ./app
+COPY --chown=app:app scripts/agent_call_console.py ./scripts/agent_call_console.py
 COPY --chown=root:root scripts/container-entrypoint.sh /usr/local/bin/container-entrypoint
 RUN uv sync --frozen --no-dev \
     && chown -R app:app /app \

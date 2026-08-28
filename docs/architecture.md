@@ -2,6 +2,8 @@
 
 Agent Call is a single-process FastAPI service that mounts an authenticated FastMCP endpoint and coordinates one outbound call at a time for a single owner.
 
+`AGENT_CALL_PROFILE=evaluation` is a fail-closed dummy boot: required settings are filled with obvious placeholders, `/healthz` and `prepare_phone_call` work, and `CallService.start` returns `live_calls_disabled` before any OpenAI or Twilio client request. The default evaluation listener is loopback. The live profile is unchanged: `prepare_phone_call` never dials, and `start_phone_call` still requires an unexpired single-use plan, `explicit_confirmation=true`, and the exact confirmation read-back.
+
 ## Components
 
 ```mermaid

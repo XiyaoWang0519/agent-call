@@ -1,0 +1,38 @@
+Phase 1 public increment record (redacted)
+
+Base: origin/main (to be recorded after verification)
+HEAD: pending verification on this sanitized branch
+Date: 2026-08-28
+
+Commands and test totals: pending re-verification on this sanitized branch.
+
+Gating tests (behavior, not counted until re-run):
+- tests/test_evaluation_start.py (live_calls_disabled; zero Twilio/OpenAI I/O)
+- tests/test_doctor.py (missing/blank/malformed/sqlite /dev/null/.invalid origin/
+  mocked healthy HTTPS; no secret print)
+- tests/test_fork_safety.py (golden paths plus upstream-maintainer-only workflow
+  job guard)
+- tests/test_smoke_prepare.py (initialize, seven tools, prepare, never start;
+  absolute/scheme-relative MCP paths and remote HTTP rejected before credential
+  read; loopback HTTP and remote HTTPS MockTransport)
+
+Dummy boot (source):
+- AGENT_CALL_PROFILE=evaluation uvicorn app.main:app --host 127.0.0.1 --port 8767
+- GET /healthz twice -> {"status":"ok"}
+  See healthz-1.json healthz-2.json
+  (source dummy boot from the prior increment; not re-run in this history rebuild)
+
+Compose:
+- docker compose version v2.36.0-desktop.1
+- docker compose config -q -> 0
+- docker compose up --build skipped: Docker daemon not running
+  See compose-launch.log
+- Persistence-after-restart not exercised
+
+History:
+- Private managed plan is preserved outside this repository.
+- Sanitization of origin/main..HEAD is not claimed until the required
+  history-inspection commands pass.
+
+No secrets, full E.164 numbers, transcripts, or customer identifiers in this file.
+No call, deploy, webhook change, provider purchase, or push in this increment.

@@ -1,21 +1,19 @@
 services:
   - type: web
-    name: agent-call
+    name: YOUR_RENDER_SERVICE_NAME
     runtime: docker
     plan: starter
     healthCheckPath: /healthz
     autoDeployTrigger: off
     disk:
-      name: agent-call-data
+      name: YOUR_RENDER_DISK_NAME
       mountPath: /var/data
       sizeGB: 1
     envVars:
       - key: DATABASE_URL
         value: sqlite:////var/data/agent_call.db
-      - key: ALLOWED_COUNTRY_CODES
-        value: +1
       - key: INPUT_TRANSCRIPTION_MODEL
-        value: gpt-4o-mini-transcribe
+        value: gpt-realtime-whisper
       - key: EXTRACTOR_MODEL
         value: gpt-5.4-nano-2026-03-17
       - key: MINI_MODELS_ENABLED

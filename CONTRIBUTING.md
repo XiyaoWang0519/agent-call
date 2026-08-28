@@ -19,6 +19,14 @@ You do not need OpenAI, Twilio, Exa, or a phone number to contribute.
 
 ```bash
 uv sync --all-groups --frozen
+uv run agent-call doctor --dummy
+uv run agent-call serve --profile evaluation --host 127.0.0.1 --port 8000
+```
+
+Optional Compose dummy stack: `docker compose up --build` (publishes
+`127.0.0.1:8000` only). Then `uv run agent-call smoke-prepare`.
+
+```bash
 test -e .env.local || cp .env.example .env.local
 ```
 

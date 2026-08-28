@@ -1,0 +1,17 @@
+.........................                                                [100%]
+25 passed in 0.43s
+doctor exit:0
+=== uv run agent-call doctor --dummy ===
+agent-call doctor --dummy
+PASS profile: evaluation
+PASS evaluation_boot: required fields filled for dummy boot
+PASS live_calls: start_phone_call returns live_calls_disabled
+dummy: OK (0 failed, 0 unverified, 3 checks)
+exit:0
+=== uv run python -m app doctor --dummy ===
+agent-call doctor --dummy
+PASS profile: evaluation
+PASS evaluation_boot: required fields filled for dummy boot
+PASS live_calls: start_phone_call returns live_calls_disabled
+dummy: OK (0 failed, 0 unverified, 3 checks)
+exit:0

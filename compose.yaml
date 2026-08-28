@@ -1,0 +1,39 @@
+# Credential-free local evaluation. Publishes only on host loopback.
+# Live calls are disabled (AGENT_CALL_PROFILE=evaluation).
+# The process inside the container must listen on 0.0.0.0 so Docker can
+# forward the host's 127.0.0.1:8000 mapping; that is not a public bind.
+services:
+  app:
+    build: .
+    image: agent-call-self-host:local
+    environment:
+      AGENT_CALL_PROFILE: evaluation
+      DATABASE_URL: sqlite:////data/agent_call.db
+    volumes:
+      - agent_call_data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz").read()'
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  agent_call_data:

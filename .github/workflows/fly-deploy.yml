@@ -1,4 +1,7 @@
-name: Deploy production
+# Upstream-maintainer-only. Forks must not run this job: it deploys the
+# XiyaoWang0519/agent-call Fly app using repository secrets. Public
+# operators use fly.toml with YOUR_FLY_APP_NAME (see docs/self-hosting.md).
+name: Deploy production (upstream-maintainer-only)
 
 on:
   push:
@@ -14,7 +17,8 @@ concurrency:
 
 jobs:
   deploy:
-    name: Test and deploy
+    name: Test and deploy (upstream-maintainer-only)
+    if: github.repository == 'XiyaoWang0519/agent-call'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
@@ -90,7 +94,7 @@ jobs:
       - name: Deploy merged main to Fly.io
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --app agent-call --ha=false --remote-only
+        run: flyctl deploy --config deploy/maintainer/fly.toml --app agent-call --ha=false --remote-only
 
       - name: Verify production health
         run: |
