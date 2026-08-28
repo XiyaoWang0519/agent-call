@@ -18,7 +18,7 @@
 
 | Field | Value |
 | --- | --- |
-| Commit SHA | `ff56668911b98208c202e6275d5db210a3962acf` (SQLite doctor on squash `089ed0f`; origin/main `c2964b5`) |
+| Commit SHA | `3d89caa430f6cfaa91ee2f0d289ce0c1a21a5607` (verification record; doctor `ff56668`; squash `089ed0f`; origin/main `c2964b5`) |
 | Public artifact versions/digests | none published (no signed wheel/image in this increment) |
 | Database migration version | unchanged SQLite schema; no migration |
 | Enabled flags | `AGENT_CALL_PROFILE` is unset by default in Settings (`effective_profile` is `live`). `agent-call serve` uses that Settings object for bind policy and refuses an unset profile when any core runtime credential is present (process env or dotenv). Dummy/Compose set `evaluation` explicitly. |
