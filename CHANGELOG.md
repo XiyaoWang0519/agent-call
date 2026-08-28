@@ -38,9 +38,10 @@ published release.
 - `agent-call smoke-prepare` validates `--base-url` and `--mcp-path` before
   reading environment credentials. Loopback `http://` is allowed; non-loopback
   targets require `https://`. `--mcp-path` must be a same-origin path.
-- `agent-call doctor --live-ready` probes SQLite writability and public-origin
-  health, plus non-billable Twilio/OpenAI metadata. Exa and the OpenAI webhook
-  secret stay unverified. Run it after the live server and HTTPS origin exist.
+- `agent-call doctor --live-ready` probes SQLite with a real open and rolled-back
+  write (or a temporary database for a new path), plus public-origin health and
+  non-billable Twilio/OpenAI metadata. Exa and the OpenAI webhook secret stay
+  unverified. Run it after the live server and HTTPS origin exist.
 - Production Fly deploy workflow is upstream-maintainer-only
   (`github.repository == 'XiyaoWang0519/agent-call'`).
 - `agent-call serve` no longer forces the evaluation profile. Settings and

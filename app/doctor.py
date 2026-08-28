@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+import stat
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -26,6 +28,9 @@ from app.settings import (
 
 _TRUE_ENV_FLAGS = frozenset({"1", "true", "yes", "on", "y"})
 _PROBE_TIMEOUT_SECONDS = 5.0
+_SQLITE_PROBE_TIMEOUT_SECONDS = 1.0
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_SQLITE_PROBE_PREFIX = ".agent-call-doctor-"
 _HEALTH_PATH = "/healthz"
 _WEBHOOK_PATH = "/webhooks/openai"
 _OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
@@ -300,49 +305,114 @@ def _record_probe(report: DoctorReport, name: str, result: ProbeResult) -> None:
     report.add(name, result.status, result.detail)
 
 
-def _closest_existing_dir(path: Path) -> Path | None:
-    current = path
-    while True:
-        if current.exists():
-            return current if current.is_dir() else None
-        parent = current.parent
-        if parent == current:
-            return None
-        current = parent
+def _remove_sqlite_artifacts(probe_name: str) -> bool:
+    if not probe_name:
+        return True
+    removed = True
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        artifact = probe_name + suffix
+        try:
+            os.unlink(artifact)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            removed = False
+    return removed
 
 
-def probe_sqlite(db_path: Path) -> ProbeResult:
+def _close_sqlite(conn: sqlite3.Connection | None) -> None:
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def _probe_existing_sqlite(db_path: Path) -> ProbeResult:
+    try:
+        mode = db_path.lstat().st_mode
+    except OSError:
+        return ProbeResult(CheckStatus.FAIL, "database is not writable")
+    if not stat.S_ISREG(mode):
+        return ProbeResult(CheckStatus.FAIL, "database path is not a regular SQLite file")
+    try:
+        with db_path.open("rb") as handle:
+            header = handle.read(len(_SQLITE_HEADER))
+    except OSError:
+        return ProbeResult(CheckStatus.FAIL, "database is not writable")
+    if header != _SQLITE_HEADER:
+        return ProbeResult(CheckStatus.FAIL, "database path is not a regular SQLite file")
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(
+            str(db_path),
+            timeout=_SQLITE_PROBE_TIMEOUT_SECONDS,
+            isolation_level=None,
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        table = f"__agent_call_doctor_probe_{os.getpid()}_{id(conn):x}__"
+        conn.execute(f'CREATE TABLE "{table}" (x INTEGER NOT NULL)')
+        conn.execute(f'INSERT INTO "{table}" (x) VALUES (1)')
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        if conn is not None:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        return ProbeResult(CheckStatus.FAIL, "database is not writable")
+    finally:
+        _close_sqlite(conn)
+    return ProbeResult(CheckStatus.PASS, "database exists and is writable")
+
+
+def _probe_new_sqlite_location(db_path: Path) -> ProbeResult:
     parent = db_path.parent
     if parent.exists() and not parent.is_dir():
         return ProbeResult(CheckStatus.FAIL, "database parent is not a directory")
-    probe_dir = parent if parent.is_dir() else _closest_existing_dir(parent)
-    if probe_dir is None:
+    if not parent.is_dir():
         return ProbeResult(CheckStatus.FAIL, "database parent cannot be created")
     handle: int | None = None
     probe_name = ""
+    conn: sqlite3.Connection | None = None
+    failure: ProbeResult | None = None
     try:
-        handle, probe_name = tempfile.mkstemp(prefix=".agent-call-doctor-", dir=probe_dir)
-    except OSError:
-        return ProbeResult(CheckStatus.FAIL, "data location is not writable")
-    try:
+        handle, probe_name = tempfile.mkstemp(prefix=_SQLITE_PROBE_PREFIX, suffix=".db", dir=parent)
         os.close(handle)
         handle = None
-        os.unlink(probe_name)
-    except OSError:
+        conn = sqlite3.connect(
+            probe_name,
+            timeout=_SQLITE_PROBE_TIMEOUT_SECONDS,
+            isolation_level=None,
+        )
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE probe (id INTEGER NOT NULL)")
+        conn.execute("INSERT INTO probe (id) VALUES (1)")
+        conn.execute("COMMIT")
+    except (OSError, sqlite3.Error):
+        failure = ProbeResult(CheckStatus.FAIL, "data location is not writable")
+    finally:
         if handle is not None:
             try:
                 os.close(handle)
             except OSError:
                 pass
-        if probe_name:
-            try:
-                os.unlink(probe_name)
-            except OSError:
-                pass
-        return ProbeResult(CheckStatus.FAIL, "data location is not writable")
-    if parent.is_dir():
-        return ProbeResult(CheckStatus.PASS, "database parent exists and is writable")
-    return ProbeResult(CheckStatus.PASS, "database parent can be created")
+        _close_sqlite(conn)
+        if not _remove_sqlite_artifacts(probe_name):
+            failure = ProbeResult(CheckStatus.FAIL, "data location is not writable")
+    if failure is not None:
+        return failure
+    return ProbeResult(CheckStatus.PASS, "database parent exists and is writable")
+
+
+def probe_sqlite(db_path: Path) -> ProbeResult:
+    try:
+        if db_path.exists() or db_path.is_symlink():
+            return _probe_existing_sqlite(db_path)
+        return _probe_new_sqlite_location(db_path)
+    except OSError:
+        return ProbeResult(CheckStatus.FAIL, "database is not writable")
 
 
 def _http_client(*, transport: httpx.BaseTransport | None = None) -> httpx.Client:

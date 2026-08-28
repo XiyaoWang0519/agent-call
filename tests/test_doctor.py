@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -455,6 +457,148 @@ def test_probe_sqlite_rejects_dev_null_parent():
     assert result.status is CheckStatus.FAIL
     assert "/dev/null" not in result.detail
     assert "agent_call.db" not in result.detail
+
+
+def _sqlite_snapshot(path: Path) -> tuple[list[tuple[str, str, str | None]], list[tuple[int, str]]]:
+    conn = sqlite3.connect(path)
+    try:
+        master = list(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"))
+        rows = list(conn.execute("SELECT id, name FROM items ORDER BY id"))
+        return master, rows
+    finally:
+        conn.close()
+
+
+def _leftover_probe_paths(directory: Path) -> list[str]:
+    leftover: list[str] = []
+    for path in directory.iterdir():
+        name = path.name
+        if name.startswith(".agent-call-doctor-") or name.endswith(("-journal", "-wal", "-shm")):
+            leftover.append(name)
+    return leftover
+
+
+def test_probe_sqlite_rejects_directory_path(tmp_path: Path):
+    db_dir = tmp_path / "not-a-database"
+    db_dir.mkdir()
+    result = probe_sqlite(db_dir)
+    assert result.status is CheckStatus.FAIL
+    assert str(db_dir) not in result.detail
+    assert "not-a-database" not in result.detail
+
+
+def test_probe_sqlite_rejects_corrupt_non_sqlite_file(tmp_path: Path):
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"this is not a sqlite database")
+    before = corrupt.read_bytes()
+    result = probe_sqlite(corrupt)
+    assert result.status is CheckStatus.FAIL
+    assert str(corrupt) not in result.detail
+    assert "corrupt.db" not in result.detail
+    assert corrupt.read_bytes() == before
+
+
+def test_probe_sqlite_rejects_connect_or_write_failure(tmp_path: Path, monkeypatch):
+    existing = tmp_path / "locked.db"
+    conn = sqlite3.connect(existing)
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.commit()
+    conn.close()
+
+    def boom(*_args: object, **_kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("unable to open database file /secret/path.db")
+
+    monkeypatch.setattr("sqlite3.connect", boom)
+    result = probe_sqlite(existing)
+    assert result.status is CheckStatus.FAIL
+    assert "/secret/path.db" not in result.detail
+    assert "OperationalError" not in result.detail
+    assert str(existing) not in result.detail
+
+
+def test_probe_sqlite_rejects_readonly_existing_database(tmp_path: Path):
+    existing = tmp_path / "readonly.db"
+    conn = sqlite3.connect(existing)
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.execute("INSERT INTO items (name) VALUES ('keep-me')")
+    conn.commit()
+    conn.close()
+    existing.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    try:
+        result = probe_sqlite(existing)
+    finally:
+        existing.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    assert result.status is CheckStatus.FAIL
+    assert str(existing) not in result.detail
+    assert "readonly.db" not in result.detail
+    master, rows = _sqlite_snapshot(existing)
+    assert rows == [(1, "keep-me")]
+    assert any(name == "items" for _type, name, _sql in master)
+
+
+def test_probe_sqlite_existing_database_unchanged(tmp_path: Path):
+    existing = tmp_path / "existing.db"
+    conn = sqlite3.connect(existing)
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+    conn.execute("CREATE INDEX items_name ON items(name)")
+    conn.execute("INSERT INTO items (name) VALUES ('keep-me')")
+    conn.execute("INSERT INTO items (name) VALUES ('also-keep')")
+    conn.commit()
+    conn.close()
+    before_bytes = existing.read_bytes()
+    before_master, before_rows = _sqlite_snapshot(existing)
+    wal = Path(str(existing) + "-wal")
+    shm = Path(str(existing) + "-shm")
+    journal = Path(str(existing) + "-journal")
+
+    result = probe_sqlite(existing)
+
+    assert result.status is CheckStatus.PASS
+    assert str(existing) not in result.detail
+    after_master, after_rows = _sqlite_snapshot(existing)
+    assert after_master == before_master
+    assert after_rows == before_rows
+    assert existing.read_bytes() == before_bytes
+    assert not wal.exists()
+    assert not shm.exists()
+    assert not journal.exists()
+
+
+def test_probe_sqlite_new_database_leaves_no_artifacts(tmp_path: Path):
+    parent = tmp_path / "data"
+    parent.mkdir()
+    target = parent / "agent_call.db"
+    before = {path.name for path in parent.iterdir()}
+
+    result = probe_sqlite(target)
+
+    assert result.status is CheckStatus.PASS
+    assert str(target) not in result.detail
+    assert "agent_call.db" not in result.detail
+    assert not target.exists()
+    assert {path.name for path in parent.iterdir()} == before
+    assert _leftover_probe_paths(parent) == []
+    assert _leftover_probe_paths(tmp_path) == []
+
+
+def test_doctor_live_ready_rejects_directory_database_and_redacts(tmp_path: Path):
+    db_dir = tmp_path / "db-as-dir"
+    db_dir.mkdir()
+    env = _live_env(DATABASE_URL=f"sqlite:///{db_dir}")
+    report = run_doctor(
+        DoctorMode.LIVE_READY,
+        environ=env,
+        env_files=(),
+        probes=_offline_network_probes(origin_status=CheckStatus.PASS),
+    )
+    assert not report.ok
+    failed = {check.name: check.detail for check in report.checks if not check.ok}
+    assert "DATABASE_URL" in failed
+    text = report.format()
+    _assert_no_secrets(text)
+    assert str(db_dir) not in text
+    assert "db-as-dir" not in text
+    assert "sqlite:" not in text
 
 
 def test_probe_public_origin_connect_error_is_value_free():
