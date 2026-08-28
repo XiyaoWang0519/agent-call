@@ -331,11 +331,15 @@ def _close_sqlite(conn: sqlite3.Connection | None) -> None:
 
 def _probe_existing_sqlite(db_path: Path) -> ProbeResult:
     try:
-        mode = db_path.lstat().st_mode
+        info = db_path.lstat()
     except OSError:
         return ProbeResult(CheckStatus.FAIL, "database is not writable")
-    if not stat.S_ISREG(mode):
+    if not stat.S_ISREG(info.st_mode):
         return ProbeResult(CheckStatus.FAIL, "database path is not a regular SQLite file")
+    if info.st_size == 0:
+        # sqlite3.connect would write a header into an empty file. Probe the
+        # parent like a new location and leave the zero-byte file untouched.
+        return _probe_new_sqlite_location(db_path)
     try:
         with db_path.open("rb") as handle:
             header = handle.read(len(_SQLITE_HEADER))

@@ -29,7 +29,9 @@ uv run agent-call doctor --prepare-only
 uv run agent-call smoke-prepare
 ```
 
-Compose (named volume, host loopback only, non-root runtime user, no credentials in the image):
+Compose (named volume, host loopback only, non-root runtime user, no credentials
+in the image; `.dockerignore` keeps `.git`, env files, and local data out of the
+build context):
 
 ```bash
 docker compose up --build

@@ -1,0 +1,42 @@
+# Allowlist: only Dockerfile COPY inputs and the Dockerfile itself enter the
+# Docker/Fly build context. Git, env files, caches, databases, and the rest
+# of the tree stay out.
+
+*
+
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+
+!app/
+!app/**
+
+!scripts/
+scripts/**
+!scripts/agent_call_console.py
+!scripts/container-entrypoint.sh
+
+# Re-exclude secrets, VCS, caches, and runtime data even under allowed paths.
+**/.git
+**/.git/**
+**/.env
+**/.env.*
+**/.venv
+**/.venv/**
+**/__pycache__/
+**/__pycache__/**
+**/*.py[cod]
+**/.pytest_cache/
+**/.pytest_cache/**
+**/.mypy_cache/
+**/.mypy_cache/**
+**/.ruff_cache/
+**/.ruff_cache/**
+**/.coverage
+**/.coverage*
+**/htmlcov/
+**/htmlcov/**
+**/*.db
+**/*.db-shm
+**/*.db-wal

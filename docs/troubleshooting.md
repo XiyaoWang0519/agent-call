@@ -27,9 +27,13 @@ reachable HTTPS origin (tunnel or your own deployment).
 - `PUBLIC_BASE_URL_format`: must be an HTTPS origin with no path or query.
 - `PUBLIC_BASE_URL_reachability`: DNS/TLS failed, `/healthz` was not 200, or
   `/webhooks/openai` returned 404.
-- `DATABASE_URL`: SQLite parent is missing, not a directory, or not writable.
-  Doctor probes with a temporary create/delete file and does not alter the
-  real database.
+- `DATABASE_URL`: an existing SQLite file gets a transactional write probe that
+  rolls back and leaves the schema unchanged. A missing file or a zero-byte
+  file is treated as a new location: doctor writes a temporary probe file in
+  the parent directory and deletes it. A missing parent directory is a
+  conservative failure; doctor does not create `DATABASE_URL` parents.
+  Symlinks, directories, and non-SQLite files fail. Details never include
+  the path.
 - `TWILIO_ACCOUNT` / `OPENAI_API`: metadata/auth check failed. Those probes do
   not place calls.
 - `EXA_API_KEY` / `OPENAI_WEBHOOK_SECRET` stay `UNVERIFIED` on purpose (no

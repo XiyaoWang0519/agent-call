@@ -20,6 +20,8 @@ published release.
   `uv run python -m app` is equivalent.
 - `compose.yaml` dummy stack: named volume, host-loopback publish, healthcheck,
   non-root runtime user, no credentials in the image.
+- Restrictive `.dockerignore` allowlist so Git history, env files, virtualenvs,
+  caches, and databases stay out of the Docker/Fly build context.
 - Builder operating record under `docs/implementation/` (ADR-001 accepted;
   ADRs 002–010 unresolved).
 - Optional self-hosted Grok Bot OAuth 2.1 for `/grok/mcp/`. Disabled by
@@ -35,6 +37,10 @@ published release.
 
 ### Changed
 
+- `doctor --live-ready` treats a zero-byte SQLite file as a new database
+  location (parent writability probe) instead of a corrupt database. A missing
+  parent directory remains a conservative failure; doctor does not create
+  `DATABASE_URL` parents.
 - `agent-call smoke-prepare` validates `--base-url` and `--mcp-path` before
   reading environment credentials. Loopback `http://` is allowed; non-loopback
   targets require `https://`. `--mcp-path` must be a same-origin path.

@@ -581,6 +581,34 @@ def test_probe_sqlite_new_database_leaves_no_artifacts(tmp_path: Path):
     assert _leftover_probe_paths(tmp_path) == []
 
 
+def test_probe_sqlite_zero_byte_file_behaves_like_new_location(tmp_path: Path):
+    parent = tmp_path / "data"
+    parent.mkdir()
+    target = parent / "agent_call.db"
+    target.write_bytes(b"")
+    before = target.read_bytes()
+
+    result = probe_sqlite(target)
+
+    assert result.status is CheckStatus.PASS
+    assert str(target) not in result.detail
+    assert "agent_call.db" not in result.detail
+    assert target.exists()
+    assert target.read_bytes() == before
+    assert _leftover_probe_paths(parent) == []
+    assert _leftover_probe_paths(tmp_path) == []
+
+
+def test_probe_sqlite_missing_parent_is_conservative_failure(tmp_path: Path):
+    target = tmp_path / "missing-parent" / "agent_call.db"
+    result = probe_sqlite(target)
+    assert result.status is CheckStatus.FAIL
+    assert str(target) not in result.detail
+    assert "missing-parent" not in result.detail
+    assert not target.exists()
+    assert not target.parent.exists()
+
+
 def test_doctor_live_ready_rejects_directory_database_and_redacts(tmp_path: Path):
     db_dir = tmp_path / "db-as-dir"
     db_dir.mkdir()
