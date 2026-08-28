@@ -1,20 +1,35 @@
 Phase 1 public increment record (redacted)
 
-Base: origin/main (to be recorded after verification)
-HEAD: pending verification on this sanitized branch
+Branch: phase1-sanitized
+origin/main (ancestor): c2964b5868eccf593844336096f99a0f55914675
+Phase 1 squash: 089ed0f2821d839192897d286ade89aff95adb39
+SQLite doctor: ff56668911b98208c202e6275d5db210a3962acf
 Date: 2026-08-28
 
-Commands and test totals: pending re-verification on this sanitized branch.
+Commands (all exit 0 unless noted):
+- uv sync --all-groups --frozen
+- uv run ruff format --check app tests scripts
+- uv run ruff check app tests scripts
+- uv run mypy app
+- uv run pytest -q --cov=app
+  Result: 475 passed, app coverage 88% (88.01%, fail_under 85)
+- uv run pre-commit run --all-files
+- docker compose config -q (exit 0)
+- git diff --check origin/main...HEAD
+- uv run agent-call doctor --dummy
+- uv run python -m app doctor --dummy
 
-Gating tests (behavior, not counted until re-run):
-- tests/test_evaluation_start.py (live_calls_disabled; zero Twilio/OpenAI I/O)
-- tests/test_doctor.py (missing/blank/malformed/sqlite /dev/null/.invalid origin/
-  mocked healthy HTTPS; no secret print)
+Gating tests:
+- tests/test_evaluation_start.py (live_calls_disabled; zero Twilio/OpenAI I/O;
+  17 passed)
+- tests/test_doctor.py (missing/blank/malformed; sqlite /dev/null, directory,
+  corrupt file, connect/write failure, existing DB unchanged, new path with no
+  artifacts; invalid origin; mocked healthy HTTPS; no secret print; 32 passed)
 - tests/test_fork_safety.py (golden paths plus upstream-maintainer-only workflow
-  job guard)
+  job guard; 5 passed)
 - tests/test_smoke_prepare.py (initialize, seven tools, prepare, never start;
   absolute/scheme-relative MCP paths and remote HTTP rejected before credential
-  read; loopback HTTP and remote HTTPS MockTransport)
+  read; loopback HTTP and remote HTTPS MockTransport; 19 passed)
 
 Dummy boot (source):
 - AGENT_CALL_PROFILE=evaluation uvicorn app.main:app --host 127.0.0.1 --port 8767
@@ -29,10 +44,13 @@ Compose:
   See compose-launch.log
 - Persistence-after-restart not exercised
 
-History:
-- Private managed plan is preserved outside this repository.
-- Sanitization of origin/main..HEAD is not claimed until the required
-  history-inspection commands pass.
+History (verified on this branch at ff56668911b98208c202e6275d5db210a3962acf):
+- git merge-base --is-ancestor origin/main HEAD
+- test ! -e docs/managed-self-hosted-product-plan.md
+- test -z "$(git log origin/main..HEAD --format='%H' -- docs/managed-self-hosted-product-plan.md)"
+- ! git rev-list origin/main..HEAD --objects | rg 'docs/managed-self-hosted-product-plan\.md'
+- ! git cat-file -e HEAD:docs/managed-self-hosted-product-plan.md
+- Private managed plan remains outside this public repository.
 
 No secrets, full E.164 numbers, transcripts, or customer identifiers in this file.
 No call, deploy, webhook change, provider purchase, or push in this increment.

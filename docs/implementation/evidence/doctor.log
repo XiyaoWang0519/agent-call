@@ -1,5 +1,5 @@
-.........................                                                [100%]
-25 passed in 0.43s
+................................                                         [100%]
+32 passed in 15.17s
 doctor exit:0
 === uv run agent-call doctor --dummy ===
 agent-call doctor --dummy

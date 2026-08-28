@@ -18,11 +18,11 @@
 
 | Field | Value |
 | --- | --- |
-| Commit SHA | pending verification on this sanitized branch |
+| Commit SHA | `ff56668911b98208c202e6275d5db210a3962acf` (SQLite doctor on squash `089ed0f`; origin/main `c2964b5`) |
 | Public artifact versions/digests | none published (no signed wheel/image in this increment) |
 | Database migration version | unchanged SQLite schema; no migration |
 | Enabled flags | `AGENT_CALL_PROFILE` is unset by default in Settings (`effective_profile` is `live`). `agent-call serve` uses that Settings object for bind policy and refuses an unset profile when any core runtime credential is present (process env or dotenv). Dummy/Compose set `evaluation` explicitly. |
-| Tests and exit codes | pending re-verification on this sanitized branch |
+| Tests and exit codes | `uv run ruff format --check app tests scripts` → 0; `uv run ruff check app tests scripts` → 0; `uv run mypy app` → 0; `uv run pytest -q --cov=app` → 0, **475 passed**, **app coverage 88%** (floor 85%); `uv run pre-commit run --all-files` → 0; `docker compose config -q` → 0; `git diff --check origin/main...HEAD` → 0; `uv run agent-call doctor --dummy` → 0; `uv run python -m app doctor --dummy` → 0 |
 | Evidence | [evidence/](evidence/) |
 | Known limitations | Five-person usability study, non-maintainer Fly live deploy, signed GHCR/SBOM provenance, and macOS CI are out of scope. Docker Compose CLI is present (v2.36.0) and `docker compose config -q` succeeds, but the **daemon is not running** (`Cannot connect to the Docker daemon`); Compose build/up, `/healthz` through Compose, smoke-prepare against Compose, and named-volume persistence after restart were **not exercised**. Source dummy boot evidence from the prior increment remains. Clean-machine, fresh non-maintainer Fly deployment, and rollback gates have not been run. |
 | Rollback | [ROLLBACKS.md](ROLLBACKS.md) Phase 1 |
