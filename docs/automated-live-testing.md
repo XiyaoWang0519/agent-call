@@ -3,7 +3,9 @@
 Status: the core harness and 22-scenario suite are implemented in `scripts/live_phone/`.
 See [the runbook](live-phone-runbook.md) for executable commands, prerequisites, and
 the remaining coverage boundaries. This document retains the broader target design.
-No live call has validated the new harness yet.
+The `basic` scenario passed a real call on 2026-09-05: web search, audible interruption,
+replacement answer and agent hangup. See the [handoff](live-phone-handoff.md) for evidence
+and how to reproduce it. The broader suite has not yet passed live.
 
 ## Recommended approach
 

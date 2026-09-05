@@ -5,6 +5,9 @@ phone counterpart, an MCP runner, received-audio transcription and grading, and 
 durable cleanup reaper. The production server does not import or host the harness.
 The existing human-operated `run_sip_canary.py` remains available.
 
+**New session or another agent:** start with the [live testing handoff](live-phone-handoff.md)
+for the existing local setup, known-good evidence and troubleshooting.
+
 ## One-time setup
 
 1. Provision a disposable Agent Call deployment using the same revision being tested,
@@ -130,8 +133,10 @@ monotonic clocks are never subtracted from each other.
 ## Coverage boundaries and calibration
 
 Automated transport and orchestration tests run locally with mocked paid providers.
-The first live acceptance run is still required to validate routing, actual Twilio
-DTMF delivery, AMD behavior, and acoustic thresholds. No live result is implied by unit
+The `basic` scenario passed a real call on 2026-09-05; see the
+[recorded acceptance](live-phone-handoff.md#what-has-actually-passed). Broader live
+validation is still required for actual Twilio DTMF delivery, AMD cases, transfers,
+hold behavior and acoustic variability. No live result is implied by unit
 tests or a green PR check. Initial interruption budgets (1.2 s), voice energy threshold,
 and hold silence allowance are provisional and must be calibrated with received audio.
 The detector uses in-band DTMF; separate Twilio digit events are retained as diagnostics.
