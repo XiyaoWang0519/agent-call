@@ -280,9 +280,17 @@ def create_app(config: Config) -> FastAPI:
     async def media(websocket: WebSocket, run_id: str, role: str) -> None:
         path = f"/media/{run_id}/{role}"
         signature = websocket.headers.get("x-twilio-signature", "")
-        if websocket.url.query or not RequestValidator(
-            config.twilio_auth_token.get_secret_value()
-        ).validate(config.public_url.rstrip("/") + path, {}, signature):
+        # Twilio signs the public WSS handshake URL; some edges append a slash.
+        # Accept only these canonical variants of our configured origin and exact path.
+        # https://www.twilio.com/docs/usage/security#validating-requests-are-coming-from-twilio
+        public_url = config.public_url.rstrip("/") + path
+        validator = RequestValidator(config.twilio_auth_token.get_secret_value())
+        valid = any(
+            validator.validate(url + suffix, {}, signature)
+            for url in (public_url, public_url.replace("https://", "wss://", 1))
+            for suffix in ("", "/")
+        )
+        if websocket.url.query or not valid:
             await websocket.close(code=1008)
             return
         session = sessions.get((run_id, role))

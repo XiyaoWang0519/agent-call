@@ -204,7 +204,12 @@ def test_harness_auth_and_signed_busy_endpoint(phone_config):
         )
 
 
-def test_signed_websocket_receives_audio_and_independent_asr(phone_config, monkeypatch):
+@pytest.mark.parametrize(
+    "scheme,suffix", [("https", ""), ("https", "/"), ("wss", ""), ("wss", "/")]
+)
+def test_signed_websocket_receives_audio_and_independent_asr(
+    phone_config, monkeypatch, scheme, suffix
+):
     app = create_app(phone_config)
     monkeypatch.setattr(app.state.provider, "twilio", AsyncMock(return_value={}))
     monkeypatch.setattr(
@@ -237,7 +242,12 @@ def test_signed_websocket_receives_audio_and_independent_asr(phone_config, monke
         assert response.status_code == 200
         path = "/media/run_one/callee"
         sid = "MZ" + "1" * 32
-        with client.websocket_connect(path, headers=signed(phone_config, path, {})) as ws:
+        signature = RequestValidator(
+            phone_config.twilio_auth_token.get_secret_value()
+        ).compute_signature(
+            phone_config.public_url.replace("https://", scheme + "://") + path + suffix, {}
+        )
+        with client.websocket_connect(path, headers={"x-twilio-signature": signature}) as ws:
             ws.send_json({"event": "connected"})
             ws.send_json(
                 {
