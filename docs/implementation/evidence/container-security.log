@@ -1,0 +1,8 @@
+tests/test_container_security.py
+8 passed in 0.01s
+exit:0
+Allowlist .dockerignore present. Dockerfile COPY sources stay explicit
+(no COPY . .). .git, .env, .env.local, .venv, caches, coverage artifacts,
+and database files are excluded. Secret-bearing local config is not a
+COPY source and is excluded from the build context. Env file contents
+were not read.

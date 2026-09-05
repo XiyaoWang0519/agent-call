@@ -26,6 +26,7 @@ from app.db import (
     LatencyMark,
     LatencyStage,
 )
+from app.evaluation import live_calls_disabled_error
 from app.exa_search import ExaSearchClient, ExaSearchError
 from app.finalizer import Finalizer
 from app.logging_safety import provider_error_fields
@@ -519,6 +520,8 @@ class CallService:
     async def start(
         self, plan_id: str, *, explicit_confirmation: bool, confirmation_text: str
     ) -> StartPhoneCallOutput:
+        if not self.settings.live_calls_enabled:
+            raise live_calls_disabled_error()
         if not explicit_confirmation or not confirmation_text.strip():
             raise ValueError(
                 json.dumps(

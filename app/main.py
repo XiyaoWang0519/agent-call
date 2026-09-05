@@ -68,6 +68,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.require_runtime_configuration()
+        if not settings.live_calls_enabled:
+            logger.info("evaluation profile enabled; live calls are disabled")
         db = Database(settings.database_path)
         await db.initialize()
         openai = None

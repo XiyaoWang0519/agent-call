@@ -1,14 +1,17 @@
-# User template. Replace YOUR_FLY_APP_NAME before deploying your own app.
-# Do not copy a maintainer overlay. Create a Fly app you own.
-app = 'YOUR_FLY_APP_NAME'
+# Upstream-maintainer-only production overlay. Forks must not use this file.
+# Deployed only by .github/workflows/fly-deploy.yml when
+# github.repository == 'XiyaoWang0519/agent-call'.
+# Public operators use the repository-root fly.toml with YOUR_FLY_APP_NAME.
+app = 'agent-call'
 primary_region = 'lax'
 
 [build]
 
 [env]
+  ALLOWED_COUNTRY_CODES = '["+1"]'
+  ASK_AGENT_ENABLED = 'true'
   DATABASE_URL = 'sqlite:////data/agent_call.db'
-  # Set PUBLIC_BASE_URL via `flyctl secrets set` to https://YOUR_FLY_APP_NAME.fly.dev
-  # Do not put ALLOWED_COUNTRY_CODES here as a bare +1 string.
+  PUBLIC_BASE_URL = 'https://agent-call.fly.dev'
 
 [http_service]
   internal_port = 8000

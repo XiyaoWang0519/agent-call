@@ -19,6 +19,14 @@ You do not need OpenAI, Twilio, Exa, or a phone number to contribute.
 
 ```bash
 uv sync --all-groups --frozen
+uv run agent-call doctor --dummy
+uv run agent-call serve --profile evaluation --host 127.0.0.1 --port 8000
+```
+
+Optional Compose dummy stack: `docker compose up --build` (publishes
+`127.0.0.1:8000` only). Then `uv run agent-call smoke-prepare`.
+
+```bash
 test -e .env.local || cp .env.example .env.local
 ```
 
@@ -47,6 +55,19 @@ uv run pre-commit run --all-files               # local hooks: ruff, gitleaks, m
 ```
 
 `uv run pytest -q` (no `--cov`) runs the same tests without the coverage gate.
+
+With a running Docker engine, exercise the actual build-context exclusions and
+the container entrypoint on a read-only root filesystem:
+
+```bash
+docker compose build
+AGENT_CALL_DOCKER_TESTS=1 AGENT_CALL_DOCKER_IMAGE=agent-call-self-host:local \
+  uv run pytest -q tests/test_container_security.py
+```
+
+These opt-in tests use synthetic files and an isolated container with no network.
+The entrypoint test also checks ownership repair of a root-owned temporary volume.
+Ordinary test runs skip these two tests and do not require Docker.
 
 Ruff targets Python 3.12 with a 100-character line length and enforces
 pycodestyle, Pyflakes, import sorting (`I`), pyupgrade, bugbear, and async

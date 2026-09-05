@@ -41,6 +41,9 @@ dependencies = [
     "websockets>=17.0.1",
 ]
 
+[project.scripts]
+agent-call = "agent_call_console:main"
+
 [project.urls]
 Homepage = "https://github.com/XiyaoWang0519/agent-call"
 Repository = "https://github.com/XiyaoWang0519/agent-call"
@@ -67,6 +70,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+# Installed as a real site-packages module so `uv run agent-call` works when
+# Python skips hidden editable `.pth` files for console scripts.
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/agent_call_console.py" = "agent_call_console.py"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

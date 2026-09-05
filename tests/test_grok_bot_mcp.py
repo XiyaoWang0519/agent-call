@@ -1,22 +1,12 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import respx
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-
-EXPECTED_TOOLS = {
-    "prepare_phone_call",
-    "start_phone_call",
-    "get_call_result",
-    "end_phone_call",
-    "get_phone_call",
-    "wait_for_call_event",
-    "answer_call_question",
-}
+from app.smoke_prepare import EXPECTED_TOOLS, parse_mcp_payload, tool_payload
 
 GROK_MCP_HEADERS = {
     "Authorization": "Bearer mcp-test",
@@ -27,18 +17,10 @@ GROK_MCP_HEADERS = {
 
 
 def _parse_mcp_payload(response) -> dict[str, Any]:
-    body = response.text.strip()
     try:
-        return json.loads(body)
-    except json.JSONDecodeError:
-        pass
-    for line in body.splitlines():
-        line = line.strip()
-        if line.startswith("data:"):
-            payload = line[5:].strip()
-            if payload and payload != "[DONE]":
-                return json.loads(payload)
-    raise AssertionError(f"MCP response was not JSON: {body[:500]}")
+        return parse_mcp_payload(response.text)
+    except ValueError as exc:
+        raise AssertionError(str(exc)) from exc
 
 
 def _mcp_session_headers(response) -> dict[str, str]:
@@ -67,17 +49,11 @@ def _prepare_arguments() -> dict[str, Any]:
 
 
 def _tool_payload(response) -> dict[str, Any]:
-    result = _parse_mcp_payload(response)["result"]
-    assert result.get("isError") is not True, result
-    if "structuredContent" in result and isinstance(result["structuredContent"], dict):
-        structured = result["structuredContent"]
-        if structured.get("plan_id") or "confirmation_summary" in structured:
-            return structured
-    text = result["content"][0]["text"]
-    parsed = json.loads(text)
-    if "result" in parsed and isinstance(parsed["result"], dict):
-        return parsed["result"]
-    return parsed
+    result = _parse_mcp_payload(response).get("result") or {}
+    try:
+        return tool_payload(result)
+    except ValueError as exc:
+        raise AssertionError(str(exc)) from exc
 
 
 @respx.mock

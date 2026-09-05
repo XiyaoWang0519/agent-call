@@ -5,8 +5,8 @@ from fastapi.testclient import TestClient
 
 from app.grok_oauth.constants import GROK_MCP_PATH
 from app.main import create_app
+from app.smoke_prepare import EXPECTED_TOOLS
 from tests.oauth_helpers import (
-    EXPECTED_TOOLS,
     complete_owner_login,
     mcp_headers,
     parse_mcp_payload,

@@ -7,7 +7,11 @@ set -eu
 if [ "$(id -u)" -eq 0 ]; then
     for data_dir in /data /var/data; do
         if [ -d "$data_dir" ]; then
-            chown --recursive --no-dereference app:app "$data_dir"
+            # Image-owned directories may be on a read-only root filesystem.
+            # Leave correct ownership alone; repair only mismatched entries
+            # in writable persistent volumes. find does not follow symlinks.
+            find "$data_dir" \( ! -user app -o ! -group app \) \
+                -exec chown --no-dereference app:app {} +
         fi
     done
     exec gosu app "$@"

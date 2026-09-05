@@ -28,6 +28,7 @@ from app.twilio_bridge import ParticipantInfo
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(
+        agent_call_profile="live",
         openai_api_key=SecretStr("sk-test"),
         openai_webhook_secret=SecretStr(
             "whsec_" + base64.b64encode(b"test webhook secret").decode()

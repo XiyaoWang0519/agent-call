@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from contextvars import ContextVar
 from functools import cached_property
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings.sources import EnvSettingsSource, PydanticBaseSettingsSource
+from pydantic_settings.sources.utils import parse_env_vars
 
+from app.evaluation import EVALUATION_SECRET_FIELDS, EVALUATION_STRING_FIELDS
 from app.grok_oauth.constants import (
     ACCESS_TOKEN_TTL_MAX_SECONDS,
     ACCESS_TOKEN_TTL_MIN_SECONDS,
@@ -33,9 +38,51 @@ SUPPORTED_TRANSCRIPTION_MODELS = frozenset(
 )
 TRANSCRIPTION_DELAYS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 _LOOPBACK_HOSTS = frozenset({"localhost", "localhost."})
+_E164_PATTERN = re.compile(r"\+[1-9]\d{1,14}")
+_COUNTRY_PREFIX_PATTERN = re.compile(r"\+[1-9]\d{0,2}")
+
+CORE_RUNTIME_ENV_NAMES: tuple[str, ...] = (
+    "OPENAI_API_KEY",
+    "OPENAI_WEBHOOK_SECRET",
+    "OPENAI_PROJECT_ID",
+    "EXA_API_KEY",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_CALLER_ID",
+    "OWNER_PHONE_E164",
+    "ALLOWED_AGENT_USER_ID",
+    "MCP_BEARER_TOKEN",
+    "DEBUG_API_TOKEN",
+    "DEPLOY_GUARD_TOKEN",
+    "PUBLIC_BASE_URL",
+)
+OAUTH_RUNTIME_ENV_NAMES: tuple[str, ...] = (
+    "GROK_MCP_OAUTH_OWNER_SECRET_HASH",
+    "GROK_MCP_OAUTH_SIGNING_KEY",
+    "GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY",
+)
+
+_settings_source_override: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "settings_source_override", default=None
+)
+_FIELD_IN_MESSAGE = re.compile(r'field "([A-Za-z_][A-Za-z0-9_]*)"')
+_ENV_TOKEN = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
 
 
-def _is_loopback_host(hostname: str | None) -> bool:
+class _MappingEnvSource(EnvSettingsSource):
+    """EnvSettingsSource that reads an explicit mapping instead of os.environ."""
+
+    def __init__(self, settings_cls: type[BaseSettings], mapping: Mapping[str, str]) -> None:
+        self._mapping = dict(mapping)
+        super().__init__(settings_cls)
+
+    def _load_env_vars(self) -> Mapping[str, str | None]:
+        return parse_env_vars(
+            self._mapping, self.case_sensitive, self.env_ignore_empty, self.env_parse_none_str
+        )
+
+
+def is_loopback_host(hostname: str | None) -> bool:
     if hostname is None:
         return False
     if hostname.casefold() in _LOOPBACK_HOSTS:
@@ -44,6 +91,43 @@ def _is_loopback_host(hostname: str | None) -> bool:
         return ip_address(hostname).is_loopback
     except ValueError:
         return False
+
+
+def is_loopback_bind_host(host: str) -> bool:
+    return is_loopback_host(host.strip("[]"))
+
+
+def is_e164_phone(value: str) -> bool:
+    return bool(_E164_PATTERN.fullmatch(value))
+
+
+def _is_blank_secret(value: SecretStr | None) -> bool:
+    return value is None or not value.get_secret_value().strip()
+
+
+def _is_blank_str(value: str | None) -> bool:
+    return value is None or not value.strip()
+
+
+def _is_blank_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, SecretStr):
+        return not value.get_secret_value().strip()
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def is_https_origin(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.netloc)
+        and parsed.path in {"", "/"}
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 class Settings(BaseSettings):
@@ -98,6 +182,8 @@ class Settings(BaseSettings):
     max_call_seconds: Literal[600] = 600
     owner_timezone: str = "America/Los_Angeles"
 
+    agent_call_profile: Literal["live", "evaluation"] | None = None
+
     grok_mcp_oauth_enabled: bool = False
     grok_mcp_oauth_owner_secret_hash: SecretStr | None = None
     grok_mcp_oauth_signing_key: SecretStr | None = None
@@ -127,14 +213,14 @@ class Settings(BaseSettings):
     @field_validator("allowed_country_codes")
     @classmethod
     def validate_country_codes(cls, value: list[str]) -> list[str]:
-        if not value or any(not re.fullmatch(r"\+[1-9]\d{0,2}", item) for item in value):
+        if not value or any(not _COUNTRY_PREFIX_PATTERN.fullmatch(item) for item in value):
             raise ValueError("ALLOWED_COUNTRY_CODES must contain E.164 country prefixes")
         return value
 
     @field_validator("twilio_caller_id", "owner_phone_e164")
     @classmethod
     def validate_configured_phone(cls, value: str | None) -> str | None:
-        if value and not re.fullmatch(r"\+[1-9]\d{1,14}", value):
+        if value and not is_e164_phone(value):
             raise ValueError("configured phone numbers must use E.164")
         return value
 
@@ -143,14 +229,7 @@ class Settings(BaseSettings):
     def validate_public_base_url(cls, value: str | None) -> str | None:
         if not value:
             return value
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme != "https"
-            or not parsed.netloc
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
+        if not is_https_origin(value):
             raise ValueError("PUBLIC_BASE_URL must be an HTTPS origin without a path or query")
         return value.rstrip("/")
 
@@ -163,7 +242,7 @@ class Settings(BaseSettings):
         if not stripped:
             return None
         parsed = urlsplit(stripped)
-        loopback = _is_loopback_host(parsed.hostname)
+        loopback = is_loopback_host(parsed.hostname)
         https_ok = parsed.scheme == "https"
         http_loopback_ok = parsed.scheme == "http" and loopback
         if (
@@ -263,6 +342,32 @@ class Settings(BaseSettings):
             raise ValueError("GROK_MCP_OAUTH_AUTH_CODE_TTL_SECONDS is outside the allowed range")
         return self
 
+    @model_validator(mode="after")
+    def apply_evaluation_profile(self) -> Settings:
+        if self.agent_call_profile != "evaluation":
+            return self
+        for field, dummy in EVALUATION_SECRET_FIELDS:
+            if _is_blank_secret(getattr(self, field)):
+                setattr(self, field, SecretStr(dummy))
+        for field, dummy in EVALUATION_STRING_FIELDS:
+            if _is_blank_str(getattr(self, field)):
+                setattr(self, field, dummy)
+        return self
+
+    @property
+    def effective_profile(self) -> Literal["live", "evaluation"]:
+        return self.agent_call_profile or "live"
+
+    @property
+    def live_calls_enabled(self) -> bool:
+        return self.effective_profile == "live"
+
+    @property
+    def has_core_runtime_credentials(self) -> bool:
+        return any(
+            not _is_blank_value(getattr(self, name.lower())) for name in CORE_RUNTIME_ENV_NAMES
+        )
+
     @cached_property
     def database_path(self) -> Path:
         prefix = "sqlite:///"
@@ -272,44 +377,47 @@ class Settings(BaseSettings):
         path = Path(raw)
         return path if path.is_absolute() else Path.cwd() / path
 
-    def require_runtime_configuration(self) -> None:
-        required = {
-            "OPENAI_API_KEY": self.openai_api_key,
-            "OPENAI_WEBHOOK_SECRET": self.openai_webhook_secret,
-            "OPENAI_PROJECT_ID": self.openai_project_id,
-            "EXA_API_KEY": self.exa_api_key,
-            "TWILIO_ACCOUNT_SID": self.twilio_account_sid,
-            "TWILIO_AUTH_TOKEN": self.twilio_auth_token,
-            "TWILIO_CALLER_ID": self.twilio_caller_id,
-            "OWNER_PHONE_E164": self.owner_phone_e164,
-            "ALLOWED_AGENT_USER_ID": self.allowed_agent_user_id,
-            "MCP_BEARER_TOKEN": self.mcp_bearer_token,
-            "DEBUG_API_TOKEN": self.debug_api_token,
-            "DEPLOY_GUARD_TOKEN": self.deploy_guard_token,
-            "PUBLIC_BASE_URL": self.public_base_url,
-        }
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        override = _settings_source_override.get()
+        if override is None:
+            return init_settings, env_settings, dotenv_settings, file_secret_settings
+        return (init_settings, _MappingEnvSource(settings_cls, override))
 
-        def is_missing(value: object) -> bool:
-            if value is None:
-                return True
-            if isinstance(value, SecretStr):
-                return not value.get_secret_value().strip()
-            if isinstance(value, str):
-                return not value.strip()
-            return False
+    @classmethod
+    def from_environ(cls, environ: Mapping[str, str], **values: Any) -> Self:
+        """Build Settings from an explicit mapping; ignores process env and dotenv.
 
+        A ContextVar swaps the env source so pydantic-settings parses `environ`
+        instead of os.environ. Used by doctor and tests that need isolation.
+        """
+        token = _settings_source_override.set(dict(environ))
+        try:
+            return cls(**values)
+        finally:
+            _settings_source_override.reset(token)
+
+    @classmethod
+    def from_values(cls, **values: Any) -> Self:
+        """Construct Settings from constructor values only; ignores process env and dotenv."""
+        return cls.from_environ({}, **values)
+
+    def runtime_env_values(self) -> dict[str, object]:
+        names: tuple[str, ...] = CORE_RUNTIME_ENV_NAMES
         if self.grok_mcp_oauth_enabled:
-            required.update(
-                {
-                    "GROK_MCP_OAUTH_OWNER_SECRET_HASH": self.grok_mcp_oauth_owner_secret_hash,
-                    "GROK_MCP_OAUTH_SIGNING_KEY": self.grok_mcp_oauth_signing_key,
-                    "GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY": (
-                        self.grok_mcp_oauth_storage_encryption_key
-                    ),
-                }
-            )
+            names = CORE_RUNTIME_ENV_NAMES + OAUTH_RUNTIME_ENV_NAMES
+        return {name: getattr(self, name.lower()) for name in names}
 
-        missing = [name for name, value in required.items() if is_missing(value)]
+    def require_runtime_configuration(self) -> None:
+        required = self.runtime_env_values()
+        missing = [name for name, value in required.items() if _is_blank_value(value)]
         if missing:
             raise RuntimeError(f"missing required environment variables: {', '.join(missing)}")
 
@@ -318,3 +426,32 @@ class Settings(BaseSettings):
         if value is None:
             raise RuntimeError("required secret is not configured")
         return value.get_secret_value()
+
+
+def _env_name_from_text(text: str) -> str | None:
+    quoted = _FIELD_IN_MESSAGE.search(text)
+    if quoted is not None:
+        field = str(quoted.group(1))
+        if field in Settings.model_fields:
+            return field.upper()
+    for token in _ENV_TOKEN.findall(text):
+        name = str(token)
+        if name.lower() in Settings.model_fields:
+            return name
+    return None
+
+
+def settings_error_check(exc: BaseException) -> tuple[str, str]:
+    """Named, value-free (env-style field, detail) for a Settings construction failure."""
+    if isinstance(exc, ValidationError):
+        for err in exc.errors():
+            loc_parts = [part for part in err.get("loc", ()) if isinstance(part, str)]
+            if loc_parts and loc_parts[-1] in Settings.model_fields:
+                return loc_parts[-1].upper(), "invalid"
+            parsed = _env_name_from_text(str(err.get("msg") or ""))
+            if parsed:
+                return parsed, "invalid"
+    parsed = _env_name_from_text(str(exc))
+    if parsed:
+        return parsed, "invalid"
+    return "settings", "invalid"

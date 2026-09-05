@@ -23,6 +23,7 @@ export OWNER_PHONE_E164="+15550000001" ALLOWED_AGENT_USER_ID="smoke-user"
 export MCP_BEARER_TOKEN="smoke-bearer" DEBUG_API_TOKEN="smoke-debug" DEPLOY_GUARD_TOKEN="smoke-deploy"
 export PUBLIC_BASE_URL="https://smoke.example.com"
 export DATABASE_URL="sqlite:///$WORKDIR/smoke.db"
+export AGENT_CALL_PROFILE="${AGENT_CALL_PROFILE:-evaluation}"
 export AGENT_PUSH_ENABLED="false" ASK_AGENT_ENABLED="true"
 
 cd "$ROOT"

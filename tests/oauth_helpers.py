@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import re
 import secrets
 from typing import Any
@@ -12,17 +11,8 @@ from fastapi.testclient import TestClient
 
 from app.grok_oauth.constants import GROK_OAUTH_SCOPE
 from app.grok_oauth.provider import grok_mcp_resource
+from app.smoke_prepare import parse_mcp_payload as parse_mcp_body
 from tests.conftest import GROK_OAUTH_OWNER_SECRET
-
-EXPECTED_TOOLS = {
-    "prepare_phone_call",
-    "start_phone_call",
-    "get_call_result",
-    "end_phone_call",
-    "get_phone_call",
-    "wait_for_call_event",
-    "answer_call_question",
-}
 
 CSRF_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
 TX_RE = re.compile(r'name="tx" value="([^"]+)"')
@@ -37,18 +27,10 @@ def pkce_pair() -> tuple[str, str]:
 
 
 def parse_mcp_payload(response) -> dict[str, Any]:
-    body = response.text.strip()
     try:
-        return json.loads(body)
-    except json.JSONDecodeError:
-        pass
-    for line in body.splitlines():
-        line = line.strip()
-        if line.startswith("data:"):
-            payload = line[5:].strip()
-            if payload and payload != "[DONE]":
-                return json.loads(payload)
-    raise AssertionError(f"MCP response was not JSON: {body[:500]}")
+        return parse_mcp_body(response.text)
+    except ValueError as exc:
+        raise AssertionError(str(exc)) from exc
 
 
 def register_test_client(

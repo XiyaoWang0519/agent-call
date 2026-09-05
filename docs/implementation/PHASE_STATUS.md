@@ -1,0 +1,45 @@
+# Phase status
+
+**Current public work:** Phase 1 — self-hosted product release and two golden paths.
+
+**Planning baseline:** private (not in this public repository). Public work follows [ADR-001](DECISIONS.md) and [ASSUMPTIONS.md](ASSUMPTIONS.md).
+
+**Builder record date:** 2026-08-28
+
+**Latest verification:** [2026-09-04](evidence/2026-09-04-verification.md), code
+`1c6418b41b455d42a02d95e97d5049a43d2ed896`: 485 tests passed, 88.04% coverage;
+real Docker build, context exclusion, read-only/non-root startup, prepare-only
+MCP and named-volume persistence after container recreation all passed.
+This supersedes the historical Phase 1 record below, including its Docker-offline
+limitation. The increment is ready for PR review; the remaining public release
+and managed-product gates are still pending.
+
+## Entry / exit
+
+| Phase | Entry | Exit | Status |
+| --- | --- | --- | --- |
+| 0 | Plan accepted as baseline | Ten ADRs approved; no TBD affecting schema or provider spend | **Partial.** ADR-001 accepted. ADRs 002–010 and Section 19 questions are unresolved blockers (see [ASSUMPTIONS.md](ASSUMPTIONS.md)). No managed-provider spend. |
+| 1 | ADR-001 accepted | Section 3.1 public DX gates that can be proven in this repo; evaluation/dummy boot; doctor; prepare-only smoke; fork-safe Fly template | **In progress (this increment implemented; not tagged)** |
+| 2–9 | Prior phase exit + listed ADRs | See program plan | **Not started.** Do not begin. |
+
+## Phase 1 record
+
+| Field | Value |
+| --- | --- |
+| Commit SHA | `0ee257e3a9059641f7b76160035e849e8f101b68` (verification record; allowlist `8e8f199`; doctor `ff56668`; squash `089ed0f`; origin/main `c2964b5`) |
+| Public artifact versions/digests | none published (no signed wheel/image in this increment) |
+| Database migration version | unchanged SQLite schema; no migration |
+| Enabled flags | `AGENT_CALL_PROFILE` is unset by default in Settings (`effective_profile` is `live`). `agent-call serve` uses that Settings object for bind policy and refuses an unset profile when any core runtime credential is present (process env or dotenv). Dummy/Compose set `evaluation` explicitly. |
+| Tests and exit codes | `uv run ruff format --check app tests scripts` → 0; `uv run ruff check app tests scripts` → 0; `uv run mypy app` → 0; `uv run pytest -q --cov=app` → 0, **482 passed**, **app coverage 88%** (88.03%, floor 85%); `uv run pre-commit run --all-files` → 0; `docker compose config -q` → 0; `git diff --check origin/main...HEAD` → 0; `gitleaks git . --log-opts=HEAD --redact --no-banner` → 0 (104 commits, no leaks); `uv run agent-call doctor --dummy` → 0; `uv run python -m app doctor --dummy` → 0 |
+| Evidence | [evidence/](evidence/) |
+| Known limitations | Five-person usability study, non-maintainer Fly live deploy, signed GHCR/SBOM provenance, and macOS CI are out of scope. Docker Compose CLI is present (v2.36.0) and `docker compose config -q` succeeds, but the **daemon is not running** (`Cannot connect to the Docker daemon`); Compose build/up, image build, `/healthz` through Compose, smoke-prepare against Compose, and named-volume persistence after restart were **not exercised**. `.dockerignore` is covered by `tests/test_container_security.py` only. Source dummy boot evidence from the prior increment remains. Clean-machine, fresh non-maintainer Fly deployment, and rollback gates have not been run. |
+| Rollback | [ROLLBACKS.md](ROLLBACKS.md) Phase 1 |
+| Unresolved findings | ADRs 002–010; Section 19 owner questions |
+
+## Forbidden in this increment
+
+- Phase 2 engine-port extraction or wheel publish
+- Creating `agent-call-cloud`
+- Inventing launch jurisdiction, pricing, retention, or provider contracts
+- Adding `tenant_id` / `MANAGED=true`
+- Live SIP canary, number purchase, production deploy, webhook change, provider spend

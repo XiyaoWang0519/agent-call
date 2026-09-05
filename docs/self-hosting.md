@@ -1,11 +1,50 @@
 # Self-hosting
 
-This is the operator guide for running your **own** Agent Call instance. The repository's `fly.toml` describes the maintainer's production app (`agent-call` at `https://agent-call.fly.dev`). **Forks must choose a different Fly application name and public URL. Do not deploy to the maintainer's `agent-call` app.**
+This is the operator guide for running **your own** Agent Call instance. Choose one golden path:
+
+1. **Local dummy** — no provider credentials; `/healthz`, MCP initialize, seven tools, `prepare_phone_call`. `start_phone_call` returns `live_calls_disabled`.
+2. **Local live (prepare-only first)** — your Twilio/OpenAI accounts and a public HTTPS tunnel. Prepare a plan; do not start a call until you intend to ring a phone.
+3. **Supported web host** — one Fly Machine you own, using the template `fly.toml`.
+
+Managed Agent Call is a forthcoming private service. It is not configured from this file.
 
 > [!CAUTION]
-> Filling real Twilio and OpenAI credentials and exposing a public webhook URL can place **real billable phone calls**. Use dummy values until you intend to spend money and ring a real phone.
+> Filling real Twilio and OpenAI credentials and exposing a public webhook URL can place **real billable phone calls**. Stay on the evaluation profile until you intend to spend money and ring a real phone.
 
-## Prerequisites
+## Local dummy
+
+No OpenAI, Twilio, or Exa accounts. The evaluation profile fills obvious dummy values and disables live calls. The default listener is loopback.
+
+```bash
+uv sync --all-groups --frozen
+uv run agent-call doctor --dummy
+uv run agent-call serve --profile evaluation --host 127.0.0.1 --port 8000
+```
+
+In another terminal:
+
+```bash
+curl -fsS http://127.0.0.1:8000/healthz
+uv run agent-call doctor --prepare-only
+uv run agent-call smoke-prepare
+```
+
+Compose (named volume, host loopback only, non-root runtime user, no credentials
+in the image; `.dockerignore` keeps `.git`, env files, and local data out of the
+build context):
+
+```bash
+docker compose up --build
+uv run agent-call smoke-prepare
+```
+
+`uv run python -m app` is equivalent to `uv run agent-call`. Evaluation refuses `--host 0.0.0.0` unless you pass `--unsafe-bind`. Bind publishing is a host/Compose concern; the Settings object does not own it.
+
+Troubleshooting: [troubleshooting.md](troubleshooting.md).
+
+## Local live (prepare-only)
+
+### Prerequisites
 
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - A voice-enabled Twilio account (E.164 caller ID, outbound SIP, Conference Participant AMD)
@@ -13,23 +52,32 @@ This is the operator guide for running your **own** Agent Call instance. The rep
 - An Exa API key (in-call web search)
 - A stable public HTTPS origin for webhooks
 
-You do **not** need those accounts to run lint and tests. See the credential-free path in the [README](../README.md#evaluate-without-credentials).
+You do **not** need those accounts for dummy boot or for lint/tests.
 
-## Configure and run locally
+### Configure
 
 ```bash
 test -e .env.local || cp .env.example .env.local   # guarded: keeps a saved key
 uv sync --all-groups --frozen
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Fill every required value in `.env.local`. Generate `MCP_BEARER_TOKEN`, `DEBUG_API_TOKEN`, and `DEPLOY_GUARD_TOKEN` with `openssl rand -hex 32`. Leave `ALLOWED_COUNTRY_CODES` unset in dotenv files (the app defaults to `["+1"]`). Never commit env files — `.gitignore` already excludes them.
+Fill every required **core** value in `.env.local`. Generate `MCP_BEARER_TOKEN`, `DEBUG_API_TOKEN`, and `DEPLOY_GUARD_TOKEN` with `openssl rand -hex 32`. Leave `ALLOWED_COUNTRY_CODES` unset in dotenv files (the app defaults to `["+1"]`). Never commit env files — `.gitignore` already excludes them.
 
-Booting the app requires every variable in `Settings.require_runtime_configuration` (`app/settings.py`) or the lifespan aborts at startup. Dummy values are enough for a local process; real Twilio/OpenAI credentials plus a public HTTPS tunnel are only needed for live calls.
+Booting a **live** process requires every variable in `Settings.require_runtime_configuration` (`app/settings.py`) or the lifespan aborts at startup.
 
 Do not put `ALLOWED_COUNTRY_CODES` in `.env.local`. pydantic-settings JSON-decodes list-typed fields, so `ALLOWED_COUNTRY_CODES=+1` crashes boot. Omit it and rely on the `+1` default. For a non-default allowlist, set a JSON list in the process environment (for example `ALLOWED_COUNTRY_CODES=["+1"]`).
 
-## Expose webhooks
+Do not run `doctor --live-ready` yet. That command includes DNS/TLS and health-path checks, so it is truthful only after the live server and a public HTTPS origin exist.
+
+### Boot the live server
+
+```bash
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+`uvicorn app.main:app` defaults to the live profile (unset `AGENT_CALL_PROFILE`). Dummy boot is `--profile evaluation` (or `AGENT_CALL_PROFILE=evaluation`). `agent-call serve` loads the same Settings object uvicorn will build, so evaluation-from-dotenv still refuses a non-loopback bind unless `--unsafe-bind` is passed. Core credentials in `.env.local` or the process environment without an explicit profile are refused — pass `--profile live` or set `AGENT_CALL_PROFILE=live` (this will place billable calls). Evaluation bind is CLI `--unsafe-bind` only; `AGENT_CALL_UNSAFE_BIND` is not a Settings field and is not honored.
+
+### Expose webhooks
 
 Webhooks need a public HTTPS origin. Start the server, then tunnel port 8000:
 
@@ -43,7 +91,19 @@ In **OpenAI Platform → Project → Webhooks**, create `https://YOUR_HOST/webho
 
 No static Twilio webhook is needed — every Conference Participant request carries its own signed status, conference, and AMD callback URLs. Confirm the Twilio account can call the OpenAI SIP URI and can use AMD on `/Participants`.
 
-## Point an agent at it
+### Check live connectivity
+
+After the live-profile process is up and `PUBLIC_BASE_URL` is a reachable HTTPS origin:
+
+```bash
+uv run agent-call doctor --live-ready
+```
+
+`doctor --live-ready` reports missing, blank, or malformed values **without printing secrets or full E.164 numbers**. It also probes SQLite writability (without altering the real database), DNS/TLS plus `/healthz` and `/webhooks/openai` on `PUBLIC_BASE_URL`, and non-billable Twilio/OpenAI metadata. Exa search and the OpenAI webhook signing secret stay **UNVERIFIED** because there is no side-effect-free check; the command then exits 1 and does not claim complete live readiness. It fails if `AGENT_CALL_PROFILE=evaluation`.
+
+Then run a prepare-only MCP client call (or `uv run agent-call smoke-prepare` against that process using your live MCP bearer). Do not invoke `start_phone_call` until a separately authorized canary.
+
+### Point an agent at it
 
 **OpenClaw**
 
@@ -166,13 +226,6 @@ token pair is issued. Expired authorization codes, access JTIs, refresh tokens
 (consumed or not), and token families are deleted at process start and whenever
 a token pair is issued; valid durable refresh families are left untouched.
 
-Residual: unauthenticated DCR can still cause **bounded churn** (creating and
-evicting unused clients, rotating the newest 2048 audit rows, filling the
-authorization-transaction cap until rows expire). It cannot grow
-`oauth_clients`, `oauth_audit`, or `oauth_auth_transactions` without bound.
-Expired OAuth rows other than audit and authorization transactions may linger
-until the next token issuance or process start if the host never issues tokens.
-
 Changing `PUBLIC_BASE_URL` (including a free-tier tunnel restart) does not
 re-derive the storage encryption key. Existing OAuth ciphertext stays readable;
 the operator still removes the old Grok connector and adds the new URL.
@@ -188,46 +241,47 @@ remain billable.
 
 ## Deploying (your own Fly app)
 
-Create **your** Fly app and volume. Do not use `agent-call` unless you are the maintainer of this repository:
+Create **your** Fly app and volume. Replace `YOUR_FLY_APP_NAME` in `fly.toml`
+before deploying. Do not use a maintainer overlay.
 
 ```bash
-flyctl apps create YOUR_APP_NAME
-# If agent-call is taken — it is, for the maintainer — pick another name.
-# Update fly.toml `app`, `[env].PUBLIC_BASE_URL`, and any CI that references the app.
-flyctl volumes create agent_call_data --region lax --size 1 -a YOUR_APP_NAME
+flyctl apps create YOUR_FLY_APP_NAME
+# Update fly.toml `app` to the same name.
+flyctl volumes create agent_call_data --region lax --size 1 -a YOUR_FLY_APP_NAME
 
 # The service runs as fixed non-root UID 10001. The entrypoint also repairs
 # legacy root-owned volume contents during upgrades.
 flyctl machine run python:3.13-slim sleep infinity \
-  --app YOUR_APP_NAME --region lax --volume agent_call_data:/data \
+  --app YOUR_FLY_APP_NAME --region lax --volume agent_call_data:/data \
   --restart no --detach
-flyctl machine list -a YOUR_APP_NAME
-flyctl ssh console -a YOUR_APP_NAME -C \
+flyctl machine list -a YOUR_FLY_APP_NAME
+flyctl ssh console -a YOUR_FLY_APP_NAME -C \
   'chown 10001:10001 /data && chmod 750 /data'
-flyctl machine destroy <maintenance-machine-id> -a YOUR_APP_NAME --force
+flyctl machine destroy <maintenance-machine-id> -a YOUR_FLY_APP_NAME --force
 ```
 
-`fly.toml` as committed defines production at `https://agent-call.fly.dev`: one always-on shared-CPU machine, 512 MB RAM, a 1 GB volume at `/data`, and SQLite at `sqlite:////data/agent_call.db`. Change `app` and `PUBLIC_BASE_URL` before deploying a fork.
+Set `PUBLIC_BASE_URL` with secrets (HTTPS origin of **your** app, no path):
 
 ```bash
+flyctl secrets set PUBLIC_BASE_URL=https://YOUR_FLY_APP_NAME.fly.dev -a YOUR_FLY_APP_NAME
 flyctl config validate
-flyctl deploy --ha=false --remote-only -a YOUR_APP_NAME
-curl -fsS https://YOUR_APP_NAME.fly.dev/healthz
+flyctl deploy --ha=false --remote-only -a YOUR_FLY_APP_NAME
+curl -fsS https://YOUR_FLY_APP_NAME.fly.dev/healthz
 ```
 
-Set every required value from `.env.example` with `flyctl secrets set` or `flyctl secrets import`. Point the OpenAI project webhook at `https://YOUR_HOST/webhooks/openai` (subscribed to `realtime.call.incoming`). After rotating the signing secret:
+Set every required live value from `.env.example` with `flyctl secrets set` or `flyctl secrets import`. Point the OpenAI project webhook at `https://YOUR_HOST/webhooks/openai` (subscribed to `realtime.call.incoming`). After rotating the signing secret:
 
 ```bash
-flyctl secrets deploy -a YOUR_APP_NAME
-flyctl status -a YOUR_APP_NAME
+flyctl secrets deploy -a YOUR_FLY_APP_NAME
+flyctl status -a YOUR_FLY_APP_NAME
 ```
 
 > [!IMPORTANT]
-> Keep exactly **one** Machine. SQLite state is volume-local; a second Machine would not share call state. `render.yaml` remains available as a paid Render alternative.
+> Keep exactly **one** Machine. SQLite state is volume-local; a second Machine would not share call state. `render.yaml` is an alternate Docker web service; it is not the Fly template.
 
-**Maintainer CI/CD:** `.github/workflows/fly-deploy.yml` runs the locked test suite and deploys every push to `main` of **this** repository to `agent-call`. It serializes production deployments, waits up to 10 minutes for active calls to finish via the authenticated `/internal/deployment-lock` lease, keeps `--ha=false`, and checks `/healthz` before reporting success. It needs the repository secrets `FLY_API_TOKEN` (app-scoped deploy token) and `DEPLOY_GUARD_TOKEN` — store the latter independently from the MCP and debug tokens; it can only touch the deployment lease. The lease is acquired atomically only when no call is active, blocks new calls while a deployment starts, expires after 15 minutes if canceled, and is cleared by a successful restart.
-
-Forks should not assume that workflow will deploy their app. Point it at a Fly app you own, or disable it.
+The GitHub deploy workflow is upstream-maintainer-only and does not run on
+forks. Forks should not assume it will ship their app. Deploy **your** Fly
+app from `fly.toml` with `YOUR_FLY_APP_NAME`.
 
 ## Rollback
 
@@ -240,8 +294,8 @@ curl --fail-with-body -sS --request POST \
   https://YOUR_HOST/internal/deployment-lock
 
 # List image references and redeploy the previous healthy image
-flyctl releases --image -a YOUR_APP_NAME
-flyctl deploy --image <previous-image-reference> -a YOUR_APP_NAME --ha=false --remote-only
+flyctl releases --image -a YOUR_FLY_APP_NAME
+flyctl deploy --image <previous-image-reference> -a YOUR_FLY_APP_NAME --ha=false --remote-only
 
 # Verify
 curl -fsS https://YOUR_HOST/healthz
