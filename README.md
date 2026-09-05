@@ -172,6 +172,11 @@ Forks must not copy a maintainer overlay. The user template does not name a pre-
 
 ## Live SIP canary
 
+For unattended real calls to dedicated automated callee and owner numbers, use the
+[automated live-phone harness](docs/live-phone-runbook.md). It records received audio,
+tests conversation and tools, and reports independent audio and provider-cleanup evidence.
+The manual canary below still requires a person with a phone.
+
 > [!CAUTION]
 > The following commands place a **real billable call** to `OWNER_PHONE_E164`. They need real credentials, a public HTTPS URL, and a human with a phone. Do not run them in CI, on a fork against someone else's app, or casually while browsing the repo.
 
