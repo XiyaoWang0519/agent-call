@@ -9,6 +9,14 @@ published release.
 
 ## Unreleased
 
+### Fixed
+
+- Compose can start with a read-only root filesystem: the entrypoint repairs
+  only mismatched ownership in data directories before dropping privileges.
+- SQLite doctor rejects unwritable zero-byte targets without modifying them.
+- Docker context exclusions also cover nested logs, transcripts, runtime data,
+  SQLite files, and journal files under otherwise allowed source directories.
+
 ### Added
 
 - Evaluation/dummy profile (`AGENT_CALL_PROFILE=evaluation`) that boots without

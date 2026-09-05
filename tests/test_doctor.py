@@ -599,6 +599,24 @@ def test_probe_sqlite_zero_byte_file_behaves_like_new_location(tmp_path: Path):
     assert _leftover_probe_paths(tmp_path) == []
 
 
+def test_probe_sqlite_zero_byte_file_rejects_write_open_failure(tmp_path: Path, monkeypatch):
+    target = tmp_path / "empty.db"
+    target.touch()
+    original_open = Path.open
+
+    def guarded_open(path, mode="r", *args, **kwargs):
+        if path == target and mode == "r+b":
+            raise PermissionError("private path must not be printed")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    result = probe_sqlite(target)
+    assert result.status is CheckStatus.FAIL
+    assert result.detail == "database is not writable"
+    assert target.read_bytes() == b""
+    assert _leftover_probe_paths(tmp_path) == []
+
+
 def test_probe_sqlite_missing_parent_is_conservative_failure(tmp_path: Path):
     target = tmp_path / "missing-parent" / "agent_call.db"
     result = probe_sqlite(target)

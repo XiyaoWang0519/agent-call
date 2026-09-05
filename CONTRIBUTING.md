@@ -56,6 +56,19 @@ uv run pre-commit run --all-files               # local hooks: ruff, gitleaks, m
 
 `uv run pytest -q` (no `--cov`) runs the same tests without the coverage gate.
 
+With a running Docker engine, exercise the actual build-context exclusions and
+the container entrypoint on a read-only root filesystem:
+
+```bash
+docker compose build
+AGENT_CALL_DOCKER_TESTS=1 AGENT_CALL_DOCKER_IMAGE=agent-call-self-host:local \
+  uv run pytest -q tests/test_container_security.py
+```
+
+These opt-in tests use synthetic files and an isolated container with no network.
+The entrypoint test also checks ownership repair of a root-owned temporary volume.
+Ordinary test runs skip these two tests and do not require Docker.
+
 Ruff targets Python 3.12 with a 100-character line length and enforces
 pycodestyle, Pyflakes, import sorting (`I`), pyupgrade, bugbear, and async
 rules (see `[tool.ruff]` in `pyproject.toml`). Auto-format with

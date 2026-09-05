@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 import tomllib
 from functools import lru_cache
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,6 +32,13 @@ _CONTEXT_EXCLUDED_PATHS = (
     "agent_call.db",
     "data/agent_call.db",
     "app/agent_call.db",
+    "app/agent_call.db-journal",
+    "app/calls.sqlite",
+    "app/calls.sqlite3-wal",
+    "app/debug.log",
+    "app/logs/call.json",
+    "app/transcripts/call.json",
+    "app/data/call.json",
     "scripts/live_smoke.sh",
     "docs/implementation/evidence/implementation-record.txt",
     "tests/test_container_security.py",
@@ -39,6 +51,7 @@ _CONTEXT_INCLUDED_PATHS = (
     "app",
     "app/main.py",
     "app/db/engine.py",
+    "app/db/transcripts.py",
     "scripts/agent_call_console.py",
     "scripts/container-entrypoint.sh",
 )
@@ -116,7 +129,8 @@ def test_runtime_container_uses_non_root_user():
 def test_container_repairs_legacy_volume_ownership_before_dropping_privileges():
     entrypoint = (Path(__file__).parents[1] / "scripts" / "container-entrypoint.sh").read_text()
 
-    assert "chown --recursive --no-dereference app:app" in entrypoint
+    assert "! -user app -o ! -group app" in entrypoint
+    assert "-exec chown --no-dereference app:app {} +" in entrypoint
     assert 'exec gosu app "$@"' in entrypoint
 
 
@@ -259,3 +273,76 @@ def test_runtime_image_copy_skips_secret_bearing_config():
     )
     leaked = [path for path in secret_paths if not _dockerignore_excludes(path)]
     assert leaked == [], leaked
+
+
+@pytest.mark.skipif(
+    os.environ.get("AGENT_CALL_DOCKER_TESTS") != "1",
+    reason="set AGENT_CALL_DOCKER_TESTS=1 with a running Docker engine",
+)
+def test_docker_build_context_uses_real_ignore_rules(tmp_path: Path):
+    """Export a synthetic context with BuildKit; no local credentials are read."""
+    context = tmp_path / "context"
+    output = tmp_path / "export"
+    context.mkdir()
+    shutil.copyfile(ROOT / ".dockerignore", context / ".dockerignore")
+    directories = {"app", ".git", ".venv"}
+    excluded = (*_CONTEXT_EXCLUDED_PATHS, "app/.env", "app/.env.local")
+    for name in (*_CONTEXT_INCLUDED_PATHS, *excluded):
+        path = context / name
+        if name in directories:
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("synthetic-build-context-marker\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "docker",
+            "build",
+            "--file",
+            "-",
+            "--output",
+            f"type=local,dest={output}",
+            str(context),
+        ],
+        input="FROM scratch\nCOPY . /\n",
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    for name in _CONTEXT_INCLUDED_PATHS:
+        assert (output / name).exists(), f"required build input missing: {name}"
+    for name in excluded:
+        assert not (output / name).exists(), f"private/runtime path entered build: {name}"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("AGENT_CALL_DOCKER_IMAGE"),
+    reason="set AGENT_CALL_DOCKER_IMAGE to a locally built image",
+)
+def test_entrypoint_repairs_volume_with_readonly_root():
+    # /data starts root-owned; /var/data is already app-owned and read-only.
+    # The old unconditional chown aborted before reaching the command.
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--tmpfs",
+            "/data",
+            "--tmpfs",
+            "/tmp",
+            os.environ["AGENT_CALL_DOCKER_IMAGE"],
+            "sh",
+            "-c",
+            "id -u; stat -c %u /data /var/data",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    assert result.stdout.splitlines() == ["10001", "10001", "10001"]

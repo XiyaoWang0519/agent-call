@@ -337,6 +337,11 @@ def _probe_existing_sqlite(db_path: Path) -> ProbeResult:
     if not stat.S_ISREG(info.st_mode):
         return ProbeResult(CheckStatus.FAIL, "database path is not a regular SQLite file")
     if info.st_size == 0:
+        try:
+            with db_path.open("r+b"):
+                pass
+        except OSError:
+            return ProbeResult(CheckStatus.FAIL, "database is not writable")
         # sqlite3.connect would write a header into an empty file. Probe the
         # parent like a new location and leave the zero-byte file untouched.
         return _probe_new_sqlite_location(db_path)
