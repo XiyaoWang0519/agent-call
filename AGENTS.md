@@ -59,4 +59,17 @@ Notes below cover gotchas that are non-obvious from the sections above.
 - Booting the app requires every variable in `Settings.require_runtime_configuration` (`app/settings.py`) or the lifespan aborts at startup. For local dev, copy `.env.example` to `.env.local` and fill dummy values (`.env.local` is gitignored); real Twilio/OpenAI credentials + a public HTTPS tunnel are only needed for live calls.
 - Startup gotcha: do NOT put `ALLOWED_COUNTRY_CODES` in `.env.local` (or any dotenv file). pydantic-settings JSON-decodes list-typed fields from dotenv files, so `ALLOWED_COUNTRY_CODES=+1` crashes boot with a `SettingsError`. Omit it and rely on the `+1` default.
 - The full end-to-end SIP canary (`scripts/run_sip_canary.py`) places a real billable call and needs real credentials, a public tunnel, and a human with a phone; do not run it in CI or an unattended environment. Practical verification is: `ruff format --check` + `ruff check`, `pytest -q` (all externals are mocked in `tests/conftest.py`, temp SQLite), boot the server, and drive the MCP tools via `scripts/live_smoke.sh`.
+- The separate `python -m scripts.live_phone` harness supports unattended billable tests only against an explicitly configured test instance and dedicated automated callee/owner numbers. Follow `docs/live-phone-runbook.md`; keep the independent reaper running, and never fall back to a personal number. Its credential-free regression tests run in ordinary pytest; live runs require provisioned test infrastructure and explicit instance confirmation.
 - MCP smoke test: the endpoint is `/mcp/` (Streamable HTTP) and requires both `Authorization: Bearer <MCP_BEARER_TOKEN>` and `X-Agent-User-Id: <ALLOWED_AGENT_USER_ID>`. `prepare_phone_call` runs without any external service (validates destination policy + persists a plan to SQLite); its `context.owner.callback_number` and `escalation.owner_phone` must equal `OWNER_PHONE_E164`, and a persisted `plan_id` is only returned once `authority_basis` (or `requested_by_owner`) is supplied.
+
+### Resuming automated live testing
+
+- Start with [docs/live-phone-handoff.md](docs/live-phone-handoff.md). It records the
+  working local setup, private config locations, tunnel restart procedure, basic run
+  command, evidence requirements, audio tracks, costs and known failures.
+- `--scenario basic` has passed a real call covering web search, audible interruption
+  and agent hangup. Run it first for basic acceptance; do not infer full-suite coverage.
+- Reuse the existing isolated test resources and private configuration when available.
+  Verify current processes, URLs and idle calls; old session state is not live evidence.
+- A normal pytest/MCP smoke pass is not a phone test. Report a live PASS only from that
+  run's audio, tool evidence, all assertions and verified cleanup without forced hangup.

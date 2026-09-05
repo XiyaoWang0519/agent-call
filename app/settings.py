@@ -161,6 +161,7 @@ class Settings(BaseSettings):
     ask_agent_answer_timeout_seconds: float = Field(default=60.0, gt=0, le=120)
     ask_agent_max_questions_per_call: int = Field(default=5, ge=1, le=20)
     hold_detection_enabled: bool = False
+    live_test_instance_id: str | None = Field(default=None, min_length=16, max_length=120)
     hold_max_seconds: float = Field(default=300.0, gt=0, le=600)
     wait_for_call_event_max_seconds: float = Field(default=20.0, gt=0, le=25)
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])

@@ -42,7 +42,7 @@ This is an **early-stage / v0.x self-hosted reference implementation**. Package 
 
 - **Single-owner architecture.** One configured owner phone, one allowed agent user id, one MCP bearer. This is not a general multi-tenant calling platform.
 - **SQLite and one instance.** Call state is volume-local. A second Fly Machine (or a second process sharing the same public URL) will not share state correctly.
-- **Real OpenAI and Twilio costs.** Live calls bill Realtime SIP audio plus Twilio voice. The automated test suite does not place calls; the SIP canary does.
+- **Real OpenAI and Twilio costs.** Live calls bill Realtime SIP audio plus Twilio voice. Pytest does not place calls; the SIP canary and opt-in live phone harness do.
 - **You own compliance.** Consent, recording, robocall, disclosure, and retention rules are jurisdiction-specific. The owner remains responsible. Transcripts are retained; apply retention independently of extraction success or failure.
 - **Not a drop-in hosted service.** Forks must provision their own Twilio, OpenAI, Exa, and compute accounts. The committed `fly.toml` is a template (`YOUR_FLY_APP_NAME`); it does not deploy to a maintainer app.
 
@@ -172,6 +172,11 @@ Forks must not copy a maintainer overlay. The user template does not name a pre-
 
 ## Live SIP canary
 
+For unattended real calls to dedicated automated callee and owner numbers, use the
+[automated live-phone harness](docs/live-phone-runbook.md). It records received audio,
+tests conversation and tools, and reports independent audio and provider-cleanup evidence.
+The manual canary below still requires a person with a phone.
+
 > [!CAUTION]
 > The following commands place a **real billable call** to `OWNER_PHONE_E164`. They need real credentials, a public HTTPS URL, and a human with a phone. Do not run them in CI, on a fork against someone else's app, or casually while browsing the repo.
 
@@ -193,6 +198,8 @@ Both exit nonzero if any gate fails. The debug evidence endpoint they use requir
 > No mini realtime model can be selected by configuration in v1. Do not relax the `realtime_model` literal or the `MINI_MODELS_ENABLED=false` gate until that exact model passes both canaries, including SIP tool calling.
 
 ## Documentation
+
+For future agents and local sessions, start with the [live phone testing handoff](docs/live-phone-handoff.md).
 
 | Doc | Contents |
 | --- | --- |
