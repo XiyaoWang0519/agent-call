@@ -1,5 +1,8 @@
 Phase 1 public increment record (redacted)
 
+Historical August 28 builder record. Superseded by 2026-09-04-verification.md
+for current code, tests, Docker startup, build-context checks and persistence.
+
 Branch: phase1-sanitized
 origin/main (ancestor): c2964b5868eccf593844336096f99a0f55914675
 Phase 1 squash: 089ed0f2821d839192897d286ade89aff95adb39

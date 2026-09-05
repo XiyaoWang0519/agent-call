@@ -7,6 +7,10 @@ customer identifiers in this directory.
 
 Files written by the Phase 1 builder:
 
+- [2026-09-04-verification.md](2026-09-04-verification.md) — latest independent
+  verification, actual Docker build/startup/persistence, final fixes and test totals;
+  supersedes the older Docker-unavailable notes below
+
 - `ruff-mypy-pytest.log` — format, lint, types, coverage-gated pytest, pre-commit, gitleaks
 - `dockerfile-force-include.log` — hatch force-include paths are COPYed before uv sync
 - `container-security.log` — `.dockerignore` allowlist and explicit Dockerfile COPY

@@ -6,6 +6,14 @@
 
 **Builder record date:** 2026-08-28
 
+**Latest verification:** [2026-09-04](evidence/2026-09-04-verification.md), code
+`1c6418b41b455d42a02d95e97d5049a43d2ed896`: 485 tests passed, 88.04% coverage;
+real Docker build, context exclusion, read-only/non-root startup, prepare-only
+MCP and named-volume persistence after container recreation all passed.
+This supersedes the historical Phase 1 record below, including its Docker-offline
+limitation. The increment is ready for PR review; the remaining public release
+and managed-product gates are still pending.
+
 ## Entry / exit
 
 | Phase | Entry | Exit | Status |
