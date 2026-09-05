@@ -129,6 +129,7 @@ class Session:
                     model=self.asr_model,
                     file=("received.wav", wav_bytes(pcm), "audio/wav"),
                     response_format="json",
+                    language="en",
                 )
                 # No prompt/expected text: the observer must hear the answer independently.
                 self.transcripts.append({"start": start, "end": end, "text": result.text})
@@ -238,6 +239,10 @@ class Session:
             for index, step in enumerate(steps):
                 text = self.render(step.text)
                 if step.action == "say":
+                    # A partial ASR result is not the end of the agent's turn. Wait for
+                    # acoustic silence before ordinary replies; interrupt deliberately bypasses it.
+                    if self.voiced:
+                        await self.until(lambda: self.now() - self.voiced[-1][0] >= 1.0, 30)
                     await self.play(self.speech[text], text)
                 elif step.action == "expect":
                     await self.until(lambda text=text: self.heard(text), step.seconds)

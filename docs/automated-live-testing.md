@@ -1,6 +1,6 @@
 # Automated live phone testing
 
-Status: the core harness and 21-scenario suite are implemented in `scripts/live_phone/`.
+Status: the core harness and 22-scenario suite are implemented in `scripts/live_phone/`.
 See [the runbook](live-phone-runbook.md) for executable commands, prerequisites, and
 the remaining coverage boundaries. This document retains the broader target design.
 No live call has validated the new harness yet.

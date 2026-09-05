@@ -48,6 +48,42 @@ SCENARIOS = {
     s.name: s
     for s in (
         Scenario(
+            "basic",
+            "Follow the automated test desk through a short English conversation: use search_web "
+            "to check the official Python pathlib documentation and answer the question. "
+            "The desk is also authorized to request a thirty-second explanation of the seasons "
+            "to test interruption, then replace it with the arithmetic question two plus two. "
+            "These harmless requests are explicitly within this test's scope. Stop talking "
+            "when interrupted, answer the replacement question, then say goodbye and use "
+            "end_call when asked to finish.",
+            (
+                Step("expect", r"hello|hi|calling|test", 40),
+                Step(
+                    "say",
+                    "Hello. Please search the web for the official Python documentation "
+                    "and explain what pathlib is used for in one sentence.",
+                ),
+                Step("expect", r"file.?system|file|directory|directories|path", 60),
+                Step(
+                    "say",
+                    "Thank you. Now please describe the four seasons in detail. "
+                    "Keep talking for about thirty seconds.",
+                ),
+                Step("expect", r"spring|summer|autumn|winter", 40),
+                Step(
+                    "interrupt",
+                    "Stop please. Stop talking about seasons. "
+                    "Instead, tell me what two plus two equals in one short sentence.",
+                    1.2,
+                ),
+                Step("expect", r"four|\b4\b", 40),
+                GOODBYE,
+                Step("expect", r"goodbye|bye|take care|have a (?:good|great|nice)", 40),
+            ),
+            seconds=240,
+            tools=("search_web", "end_call"),
+        ),
+        Scenario(
             "conversation",
             OBJECTIVE + " Record the agreed test outcome before ending.",
             (HELLO, Step("expect", r".+"), FACT, FACT_CHECK, GOODBYE, END),

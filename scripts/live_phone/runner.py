@@ -213,6 +213,8 @@ async def run_call(
                     if any(s.error for s in sessions.values()):
                         raise RuntimeError("counterpart scenario failed")
                     if event["terminal"]:
+                        if event["state"] not in scenario.states:
+                            raise RuntimeError("call ended in unexpected state: " + event["state"])
                         if event["state"] == "transferred":
                             for session in sessions.values():
                                 session.signals["transferred"].set()

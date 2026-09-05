@@ -51,6 +51,11 @@ def grade(scenario: Scenario, evidence: dict[str, Any]) -> dict[str, bool]:
                 session.get("steps_finished") is True and session.get("error") is None
             )
             checks[f"{role}:closed"] = session.get("closed") is True
+    if any(step.action == "interrupt" for step in scenario.steps):
+        checks["interruption_audio_verified"] = any(
+            event.get("type") == "interruption_verified"
+            for event in evidence.get("sessions", {}).get("callee", {}).get("events", [])
+        )
     for name in scenario.tools:
         checks[f"tool:{name}"] = name in tools
         if name != "transfer_to_owner":

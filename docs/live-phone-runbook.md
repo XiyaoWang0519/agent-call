@@ -12,7 +12,8 @@ The existing human-operated `run_sip_canary.py` remains available.
    isolated Twilio account or subaccount. Retain normal signed webhooks and MCP auth.
 2. Configure three distinct owned Twilio numbers: the application caller ID, automated
    callee, and automated owner. Set the test application's `OWNER_PHONE_E164` to the
-   automated owner. Never use a personal phone for these endpoints.
+   automated owner and `OWNER_DISPLAY_NAME` to `Automated test owner`. Never use a
+   personal phone for these endpoints.
 3. Give the test app a unique `LIVE_TEST_INSTANCE_ID` (at least 16 characters).
    Enable `ASK_AGENT_ENABLED=true` and `HOLD_DETECTION_ENABLED=true` for the full suite.
    The authenticated `/diagnostics/live-test` endpoint proves the instance identity,
@@ -48,6 +49,24 @@ closed to new calls. Never delete `runs.db` to force a new run while calls are u
 Incoming legs have provider time limits; application-side limits remain in force as a
 last backstop. Keep the application available for final resource discovery.
 
+## Basic conversation acceptance
+
+Start with one real call covering conversation, web search, interruption, and hangup:
+
+```bash
+uv run python -m scripts.live_phone --env-file .env.live-phone run \
+  --scenario basic --confirm-instance YOUR_TEST_INSTANCE_ID
+```
+
+`basic` checks an audible greeting, successful `search_web` execution and an accurate
+spoken explanation of Python's pathlib module. It then asks for a long explanation,
+waits to hear it begin, interrupts with an arithmetic question, and requires the agent
+to stop speaking within 1.2 seconds and answer the replacement question. Finally it
+requires an audible goodbye, the agent's `end_call` tool, a persisted result and verified
+provider termination without forced cleanup. Ordinary replies wait for acoustic silence;
+only the interruption step intentionally overlaps speech. The synthetic scripts and
+independent ASR are English. The 240-second scenario deadline is not a latency benchmark.
+
 ## Run a suite
 
 List scenarios without credentials, dialing, or API usage:
@@ -71,10 +90,10 @@ uv run python -m scripts.live_phone --env-file .env.live-phone run \
   --scenario transfer --scenario transfer-busy --confirm-instance YOUR_TEST_INSTANCE_ID
 ```
 
-The full suite currently contains 21 scenarios covering all seven in-call tools and all
+The full suite currently contains 22 scenarios covering all seven in-call tools and all
 seven public MCP tools. Smoke selects conversation, interruption, IVR, and MCP termination.
 Each scenario has a deadline. The full configured worst-case reservation budget is
-3,945 seconds, below the default 5,400-second suite limit. Typical runs can finish sooner.
+4,230 seconds, below the default 5,400-second suite limit. Typical runs can finish sooner.
 This is a duration authorization, not a dollar cap: conference participants, inbound and
 outbound legs, OpenAI speech/transcription/grading, and Exa can incur separate charges.
 Configure provider-side budgets as well. Run serially; Agent Call allows one active call.
@@ -121,7 +140,7 @@ This suite does not yet automate a genuinely unanswered ringing endpoint, destru
 process/network fault injection, maximum-duration/maximum-hold calls, or every failure
 permutation in the design matrix. Signature/replay protection, OAuth, duplicate/late
 answers, extraction failure, and recovery have existing deterministic integration tests.
-These are separate evidence from real-phone coverage. A full suite pass means the 21
+These are separate evidence from real-phone coverage. A full suite pass means the 22
 listed scenarios passed, not that every proposed matrix row ran live.
 
 Twilio-to-Twilio calls exercise real provider audio but do not prove a mobile carrier

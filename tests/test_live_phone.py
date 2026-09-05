@@ -278,6 +278,9 @@ def test_signed_websocket_receives_audio_and_independent_asr(
                 ws.receive_json()
         assert session.drained.is_set()
         assert session.transcripts[0]["text"] == "amber river robin"
+        asr_args = app.state.speech_client.audio.transcriptions.create.await_args.kwargs
+        assert asr_args["language"] == "en"
+        assert "prompt" not in asr_args
         assert session.evidence()["voiced_seconds"] > 0
         assert (store.root / "run_one/callee-received.wav").read_bytes().startswith(b"RIFF")
 
@@ -748,3 +751,35 @@ def test_list_command_does_not_load_credentials(monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["live-phone", "list"])
     assert main() == 0
     assert len(json.loads(capsys.readouterr().out)) == len(SCENARIOS)
+
+
+def test_basic_requires_search_hangup_and_acoustic_interruption():
+    checks = grade(SCENARIOS["basic"], {})
+    assert checks["tool:search_web"] is False
+    assert checks["search_succeeded"] is False
+    assert checks["tool:end_call"] is False
+    assert checks["interruption_audio_verified"] is False
+    evidence = {"sessions": {"callee": {"events": [{"type": "interruption_verified"}]}}}
+    assert grade(SCENARIOS["basic"], evidence)["interruption_audio_verified"] is True
+
+
+async def test_normal_reply_waits_for_agent_silence(tmp_path, monkeypatch):
+    from scripts.live_phone.scenarios import Step
+
+    session = Session("callee", tmp_path, {"reply": b"pcm"}, {}, None, "test", AsyncMock(), {})
+    session.ready.set()
+    session.voiced = [(0.0, 0.02)]
+    clock = [0.5]
+    monkeypatch.setattr(session, "now", lambda: clock[0])
+
+    async def wait_for_turn(predicate, seconds):
+        assert not predicate()
+        clock[0] = 1.1
+        assert predicate()
+
+    session.until = AsyncMock(side_effect=wait_for_turn)
+    session.play = AsyncMock()
+    await session.execute((Step("say", "reply"),))
+    session.until.assert_awaited_once()
+    session.play.assert_awaited_once_with(b"pcm", "reply")
+    assert session.error is None
