@@ -889,7 +889,7 @@ class CallService:
         if leg == "callee" and status in {"in-progress", "answered"}:
             # The callee's answered status callback usually reaches us before the
             # conference participant-join event; whichever arrives first records
-            # answer readiness. Automatic speech still waits for AMD classification.
+            # answer readiness. Async AMD must not add its classification delay.
             answered = received
             try:
                 if await self.db.set_flag_once(call_id, "callee_joined"):
@@ -918,10 +918,6 @@ class CallService:
         if not (
             call["sideband_open"]
             and call["callee_joined"]
-            # Keep the initially-muted leg and disabled automatic responses intact
-            # until async AMD classifies the answer. Cancelling after a voicemail
-            # beep cannot retract ordinary audio already heard by the recorder.
-            and call["amd_result"]
             and call["transcription_verified"]
             and call["semantic_vad_verified"]
         ):
@@ -1163,7 +1159,7 @@ class CallService:
             "input_audio_buffer.committed",
         }:
             # Frames may precede sideband setup's database/network awaits. Preserve
-            # that greeting so classification does not cause a duplicate opening.
+            # that greeting so activation does not cause a duplicate opening.
             state = self._opening_listen.setdefault(call_id, OpeningListenState())
         if state is None:
             return
@@ -1246,13 +1242,14 @@ class CallService:
             if call is None:
                 return
             state = self._opening_listen.setdefault(call_id, OpeningListenState())
-            # Classification is immutable once accepted. Open the media path while
-            # responses are still disabled, before ordinary/voicemail generation.
+            # Open the media path while responses are still disabled, before
+            # ordinary/voicemail generation. AMD may arrive during this await.
             conference = call.get("conference_sid") or call.get("conference_name")
             await self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))
             current = await self.db.get_call(call_id)
             if current is None or current["state"] != CallState.ACTIVATING.value:
                 return
+            call = current
             if call["answer_handling"] != "voicemail":
                 try:
                     updated = await self.realtime.enable_automatic_responses(call_id)
@@ -1266,8 +1263,8 @@ class CallService:
             if not await self.db.cas_state(call_id, CallState.ACTIVATING, CallState.ACTIVE):
                 return
             if call["answer_handling"] != "voicemail":
-                # A greeting committed during AMD needs an immediate continuation,
-                # not a second artificial listening pause after classification.
+                # A greeting committed during setup needs an immediate continuation,
+                # not a second artificial listening pause after activation.
                 self._opening_tasks[call_id] = self._spawn(
                     self._opening_after_listen(
                         call_id, delay=0.0 if state.early_committed else None

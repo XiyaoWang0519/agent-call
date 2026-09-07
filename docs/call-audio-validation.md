@@ -10,9 +10,10 @@ factual grounding, genuine interruption handling, or completed farewell playback
 ## Changes
 
 - Listen to the callee's greeting or menu before speaking, with a 1.5-second silence
-  fallback. Keep automatic replies disabled and the agent muted until asynchronous
-  AMD classifies the answer, so ordinary speech cannot leak into a voicemail recording.
-  Continue immediately if the greeting was already committed during classification.
+  fallback. Unmute before enabling automatic replies once the callee and verified
+  sideband are ready; asynchronous AMD does not block conversation. Continue
+  immediately if the greeting was already committed during setup. Late voicemail
+  detection cancels normal replies but cannot retract previously delivered audio.
 - Preserve the far-field input filter across session updates. Default to server VAD
   with 300 ms silence and threshold 0.5; semantic VAD remains configurable. Initial
   and activation acknowledgements must match an explicitly configured noise filter.
@@ -30,11 +31,20 @@ factual grounding, genuine interruption handling, or completed farewell playback
 ## Local validation on 2026-09-07
 
 The audio measurements below were collected at `cff6381`, before the review fixes
-restored the AMD activation gate and added closing-check retries and filter-echo
-validation. They do not certify the revised opening latency: the revised path adds
-provider classification time while avoiding a second listen delay after an already
-heard greeting. The review fixes have separate regression coverage; no additional
+added closing-check retries and filter-echo validation. The temporary AMD activation
+gate introduced at `e699c7e` was subsequently removed at the owner's request because
+it could impose a lengthy opening delay. The revised path again activates without
+waiting for AMD and avoids a second listen delay after an already heard greeting.
+The review fixes and gate removal have separate regression coverage; no additional
 phone call was made for those fixes.
+
+For scale, the last business call's logs place the AMD callback approximately
+28–37 seconds after answer, while the first DTMF action occurred at 8.51 seconds.
+Gating that recorded sequence would have blocked its initial IVR action for roughly
+another 19–29 seconds; this is a counterfactual estimate, not a live measurement of
+the gated implementation. Twilio documents a default detection timeout of 30 seconds
+and waits for a machine greeting to end in `DetectMessageEnd` mode. Callback delivery
+adds further time. See [Twilio's AMD reference](https://www.twilio.com/docs/voice/answering-machine-detection).
 
 The actual application, live Realtime model, tool handlers and SQLite state were
 exercised with fixed synthetic speech and paced local G.711 input/output transport.
@@ -78,3 +88,8 @@ Review-fix verification on the same date: 740 tests passed, two skipped, 88.65%
 application coverage; Ruff formatting/lint, strict mypy, and MCP/OAuth smoke passed.
 The regressions cover pending AMD and concurrent activation, filter-echo mismatches,
 closing-check errors/timeouts/stale retries, and the migrated received-audio grading.
+
+After removing the blocking AMD gate: 740 tests passed, two skipped, 88.66%
+application coverage; Ruff, strict mypy and all pre-commit checks passed. Activation
+regressions verify readiness without AMD, immediate early-greeting continuation,
+voicemail arriving during unmute or response enablement, and termination races.

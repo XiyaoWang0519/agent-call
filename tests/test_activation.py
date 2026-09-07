@@ -269,7 +269,7 @@ async def test_opening_unmutes_agent_before_speech(service, packet):
 
 
 @pytest.mark.asyncio
-async def test_callee_join_stays_muted_until_amd_and_listens_before_opening(service, packet):
+async def test_callee_join_activates_without_amd_and_listens_before_opening(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_conference_event(
@@ -281,11 +281,11 @@ async def test_callee_join_stays_muted_until_amd_and_listens_before_opening(serv
         },
     )
     call = await service.db.get_call(call_id)
-    assert call["state"] == CallState.PREWARMING.value
+    assert call["state"] == CallState.ACTIVE.value
     assert call["amd_result"] is None
     assert call["opening_sent"] == 0
-    assert service._test_realtime.events == []
-    assert service._test_twilio.unmuted == []
+    assert service._test_realtime.events == [("session.update", call_id)]
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
     await wait_opening(service, call_id)
     await service.handle_amd(call_id, "human")
     await wait_opening(service, call_id)
@@ -302,8 +302,8 @@ async def test_callee_answered_status_activates_before_conference_join(service, 
     assert call["callee_joined"] == 1
     assert call["answered_at"] is not None
     assert call["opening_sent"] == 0
-    assert call["state"] == CallState.PREWARMING.value
-    assert service._test_realtime.events == []
+    assert call["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.events == [("session.update", call_id)]
     await service.handle_conference_event(
         call_id,
         {
@@ -376,8 +376,8 @@ async def test_conference_start_alone_does_not_mark_callee_joined(service, packe
     assert call["callee_joined"] == 1
     assert call["answered_at"] is not None
     assert call["opening_sent"] == 0
-    assert call["state"] == CallState.PREWARMING.value
-    assert service._test_realtime.events == []
+    assert call["state"] == CallState.ACTIVE.value
+    assert service._test_realtime.events == [("session.update", call_id)]
     await service.handle_amd(call_id, "human")
     await wait_opening(service, call_id)
     assert service._test_realtime.events == [("session.update", call_id), ("opening", call_id)]
@@ -840,7 +840,7 @@ async def test_machine_end_other_does_not_create_an_extra_response(service, pack
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
-    assert service._test_realtime.events == []
+    assert service._test_realtime.events == [("session.update", call_id)]
     await service.handle_amd(call_id, "machine_end_other")
     call = await service.db.get_call(call_id)
     assert call["answered_by"] == "machine_end_other"
@@ -873,26 +873,32 @@ async def test_voicemail_activation_never_enables_automatic_responses(service, p
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("classification", ["machine_end_beep", "machine_end_silence"])
-async def test_late_amd_never_exposes_ordinary_audio(service, packet, classification):
+async def test_late_amd_suspends_ordinary_responses_when_classification_arrives(
+    service, packet, classification
+):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     for kind in ["speech_started", "speech_stopped", "committed"]:
         service._observe_opening_event(call_id, {"type": f"input_audio_buffer.{kind}"})
     await asyncio.sleep(0.04)
-    assert service._test_realtime.events == []
-    assert service._test_twilio.unmuted == []
+    assert service._test_realtime.events == [("session.update", call_id)]
+    assert service._test_twilio.unmuted == [("CF" + "a" * 32, "CA" + "a" * 32)]
     await service.handle_amd(call_id, classification)
     await wait_opening(service, call_id)
-    assert service._test_realtime.events == [("voicemail", call_id)]
-    assert service._test_realtime.suspend_calls == []
+    assert service._test_realtime.events == [
+        ("session.update", call_id),
+        ("session.update", call_id),
+        ("cancel_response", call_id),
+        ("voicemail", call_id),
+    ]
+    assert service._test_realtime.suspend_calls == [call_id]
 
 
 @pytest.mark.asyncio
-async def test_classification_and_unmute_finish_before_enabling_responses(service, packet):
+async def test_amd_during_unmute_prevents_ordinary_response_enable(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
-    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     reached = asyncio.Event()
     release = asyncio.Event()
     original = service._test_twilio.unmute_participant
@@ -903,29 +909,34 @@ async def test_classification_and_unmute_finish_before_enabling_responses(servic
         await original(*args)
 
     service._test_twilio.unmute_participant = slow_unmute
-    task = asyncio.create_task(service.handle_amd(call_id, "human"))
+    task = asyncio.create_task(
+        service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    )
     await asyncio.wait_for(reached.wait(), 1)
     assert service._test_realtime.events == []
-    # Duplicated/concurrent callbacks cannot change accepted classification.
-    await service.handle_amd(call_id, "machine_end_beep")
+    amd = asyncio.create_task(service.handle_amd(call_id, "machine_end_beep"))
+    for _ in range(100):
+        if (await service.db.get_call(call_id))["answer_handling"] == "voicemail":
+            break
+        await asyncio.sleep(0.001)
+    else:
+        pytest.fail("AMD did not persist during unmute")
     release.set()
-    await task
+    await asyncio.gather(task, amd)
     await wait_opening(service, call_id)
-    assert service._test_realtime.events == [("session.update", call_id), ("opening", call_id)]
-    assert (await service.db.get_call(call_id))["answer_handling"] == "human"
+    assert service._test_realtime.events == [("voicemail", call_id)]
 
 
 @pytest.mark.asyncio
 async def test_termination_during_unmute_prevents_response_enable(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
-    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
 
     async def terminate_during_unmute(*args):
         await service.terminate_call(call_id, "callee_participant_leave")
 
     service._test_twilio.unmute_participant = terminate_during_unmute
-    await service.handle_amd(call_id, "human")
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     assert service._test_realtime.events == []
     assert (await service.db.get_call(call_id))["state"] == CallState.COMPLETED.value
 
@@ -935,11 +946,6 @@ async def test_late_voicemail_amd_cancels_in_flight_opening(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
-    # Defensive legacy-state test; new calls remain muted before AMD.
-    await service.db.update_call(call_id, state=CallState.ACTIVE.value)
-    service._opening_listen[call_id].enabled = True
-    await service._test_realtime.enable_automatic_responses(call_id)
-    await service._test_realtime.create_opening(call_id)
     await wait_opening(service, call_id)
     assert service._test_realtime.events == [("session.update", call_id), ("opening", call_id)]
 
@@ -1085,10 +1091,9 @@ async def test_completed_pre_activation_turn_resumes_only_when_unanswered(
     service._observe_opening_event(
         call_id, {"type": "input_audio_buffer.committed", "item_id": "early_greeting"}
     )
-    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
-    await service.handle_amd(call_id, "human")
     if intervening_event:
         service._observe_opening_event(call_id, intervening_event)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     await wait_opening(service, call_id)
     expected = [("session.update", call_id)]
     if intervening_event is None:
@@ -1101,10 +1106,6 @@ async def test_late_voicemail_suspends_native_reply_without_opening_claim(servic
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
-    # Defensive legacy-state test; new calls remain muted before AMD.
-    await service.db.update_call(call_id, state=CallState.ACTIVE.value)
-    service._opening_listen[call_id].enabled = True
-    await service._test_realtime.enable_automatic_responses(call_id)
     await service.handle_realtime_event(
         call_id, {"type": "response.created", "response": {"id": "native_reply"}}
     )
@@ -1172,10 +1173,6 @@ async def test_late_voicemail_fails_closed_if_responses_cannot_be_suspended(
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "answered"})
-    # Defensive legacy-state test; new calls remain muted before AMD.
-    await service.db.update_call(call_id, state=CallState.ACTIVE.value)
-    service._opening_listen[call_id].enabled = True
-    await service._test_realtime.enable_automatic_responses(call_id)
     if failure == "timeout":
         service._test_realtime.suspend_failures_remaining = 1
     else:
@@ -1208,21 +1205,18 @@ async def test_greeting_before_sideband_setup_resumes_without_second_listen_dela
     for kind in ["speech_started", "speech_stopped", "committed"]:
         service._observe_opening_event(call_id, {"type": f"input_audio_buffer.{kind}"})
     await service.handle_sideband_open(call_id)
-    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
-    assert service._test_realtime.events == []
-    assert service._test_twilio.unmuted == []
     monkeypatch.setattr("app.call_state.OPENING_LISTEN_SECONDS", 10.0)
-    await service.handle_amd(call_id, "human")
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    assert (await service.db.get_call(call_id))["amd_result"] is None
     # wait_opening is bounded at one second: a second listen delay would fail.
     await wait_opening(service, call_id)
     assert service._test_realtime.events == [("session.update", call_id), ("opening", call_id)]
 
 
 @pytest.mark.asyncio
-async def test_concurrent_amd_during_activation_update_cannot_inject_voicemail(service, packet):
+async def test_amd_during_activation_update_suspends_before_voicemail(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
-    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     reached = asyncio.Event()
     release = asyncio.Event()
     original = service._test_realtime.enable_automatic_responses
@@ -1234,12 +1228,24 @@ async def test_concurrent_amd_during_activation_update_cannot_inject_voicemail(s
         return await original(candidate_call_id)
 
     service._test_realtime.enable_automatic_responses = delayed_update
-    task = asyncio.create_task(service.handle_amd(call_id, "human"))
+    task = asyncio.create_task(
+        service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    )
     await asyncio.wait_for(reached.wait(), 1)
-    await service.handle_amd(call_id, "machine_end_beep")
+    amd = asyncio.create_task(service.handle_amd(call_id, "machine_end_beep"))
+    for _ in range(100):
+        if (await service.db.get_call(call_id))["answer_handling"] == "voicemail":
+            break
+        await asyncio.sleep(0.001)
+    else:
+        pytest.fail("AMD did not persist during session update")
     assert service._test_realtime.events == []
-    assert (await service.db.get_call(call_id))["answer_handling"] == "human"
     release.set()
-    await task
+    await asyncio.gather(task, amd)
     await wait_opening(service, call_id)
-    assert service._test_realtime.events == [("session.update", call_id), ("opening", call_id)]
+    assert service._test_realtime.events == [
+        ("session.update", call_id),
+        ("session.update", call_id),
+        ("cancel_response", call_id),
+        ("voicemail", call_id),
+    ]
