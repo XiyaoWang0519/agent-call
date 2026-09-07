@@ -6,6 +6,7 @@ import pytest
 
 from app.models import CallState
 from tests.conftest import seed_call, wait_background
+from tests.test_ask_agent import _ask
 from tests.test_voice_closing import classification_event, finish_playback, spoken_farewell
 
 
@@ -233,3 +234,98 @@ async def test_received_decision_does_not_retry_while_usage_persistence_waits(
     await finish_playback(service, call_id, "spoken")
     await wait_background()
     assert service._test_realtime.hangups == ["rtc_test"]
+
+
+async def interim_spoken_response(service, call_id):
+    await service.handle_realtime_event(
+        call_id, {"type": "response.created", "response": {"id": "interim_answer"}}
+    )
+    await service.handle_realtime_event(
+        call_id,
+        {
+            "type": "response.done",
+            "response": {
+                "id": "interim_answer",
+                "status": "completed",
+                "output": [{"content": [{"transcript": "I am checking that for you."}]}],
+            },
+        },
+    )
+    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("resolution", ["answer", "timeout"])
+async def test_pending_question_keeps_channel_available_for_continuation(
+    service, packet, resolution
+):
+    service.settings.ask_agent_enabled = True
+    service.settings.ask_agent_answer_timeout_seconds = 0.1 if resolution == "timeout" else 30
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _ask(service, call_id)
+    question_id = service._pending_questions[call_id].question_id
+    await interim_spoken_response(service, call_id)
+    assert service._test_realtime.closing_checks == []
+    if resolution == "answer":
+        await service.answer_call_question(call_id, question_id, "CVS on Market Street")
+    else:
+        await asyncio.sleep(0.15)
+    await wait_background()
+    assert service._test_realtime.tool_results[-1][2]["status"] == (
+        "answered" if resolution == "answer" else "timeout"
+    )
+    assert service._test_realtime.tool_result_continuation_texts[-1]
+    assert service._test_realtime.closing_checks == []
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+
+
+@pytest.mark.parametrize("expiry_races", [False, True])
+async def test_question_delivery_keeps_closing_check_suppressed(
+    service, packet, monkeypatch, expiry_races
+):
+    service.settings.ask_agent_enabled = True
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await _ask(service, call_id)
+    question_id = service._pending_questions[call_id].question_id
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = service._guarded_send_tool_result
+
+    async def blocked_delivery(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_guarded_send_tool_result", blocked_delivery)
+    await service.answer_call_question(call_id, question_id, "CVS on Market Street")
+    await asyncio.wait_for(entered.wait(), 1)
+    assert service._pending_questions[call_id].delivering
+    if expiry_races:
+        service.settings.ask_agent_answer_timeout_seconds = 0
+        await service._question_deadline(call_id, question_id)
+        assert call_id not in service._pending_questions
+    assert call_id in service._question_answer_deliveries
+    await interim_spoken_response(service, call_id)
+    assert service._test_realtime.closing_checks == []
+    release.set()
+    await wait_background()
+    assert call_id not in service._pending_questions
+    assert call_id not in service._question_answer_deliveries
+    # A subsequent farewell can still classify once the answer is delivered.
+    await spoken_farewell(service, call_id)
+
+
+@pytest.mark.parametrize("decision", ["rejected", "finished"])
+async def test_question_registered_during_check_prevents_retry_or_hangup(service, packet, decision):
+    service.settings.ask_agent_enabled = True
+    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
+    await spoken_farewell(service, call_id)
+    await _ask(service, call_id)
+    await service.handle_realtime_event(
+        call_id, rejection() if decision == "rejected" else classification_event()
+    )
+    await finish_playback(service, call_id, "spoken")
+    await wait_background()
+    assert len(service._test_realtime.closing_checks) == 1
+    assert call_id in service._pending_questions
+    assert service._test_realtime.hangups == []
+    assert call_id not in service._audio_drain_terminations

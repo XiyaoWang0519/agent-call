@@ -8,6 +8,9 @@ added to the conversation. It runs behind playback, so speech does not wait for 
 model round trip. Only an exact completed `FINISHED` result can arm closing, and only for
 the latest uncut spoken response with no intervening callee speech. Other results leave
 the call connected. Classifier usage is counted without changing the active audio response.
+Pending owner questions, including answer delivery and timeout continuations, suppress
+new closing checks so those continuations can use the response channel. A question
+registered before a retry or decision also prevents that stale check from closing the call.
 
 Each classification attempt has a three-second deadline covering send and result receipt.
 A failed send, provider rejection, failed/incomplete response, malformed decision, or missing

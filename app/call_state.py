@@ -169,9 +169,11 @@ HOLD_PHRASE_PATTERN = re.compile(
 
 # A menu can mention a queue while still asking for input (including a callback choice).
 # Let the model answer rather than suspending it based on words elsewhere in the prompt.
+# Punctuation alone is not a request: queue announcements can contain rhetorical questions.
 HOLD_INPUT_REQUEST_PATTERN = re.compile(
     r"\b(press|dial|say|tell me|tell us|enter|select|choose)\b|"
-    r"\b(how (can|may) (I|we) help|what (would|can|is|are)|would you|can you)\b|[?]",
+    r"\b(how (can|may) (I|we) help|what (would|can|is|are)|would you|can you|"
+    r"do you (want|need|prefer)|are you (calling|ready)|is (that|this) (correct|right))\b",
     re.IGNORECASE,
 )
 HOLD_CONNECTION_PATTERN = re.compile(
@@ -285,6 +287,7 @@ class CallService:
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
+        self._question_answer_deliveries: dict[str, int] = {}
         self._hold_state: dict[str, HoldState] = {}
         # Answered questions whose tool result never reached the sideband; an agent retry
         # of answer_call_question re-attempts delivery instead of reporting already_answered.
@@ -963,6 +966,10 @@ class CallService:
             or response.get("status") != "completed"
             or audio.cleared
             or call_id in self._hold_state
+            # Owner-answer and timeout continuations need the response channel.
+            # Do not start a separate classifier while their question is pending.
+            or call_id in self._pending_questions
+            or call_id in self._question_answer_deliveries
             or call_id in self._voice_end_pending
             or any(item.get("type") == "function_call" for item in output)
             or (response.get("metadata") or {}).get(RESPONSE_PURPOSE_METADATA_KEY)
@@ -1042,6 +1049,8 @@ class CallService:
             and next(reversed(responses)) == source
             and not self._voice_end_overtaken_by_speech(call_id, audio.speech_epoch)
             and call_id not in self._hold_state
+            and call_id not in self._pending_questions
+            and call_id not in self._question_answer_deliveries
             and call_id not in self._activity.tombstones
             and call_id not in self._activity.watchdog_claims
         )
@@ -2308,6 +2317,21 @@ class CallService:
             pending.delivering = True
 
     async def _deliver_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
+        # A losing expiry claim may clear the pending-question entry while this
+        # continuation still owns the channel. Keep delivery ownership separately.
+        self._question_answer_deliveries[call_id] = (
+            self._question_answer_deliveries.get(call_id, 0) + 1
+        )
+        try:
+            await self._send_question_answer(call_id, question_row)
+        finally:
+            remaining = self._question_answer_deliveries.get(call_id, 0) - 1
+            if remaining > 0:
+                self._question_answer_deliveries[call_id] = remaining
+            else:
+                self._question_answer_deliveries.pop(call_id, None)
+
+    async def _send_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
         question_id = question_row["question_id"]
         if call_id in self._voice_end_pending:
             # The goodbye turn owns the sideband now; do not inject an answer relay.
@@ -3200,6 +3224,7 @@ class CallService:
         self._opening_transition_locks.pop(call_id, None)
         self._tool_seen_calls.discard(call_id)
         self._pending_questions.pop(call_id, None)
+        self._question_answer_deliveries.pop(call_id, None)
         self._voice_end_pending.pop(call_id, None)
         self._voice_end_reply_waits.pop(call_id, None)
         self._callee_speech_epochs.pop(call_id, None)

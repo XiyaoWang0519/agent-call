@@ -93,3 +93,7 @@ After removing the blocking AMD gate: 740 tests passed, two skipped, 88.66%
 application coverage; Ruff, strict mypy and all pre-commit checks passed. Activation
 regressions verify readiness without AMD, immediate early-greeting continuation,
 voicemail arriving during unmute or response enablement, and termination races.
+
+Follow-up review verification: 752 tests passed, two skipped, 88.67% coverage;
+Ruff, strict mypy and pre-commit passed. Added pending-question/delivery/expiry-race
+coverage for closing checks and rhetorical-versus-actionable hold announcements.

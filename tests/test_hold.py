@@ -248,3 +248,46 @@ async def test_queue_menu_request_exits_hold_to_allow_answer(hold_service, packe
     assert call_id not in hold_service._hold_state
     assert ("session.update", call_id) in hold_service._test_realtime.events
     assert hold_service._test_realtime.request_response_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_holding", [False, True])
+async def test_rhetorical_queue_question_does_not_resume_speech(
+    hold_service, packet, already_holding
+):
+    call_id = await seed_call(hold_service.db, packet, state=CallState.ACTIVE)
+    if already_holding:
+        hold_service._hold_state[call_id] = HoldState(started_monotonic=time.monotonic())
+
+    await hold_service.handle_realtime_event(
+        call_id,
+        _transcript_event(
+            "Did you know you can manage your account online? Please continue to hold."
+        ),
+    )
+
+    assert call_id in hold_service._hold_state
+    assert hold_service._test_realtime.request_response_calls == []
+    assert hold_service._test_realtime.suspend_calls == ([] if already_holding else [call_id])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Do you want a callback?",
+        "Is that correct?",
+        "What would you like to do?",
+        "Press one for a callback.",
+    ],
+)
+async def test_actionable_queue_prompt_still_resumes_speech(hold_service, packet, question):
+    call_id = await seed_call(hold_service.db, packet, state=CallState.ACTIVE)
+    hold_service._hold_state[call_id] = HoldState(started_monotonic=time.monotonic())
+
+    await hold_service.handle_realtime_event(
+        call_id, _transcript_event(f"Please continue to hold. {question}")
+    )
+
+    assert call_id not in hold_service._hold_state
+    assert hold_service._test_realtime.request_response_calls
