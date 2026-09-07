@@ -25,6 +25,26 @@ class Verdict(BaseModel):
     evidence_ids: list[str]
 
 
+async def drain_sessions(
+    sessions: dict[str, Session], *, close_timeout: float = 15, drain_timeout: float = 35
+) -> dict[str, str]:
+    """Wait for final receive-side evidence, including on scenario failure."""
+
+    async def drain(role: str, session: Session) -> tuple[str, str]:
+        if not session.ready.is_set():
+            session.save()
+            return role, "not_connected"
+        try:
+            await asyncio.wait_for(session.closed.wait(), close_timeout)
+            await asyncio.wait_for(session.drained.wait(), drain_timeout)
+        except TimeoutError:
+            session.error = session.error or "media_finalize_timeout"
+            return role, "timeout"
+        return role, "drained"
+
+    return dict(await asyncio.gather(*(drain(role, s) for role, s in sessions.items())))
+
+
 def tool_data(result: Any) -> dict[str, Any]:
     if result.is_error:
         raise RuntimeError("MCP tool failed")
@@ -235,6 +255,9 @@ async def run_call(
     except (Exception, asyncio.CancelledError) as exc:
         evidence["error"] = type(exc).__name__
     finally:
+        store.update(run_id, finalizing=True)
+        for session in sessions.values():
+            session.accepting = False
         for job in jobs:
             if not job.done():
                 job.cancel()
@@ -244,6 +267,10 @@ async def run_call(
             evidence["cleanup"] = await provider.cleanup(store, run_id)
         except Exception as exc:
             evidence["cleanup"] = {"verified": False, "error": type(exc).__name__}
+        evidence["media_finalization"] = await drain_sessions(sessions)
+        media_finalized = "timeout" not in evidence["media_finalization"].values()
+        if not media_finalized:
+            evidence["error"] = evidence["error"] or "media_finalize_timeout"
         if call_id and "debug" not in evidence:
             with contextlib.suppress(Exception):
                 evidence["debug"] = await provider.debug(f"/calls/{call_id}")
@@ -256,5 +283,6 @@ async def run_call(
             checks=result["checks"],
             error=evidence["error"],
             cleanup=evidence["cleanup"],
-            done=evidence["cleanup"].get("verified", False),
+            done=evidence["cleanup"].get("verified", False) and media_finalized,
+            finalizing=not media_finalized,
         )

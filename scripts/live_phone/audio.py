@@ -60,6 +60,16 @@ def tone(seconds: float, frequencies: tuple[int, ...] = (440,)) -> bytes:
     return struct.pack(f"<{len(samples)}h", *samples)
 
 
+def challenge_audio(digits: str) -> bytes:
+    """Single-frequency nonce tones avoid telephone-network DTMF suppression."""
+    quiet = b"".join(tone(0.2, (600 + 150 * int(digit),)) + bytes(1920) for digit in digits)
+    # Leave headroom for the conference mix while keeping the nonce above speech.
+    loud = struct.pack(
+        f"<{len(quiet) // 2}h", *(value * 3 for (value,) in struct.iter_unpack("<h", quiet))
+    )
+    return bytes(6400) + loud + bytes(6400)
+
+
 class DigitDetector:
     """In-band DTMF, 40 ms windows with minimum duration and release debounce."""
 
@@ -105,3 +115,25 @@ class DigitDetector:
                     found.append(digit)
                 self.latched = digit
         return found
+
+
+class ChallengeDetector(DigitDetector):
+    @staticmethod
+    def detect(pcm: bytes) -> str | None:
+        samples = [v[0] for v in struct.iter_unpack("<h", pcm)]
+        energy = sum(v * v for v in samples)
+        if energy < len(samples) * 250**2:
+            return None
+        powers = []
+        for digit in range(10):
+            coeff = 2 * math.cos(2 * math.pi * (600 + 150 * digit) / RATE)
+            a = b = 0.0
+            for sample in samples:
+                a, b = sample + coeff * a - b, a
+            powers.append(a * a + b * b - coeff * a * b)
+        best = max(range(10), key=lambda i: powers[i])
+        if powers[best] / (len(samples) * energy) < 0.2:
+            return None
+        if any(powers[best] < 2 * power for i, power in enumerate(powers) if i != best):
+            return None
+        return str(best)

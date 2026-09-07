@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -76,6 +77,77 @@ class Provider:
         if call["status"] not in CALL_TERMINAL:
             await self.twilio("POST", f"/Calls/{sid}.json", data={"Status": "completed"})
 
+    async def correlate(self, row: dict[str, Any], role: str, sid: str) -> dict[str, str]:
+        """Find this plan's outbound leg; caller ID is only an initial filter."""
+        self.validate_sid(sid, "CA")
+        inbound = await self.twilio("GET", f"/Calls/{sid}.json")
+        destination = self.config.callee_number if role == "callee" else self.config.owner_number
+        if (
+            inbound.get("account_sid") != self.config.twilio_account_sid
+            or inbound.get("direction") != "inbound"
+            or inbound.get("from") != self.config.caller_number
+            or inbound.get("to") != destination
+            or inbound.get("status") not in {"ringing", "in-progress"}
+            or parsedate_to_datetime(inbound["date_created"]).timestamp() < int(row["created_at"])
+        ):
+            raise ValueError("unexpected inbound call")
+        # The signed incoming request can arrive before start_phone_call returns.
+        async with asyncio.timeout(8):
+            while True:
+                calls = await self.debug("/calls")
+                owned = [call for call in calls if call.get("plan_id") == row["plan_id"]]
+                if len(owned) > 1:
+                    raise ValueError("ambiguous application call")
+                if owned:
+                    call_id = owned[0]["call_id"]
+                    if row.get("app_call_id", call_id) != call_id:
+                        raise ValueError("application call mismatch")
+                    detail = await self.debug(f"/calls/{call_id}")
+                    audit = detail["canary_evidence"]
+                    outbound_sid = audit.get(f"twilio_{role}_call_sid")
+                    conference_sid = audit.get("conference_sid")
+                    if outbound_sid and conference_sid:
+                        break
+                await asyncio.sleep(0.2)
+        self.validate_sid(outbound_sid, "CA")
+        self.validate_sid(conference_sid, "CF")
+        outbound = await self.twilio("GET", f"/Calls/{outbound_sid}.json")
+        if (
+            outbound.get("account_sid") != self.config.twilio_account_sid
+            or outbound.get("direction") != "outbound-api"
+            or outbound.get("from") != self.config.caller_number
+            or outbound.get("to") != destination
+            or outbound.get("status") not in {"queued", "ringing", "in-progress"}
+        ):
+            raise ValueError("unexpected outbound leg")
+        return {
+            "app_call_id": call_id,
+            "incoming_call_sid": sid,
+            "outbound_call_sid": outbound_sid,
+            "conference_sid": conference_sid,
+        }
+
+    async def announce_challenge(self, correlation: dict[str, Any], url: str) -> None:
+        path = (
+            f"/Conferences/{correlation['conference_sid']}/Participants/"
+            f"{correlation['outbound_call_sid']}.json"
+        )
+        async with asyncio.timeout(12):
+            while True:
+                try:
+                    participant = await self.twilio("GET", path)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code != 404:
+                        raise
+                    participant = {}
+                if participant.get("status") == "connected":
+                    break
+                await asyncio.sleep(0.2)
+        await self.twilio(
+            "POST", f"/Calls/{correlation['incoming_call_sid']}.json", data={"TimeLimit": "30"}
+        )
+        await self.twilio("POST", path, data={"AnnounceUrl": url, "AnnounceMethod": "POST"})
+
     @staticmethod
     def validate_sid(sid: str, prefix: str) -> None:
         if not re.fullmatch(prefix + r"[a-fA-F0-9]{32}", sid):
@@ -122,7 +194,9 @@ class Provider:
             except Exception as exc:
                 errors.append("discovery:" + type(exc).__name__)
         record = store.get(run_id)
-        calls = set(record["calls"])
+        # Provisional inbound legs were admitted by this harness but are not
+        # evidence receivers until the private outbound challenge is returned.
+        calls = set(record["calls"]) | set(record.get("candidates", {}))
         conferences = set(record.get("conferences", []))
         forced: list[str] = []
         states: dict[str, str] = {}
@@ -186,6 +260,13 @@ class Provider:
                 continue
             try:
                 result = await self.cleanup(store, record["id"])
+                if store.get(record["id"]).get("finalizing"):
+                    # The runner owns artifact publication while receive handlers drain.
+                    # A crashed runner requires explicit reconciliation; a reaper must
+                    # never turn unfinished audio into a completed, downloadable report.
+                    store.update(record["id"], cleanup=result)
+                    results.append({"id": record["id"], **result})
+                    continue
                 from scripts.live_phone.report import write_report
                 from scripts.live_phone.scenarios import SCENARIOS
 

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,7 +16,9 @@ from starlette.websockets import WebSocketDisconnect
 from twilio.request_validator import RequestValidator
 
 from scripts.live_phone.audio import (
+    ChallengeDetector,
     DigitDetector,
+    challenge_audio,
     decode_mulaw,
     encode_mulaw,
     pcm24_to_8,
@@ -26,7 +29,7 @@ from scripts.live_phone.audio import (
 from scripts.live_phone.config import Config
 from scripts.live_phone.provider import Provider
 from scripts.live_phone.report import grade, write_report
-from scripts.live_phone.runner import packet, run_call
+from scripts.live_phone.runner import drain_sessions, packet, run_call
 from scripts.live_phone.scenarios import SCENARIOS
 from scripts.live_phone.server import create_app
 from scripts.live_phone.session import Session
@@ -72,6 +75,30 @@ def test_mulaw_roundtrip_and_wav_are_real_audio():
     assert decode_mulaw(bytes([255, 127])) == bytes(4)
     assert wav_bytes(pcm).startswith(b"RIFF")
     assert len(pcm24_to_8(pcm * 3)) == len(pcm)
+
+
+def test_audio_challenge_survives_mixed_audio_codec_and_frame_boundaries():
+    expected = "00112233445566778899"
+    signal = challenge_audio(expected)
+    interference = tone(len(signal) / 16000, (423, 832, 1754))
+    mixed = struct.pack(
+        f"<{len(signal) // 2}h",
+        *(
+            max(-32768, min(32767, a + b))
+            for (a,), (b,) in zip(
+                struct.iter_unpack("<h", signal),
+                struct.iter_unpack("<h", interference),
+                strict=True,
+            )
+        ),
+    )
+    received = bytes(174) + decode_mulaw(encode_mulaw(mixed))
+    detector = ChallengeDetector()
+    decoded = []
+    for offset in range(0, len(received), 320):
+        decoded.extend(detector.feed(received[offset : offset + 320]))
+    assert "".join(decoded) == expected
+    assert ChallengeDetector().feed(tone(0.5, (440,))) == []
 
 
 @pytest.mark.parametrize(
@@ -174,6 +201,236 @@ def incoming_form(config, role="callee"):
     }
 
 
+def test_candidate_proof_is_one_use_and_cannot_cross_runs(phone_config):
+    store = Store(phone_config.artifacts)
+    sid = "CA" + "a" * 32
+    store.create("old", {"bindings": {}}, 120)
+    store.candidate("old", sid, "callee", {"digits": "123456789012"})
+    with pytest.raises(ValueError, match="challenge mismatch"):
+        store.bind_candidate("old", sid, "000000000000")
+    with pytest.raises(ValueError, match="invalid candidate"):
+        store.bind_candidate("old", sid, "123456789012")
+    assert store.get("old")["bindings"] == {}
+    store.update("old", done=True)
+    store.create("new", {"bindings": {}}, 120)
+    with pytest.raises(ValueError, match="earlier run"):
+        store.candidate("new", sid, "callee", {"digits": "987654321098"})
+    actual_sid = "CA" + "b" * 32
+    store.candidate("new", actual_sid, "callee", {"digits": "987654321098"})
+    store.bind_candidate("new", actual_sid, "987654321098")
+    assert store.get("new")["bindings"] == {"callee": actual_sid}
+    with pytest.raises(ValueError, match="invalid candidate"):
+        store.bind_candidate("new", actual_sid, "987654321098")
+
+
+@pytest.mark.parametrize("invalid", ["stale", "terminal", "wrong_destination", "wrong_plan"])
+async def test_provider_rejects_unrelated_legs(phone_config, invalid):
+    import time
+    from email.utils import formatdate
+
+    sid, outbound_sid, conference = "CA" + "a" * 32, "CA" + "b" * 32, "CF" + "c" * 32
+    now = time.time()
+    inbound = {
+        "account_sid": phone_config.twilio_account_sid,
+        "direction": "inbound",
+        "from": phone_config.caller_number,
+        "to": phone_config.callee_number,
+        "status": "ringing",
+        "date_created": formatdate(now, usegmt=True),
+    }
+    outbound = {**inbound, "direction": "outbound-api"}
+    if invalid == "stale":
+        inbound["date_created"] = formatdate(now - 3600, usegmt=True)
+    elif invalid == "terminal":
+        inbound["status"] = "completed"
+    elif invalid == "wrong_destination":
+        outbound["to"] = phone_config.owner_number
+    async with httpx.AsyncClient() as http:
+        provider = Provider(phone_config, http)
+        provider.twilio = AsyncMock(side_effect=[inbound, outbound])
+        provider.debug = AsyncMock(
+            side_effect=[
+                [{"call_id": "other" if invalid == "wrong_plan" else "current", "plan_id": "plan"}],
+                {
+                    "canary_evidence": {
+                        "twilio_callee_call_sid": outbound_sid,
+                        "conference_sid": conference,
+                    }
+                },
+            ]
+        )
+        with pytest.raises(ValueError):
+            await provider.correlate(
+                {"plan_id": "plan", "app_call_id": "current", "created_at": now}, "callee", sid
+            )
+
+
+@pytest.mark.parametrize("cleanup_verified", [True, False])
+async def test_failure_report_waits_for_final_audio_and_asr(
+    phone_config, monkeypatch, cleanup_verified
+):
+    store = Store(phone_config.artifacts)
+    store.create("run_one", {"scenario": "conversation"}, 120)
+    session = Session("callee", store.root / "run_one", {}, {}, None, "test", AsyncMock(), {})
+    session.ready.set()
+    cleaned = asyncio.Event()
+    close = asyncio.Event()
+    transcribe = asyncio.Event()
+
+    async def receive_tail():
+        await close.wait()
+        session.closed.set()
+        await transcribe.wait()
+        session.rx.extend(tone(0.2))
+        session.transcripts.append({"text": "the final received words"})
+        session.save()
+        session.drained.set()
+
+    async def cleanup(*args):
+        cleaned.set()
+        return {"verified": cleanup_verified, "forced": [], "states": {}}
+
+    monkeypatch.setattr(
+        "scripts.live_phone.runner.Client", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError())
+    )
+    receiver = asyncio.create_task(receive_tail())
+    runner = asyncio.create_task(
+        run_call(
+            phone_config,
+            store,
+            SimpleNamespace(cleanup=cleanup),
+            None,
+            "run_one",
+            SCENARIOS["conversation"],
+            {"callee": session},
+        )
+    )
+    await cleaned.wait()
+    assert not store.get("run_one")["done"]
+    assert not (session.root / "report.json").exists()
+    close.set()
+    await asyncio.sleep(0)
+    assert not store.get("run_one")["done"]
+    transcribe.set()
+    await asyncio.gather(receiver, runner)
+    report = json.loads((session.root / "report.json").read_text())
+    assert (
+        report["evidence"]["sessions"]["callee"]["transcripts"][-1]["text"]
+        == "the final received words"
+    )
+    assert (session.root / "callee-received.wav").stat().st_size > 44
+    assert store.get("run_one")["done"] == cleanup_verified
+    assert not store.get("run_one")["finalizing"]
+    assert not store.get("run_one")["passed"]
+
+
+async def test_media_finalize_is_bounded_and_skips_unconnected_sessions(tmp_path):
+    connected = Session("callee", tmp_path, {}, {}, None, "test", AsyncMock(), {})
+    absent = Session("owner", tmp_path, {}, {}, None, "test", AsyncMock(), {})
+    connected.ready.set()
+    result = await drain_sessions(
+        {"callee": connected, "owner": absent}, close_timeout=0.01, drain_timeout=0.01
+    )
+    assert result == {"callee": "timeout", "owner": "not_connected"}
+    assert connected.error == "media_finalize_timeout"
+    assert (tmp_path / "owner-received.wav").is_file()
+
+
+async def test_reaper_does_not_publish_while_runner_drains(phone_config):
+    store = Store(phone_config.artifacts)
+    store.create("run_one", {"scenario": "conversation", "finalizing": True}, -1)
+    async with httpx.AsyncClient() as http:
+        provider = Provider(phone_config, http)
+        provider.cleanup = AsyncMock(return_value={"verified": True, "forced": [], "states": {}})
+        await provider.reap(store)
+    assert not store.get("run_one")["done"]
+    assert not (store.root / "run_one" / "report.json").exists()
+
+
+async def test_challenge_waits_for_connection_and_targets_exact_outbound_leg(phone_config):
+    correlation = {
+        "conference_sid": "CF" + "c" * 32,
+        "outbound_call_sid": "CA" + "b" * 32,
+        "incoming_call_sid": "CA" + "a" * 32,
+    }
+    missing = httpx.Response(404, request=httpx.Request("GET", "https://api.twilio.com/"))
+    async with httpx.AsyncClient() as http:
+        provider = Provider(phone_config, http)
+        provider.twilio = AsyncMock(
+            side_effect=[
+                httpx.HTTPStatusError("not joined", request=missing.request, response=missing),
+                {"status": "connected"},
+                {},
+                {},
+            ]
+        )
+        await provider.announce_challenge(
+            correlation, "https://phones.example.test/challenge/current"
+        )
+    calls = provider.twilio.call_args_list
+    assert calls[0].args == calls[1].args
+    assert calls[2].args == ("POST", f"/Calls/{correlation['incoming_call_sid']}.json")
+    assert calls[2].kwargs["data"] == {"TimeLimit": "30"}
+    assert calls[3].args == (
+        "POST",
+        f"/Conferences/{correlation['conference_sid']}/Participants/{correlation['outbound_call_sid']}.json",
+    )
+    assert calls[3].kwargs["data"]["AnnounceUrl"].endswith("/challenge/current")
+
+
+def test_wrong_audio_probe_cannot_consume_receiver_or_ticket(phone_config):
+    app = create_app(phone_config)
+    app.state.provider.announce_challenge = AsyncMock()
+    app.state.provider.twilio = AsyncMock(return_value={})
+    sid = "CA" + "a" * 32
+    with TestClient(app) as client:
+        store = app.state.store
+        store.create("run_one", {"bindings": {}}, 120)
+        store.candidate("run_one", sid, "callee", {"digits": "1" * 20})
+        session = Session("callee", store.root / "run_one", {}, {}, None, "test", AsyncMock(), {})
+        app.state.sessions["run_one", "callee"] = session
+        app.state.tickets["run_one", "callee"] = "unconsumed"
+        path = f"/probe/run_one/{sid}"
+        stream_sid = "MZ" + "2" * 32
+        assert client.post(f"/challenge/run_one/{sid}").status_code == 403
+        with client.websocket_connect(path, headers=signed(phone_config, path, {})) as ws:
+            ws.send_json({"event": "connected"})
+            ws.send_json(
+                {
+                    "event": "start",
+                    "start": {
+                        "accountSid": phone_config.twilio_account_sid,
+                        "callSid": sid,
+                        "streamSid": stream_sid,
+                        "mediaFormat": {
+                            "encoding": "audio/x-mulaw",
+                            "sampleRate": 8000,
+                            "channels": 1,
+                        },
+                    },
+                }
+            )
+            raw = encode_mulaw(challenge_audio("2" * 20))
+            for offset in range(0, len(raw), 8000):
+                ws.send_json(
+                    {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {
+                            "track": "inbound",
+                            "payload": base64.b64encode(raw[offset : offset + 8000]).decode(),
+                        },
+                    }
+                )
+            ws.send_json({"event": "stop", "streamSid": stream_sid})
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+        assert store.get("run_one")["bindings"] == {}
+        assert app.state.tickets["run_one", "callee"] == "unconsumed"
+        assert not session.ready.is_set() and session.error is None
+        assert session.rx == b""
+
+
 def test_harness_auth_and_signed_busy_endpoint(phone_config):
     app = create_app(phone_config)
     with TestClient(app) as client:
@@ -188,13 +445,14 @@ def test_harness_auth_and_signed_busy_endpoint(phone_config):
         )
         assert result.status_code == 200
         assert '<Reject reason="busy"' in result.text
-        assert app.state.store.get("run_one")["calls"] == [form["CallSid"]]
+        assert app.state.store.get("run_one")["calls"] == []
+        assert app.state.store.get("run_one")["bindings"] == {}
         form["CallSid"] = "CA" + "b" * 32
         assert (
             client.post(
                 "/incoming", data=form, headers=signed(phone_config, "/incoming", form)
             ).status_code
-            == 409
+            == 200
         )
         assert (
             client.get(
@@ -212,6 +470,18 @@ def test_signed_websocket_receives_audio_and_independent_asr(
 ):
     app = create_app(phone_config)
     monkeypatch.setattr(app.state.provider, "twilio", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        app.state.provider,
+        "correlate",
+        AsyncMock(
+            return_value={
+                "app_call_id": "app-call",
+                "outbound_call_sid": "CA" + "b" * 32,
+                "conference_sid": "CF" + "c" * 32,
+            }
+        ),
+    )
+    monkeypatch.setattr(app.state.provider, "announce_challenge", AsyncMock())
     monkeypatch.setattr(
         app.state.speech_client.audio.transcriptions,
         "create",
@@ -240,6 +510,62 @@ def test_signed_websocket_receives_audio_and_independent_asr(
             "/incoming", data=form, headers=signed(phone_config, "/incoming", form)
         )
         assert response.status_code == 200
+        assert "<Start" in response.text and "ticket" not in response.text
+        assert store.get("run_one")["bindings"] == {}
+        correlate_path = "/connected/run_one/" + form["CallSid"]
+        assert (
+            client.post(
+                correlate_path, data=form, headers=signed(phone_config, correlate_path, form)
+            ).status_code
+            == 409
+        )
+        probe_path = "/probe/run_one/" + form["CallSid"]
+        probe_sid = "MZ" + "2" * 32
+        signature = RequestValidator(
+            phone_config.twilio_auth_token.get_secret_value()
+        ).compute_signature(
+            phone_config.public_url.replace("https://", scheme + "://") + probe_path + suffix, {}
+        )
+        with client.websocket_connect(probe_path, headers={"x-twilio-signature": signature}) as ws:
+            ws.send_json({"event": "connected"})
+            ws.send_json(
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": probe_sid,
+                        "accountSid": phone_config.twilio_account_sid,
+                        "callSid": form["CallSid"],
+                        "mediaFormat": {
+                            "encoding": "audio/x-mulaw",
+                            "sampleRate": 8000,
+                            "channels": 1,
+                        },
+                    },
+                }
+            )
+            digits = store.get("run_one")["candidates"][form["CallSid"]]["digits"]
+            raw = encode_mulaw(challenge_audio(digits))
+            for offset in range(0, len(raw), 8000):
+                ws.send_json(
+                    {
+                        "event": "media",
+                        "streamSid": probe_sid,
+                        "media": {
+                            "track": "inbound",
+                            "payload": base64.b64encode(raw[offset : offset + 8000]).decode(),
+                        },
+                    }
+                )
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+        assert store.get("run_one")["bindings"] == {"callee": form["CallSid"]}
+        assert not session.ready.is_set()
+        assert session.rx == b""
+        response = client.post(
+            correlate_path, data=form, headers=signed(phone_config, correlate_path, form)
+        )
+        assert response.status_code == 200
+        assert "ticket-value" in response.text
         path = "/media/run_one/callee"
         sid = "MZ" + "1" * 32
         signature = RequestValidator(
@@ -559,6 +885,8 @@ async def test_runner_polls_answers_and_waits_for_post_transfer_audio(
             self.signals = {"transferred": asyncio.Event()}
             self.closed = asyncio.Event()
             self.drained = asyncio.Event()
+            self.ready = asyncio.Event()
+            self.ready.set()
             self.finished = False
 
         async def execute(self, steps):

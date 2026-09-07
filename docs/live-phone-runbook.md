@@ -52,6 +52,22 @@ closed to new calls. Never delete `runs.db` to force a new run while calls are u
 Incoming legs have provider time limits; application-side limits remain in force as a
 last backstop. Keep the application available for final resource discovery.
 
+Incoming conversation legs undergo a private audio challenge before they can consume
+a receiver binding. The harness discovers this plan's outbound conference participant,
+plays a random sequence of ordinary tones to that participant with Twilio's private
+announcement API, and decodes it on a provisional receiving stream. This adds several
+seconds before the scripted conversation. Provisional audio is discarded. The normal
+media ticket and ASR are enabled only after verification; caller ID and a signed webhook
+alone are insufficient. Reject/busy handlers take no receiver binding.
+
+After cleanup, the runner waits up to 15 seconds for each connected stream to close,
+then 35 seconds for its final ASR and WAV writes. These waits also apply to failed runs.
+Unconnected sessions are recorded as such without waiting for a stop event. If media
+finalization times out, the report explicitly fails and `done` remains false. The reaper
+continues terminating resources but cannot overwrite a finalizing runner's report or
+release its lease. Inspect the receive-handler failure and reconcile the incomplete
+artifacts before releasing that reservation; never promote partial audio to a pass.
+
 ## Basic conversation acceptance
 
 Start with one real call covering conversation, web search, interruption, and hangup:

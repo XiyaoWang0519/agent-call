@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import re
 import secrets
@@ -15,7 +16,14 @@ from pydantic import BaseModel
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
 
-from scripts.live_phone.audio import pcm24_to_8
+from scripts.live_phone.audio import (
+    ChallengeDetector,
+    challenge_audio,
+    decode_mulaw,
+    pcm24_to_8,
+    rms,
+    wav_bytes,
+)
 from scripts.live_phone.config import Config
 from scripts.live_phone.provider import Provider
 from scripts.live_phone.runner import run_call
@@ -213,7 +221,7 @@ def create_app(config: Config) -> FastAPI:
         if not role or len(active) != 1 or active[0]["deadline"] <= time.time():
             raise HTTPException(409, "no matching reservation")
         row = active[0]
-        if not row.get("plan_id"):
+        if not row.get("plan_id") or row.get("finalizing"):
             raise HTTPException(409, "run is not armed")
         run_id = row["id"]
         sid = str(form.get("CallSid"))
@@ -228,22 +236,87 @@ def create_app(config: Config) -> FastAPI:
         reject = scenario.reject if role == "callee" else scenario.owner_reject
         if not reject and (run_id, role) not in sessions:
             raise HTTPException(409, "counterpart is not available")
-        store.add_call(run_id, sid)
-        bindings[role] = sid
-        store.update(run_id, bindings=bindings)
         response = VoiceResponse()
         if reject:
+            # A refusal needs no receiver ownership. In particular, an unrelated
+            # caller cannot consume a role and prevent the real test being refused.
             response.reject(reason=reject)
         else:
-            stream = response.connect().stream(
+            try:
+                correlation = await provider.correlate(row, role, sid)
+                correlation["digits"] = "".join(secrets.choice("0123456789") for _ in range(20))
+                store.candidate(run_id, sid, role, correlation)
+            except (ValueError, TimeoutError, httpx.HTTPError):
+                raise HTTPException(409, "call correlation unavailable") from None
+
+            response.start().stream(
+                name="correlation-probe",
                 url=config.public_url.rstrip("/").replace("https://", "wss://", 1)
-                + f"/media/{run_id}/{role}"
+                + f"/probe/{run_id}/{sid}",
             )
-            ticket = tickets.get((run_id, role))
-            if ticket is None:
-                raise HTTPException(409, "stream already consumed")
-            stream.parameter(name="ticket", value=ticket)
+            response.pause(length=25)
             response.hangup()
+        return Response(str(response), media_type="text/xml")
+
+    async def signed_form(request: Request) -> Any:
+        form = await request.form()
+        if request.url.query or not RequestValidator(
+            config.twilio_auth_token.get_secret_value()
+        ).validate(
+            config.public_url.rstrip("/") + request.url.path,
+            form,
+            request.headers.get("x-twilio-signature", ""),
+        ):
+            raise HTTPException(403, "invalid signature")
+        return form
+
+    @app.post("/challenge/{run_id}/{sid}")
+    async def challenge_wav(request: Request, run_id: str, sid: str):
+        from fastapi.responses import Response
+
+        await signed_form(request)
+        try:
+            row = store.get(run_id)
+            candidate = row["candidates"][sid]
+            if row["done"] or row.get("finalizing") or row["deadline"] <= time.time():
+                raise KeyError(run_id)
+        except KeyError:
+            raise HTTPException(409, "challenge unavailable") from None
+        return Response(
+            wav_bytes(challenge_audio(candidate["digits"])),
+            media_type="audio/wav",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/connected/{run_id}/{sid}")
+    async def connected(request: Request, run_id: str, sid: str):
+        from fastapi.responses import Response
+
+        form = await signed_form(request)
+        if form.get("AccountSid") != config.twilio_account_sid or form.get("CallSid") != sid:
+            raise HTTPException(403, "unexpected call")
+        try:
+            row = store.get(run_id)
+            role = row["candidates"][sid]["role"]
+            ticket = tickets[(run_id, role)]
+            if (
+                not sessions[(run_id, role)].accepting
+                or row["bindings"].get(role) != sid
+                or row["done"]
+                or row.get("finalizing")
+                or row["deadline"] <= time.time()
+            ):
+                raise ValueError("session finalizing")
+        except (KeyError, ValueError):
+            raise HTTPException(409, "call correlation failed") from None
+        response = VoiceResponse()
+        response.stop().stream(name="correlation-probe")
+        stream = response.connect().stream(
+            url=config.public_url.rstrip("/").replace("https://", "wss://", 1)
+            + f"/media/{run_id}/{role}"
+        )
+        stream.parameter(name="ticket", value=ticket)
+        response.hangup()
         return Response(str(response), media_type="text/xml")
 
     @app.get("/runs/{run_id}/artifacts/{name}", dependencies=[Depends(auth)])
@@ -276,25 +349,114 @@ def create_app(config: Config) -> FastAPI:
             },
         )
 
-    @app.websocket("/media/{run_id}/{role}")
-    async def media(websocket: WebSocket, run_id: str, role: str) -> None:
-        path = f"/media/{run_id}/{role}"
-        signature = websocket.headers.get("x-twilio-signature", "")
+    def valid_media_signature(websocket: WebSocket, path: str) -> bool:
         # Twilio signs the public WSS handshake URL; some edges append a slash.
         # Accept only these canonical variants of our configured origin and exact path.
         # https://www.twilio.com/docs/usage/security#validating-requests-are-coming-from-twilio
         public_url = config.public_url.rstrip("/") + path
         validator = RequestValidator(config.twilio_auth_token.get_secret_value())
-        valid = any(
-            validator.validate(url + suffix, {}, signature)
+        return not websocket.url.query and any(
+            validator.validate(url + suffix, {}, websocket.headers.get("x-twilio-signature", ""))
             for url in (public_url, public_url.replace("https://", "wss://", 1))
             for suffix in ("", "/")
         )
-        if websocket.url.query or not valid:
+
+    @app.websocket("/probe/{run_id}/{sid}")
+    async def probe(websocket: WebSocket, run_id: str, sid: str) -> None:
+        if not valid_media_signature(websocket, f"/probe/{run_id}/{sid}"):
+            await websocket.close(code=1008)
+            return
+        announcer = None
+        frames = 0
+        peak_rms = 0.0
+        decoded = 0
+        observed = ""
+        await websocket.accept()
+        try:
+            async with asyncio.timeout(20):
+                row = store.get(run_id)
+                candidate = row["candidates"][sid]
+                if row["done"] or row.get("finalizing") or row["deadline"] <= time.time():
+                    raise ValueError("reservation expired")
+                message = await websocket.receive_json()
+                if message.get("event") == "connected":
+                    message = await websocket.receive_json()
+                start = message.get("start", {})
+                stream_sid = start.get("streamSid", "")
+                if (
+                    message.get("event") != "start"
+                    or start.get("callSid") != sid
+                    or start.get("accountSid") != config.twilio_account_sid
+                    or not re.fullmatch(r"MZ[a-fA-F0-9]{32}", str(stream_sid))
+                    or start.get("mediaFormat")
+                    != {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1}
+                ):
+                    raise ValueError("invalid probe stream")
+                announcer = asyncio.create_task(
+                    provider.announce_challenge(
+                        candidate, config.public_url.rstrip("/") + f"/challenge/{run_id}/{sid}"
+                    )
+                )
+                detector = ChallengeDetector()
+                digits = ""
+                while not secrets.compare_digest(digits, candidate["digits"]):
+                    message = await websocket.receive_json()
+                    if announcer.done():
+                        announcer.result()
+                    if message.get("streamSid") != stream_sid or message.get("event") == "stop":
+                        raise ValueError("probe disconnected")
+                    if message.get("event") != "media":
+                        continue
+                    media = message["media"]
+                    raw = base64.b64decode(media["payload"], validate=True)
+                    if media.get("track") != "inbound" or not 0 < len(raw) <= 8000:
+                        raise ValueError("invalid probe audio")
+                    pcm = decode_mulaw(raw)
+                    frames += 1
+                    peak_rms = max(peak_rms, rms(pcm))
+                    found = detector.feed(pcm)
+                    decoded += len(found)
+                    observed = (observed + "".join(found))[-100:]
+                    digits = (digits + "".join(found))[-len(candidate["digits"]) :]
+                await announcer
+                store.bind_candidate(run_id, sid, digits)
+                await provider.twilio(
+                    "POST",
+                    f"/Calls/{sid}.json",
+                    data={
+                        "Url": config.public_url.rstrip("/") + f"/connected/{run_id}/{sid}",
+                        "Method": "POST",
+                    },
+                )
+        except Exception as exc:
+            # A failed probe cannot set the real session's error or consume its ticket.
+            store.candidate_error(
+                run_id,
+                sid,
+                type(exc).__name__,
+                {
+                    "frames": frames,
+                    "peak_rms": round(peak_rms),
+                    "decoded_symbols": decoded,
+                    "observed_symbols": observed,
+                    "announcement_done": announcer is not None and announcer.done(),
+                },
+            )
+        finally:
+            if announcer:
+                announcer.cancel()
+                await asyncio.gather(announcer, return_exceptions=True)
+            with contextlib.suppress(Exception):
+                await websocket.close()
+
+    @app.websocket("/media/{run_id}/{role}")
+    async def media(websocket: WebSocket, run_id: str, role: str) -> None:
+        path = f"/media/{run_id}/{role}"
+        if not valid_media_signature(websocket, path):
             await websocket.close(code=1008)
             return
         session = sessions.get((run_id, role))
-        if not session or session.ready.is_set():
+        if not session or not session.accepting or session.ready.is_set():
             await websocket.close(code=1008)
             return
         await websocket.accept()
@@ -317,6 +479,8 @@ def create_app(config: Config) -> FastAPI:
                         tickets.get((run_id, role), "invalid"),
                     )
                     or row["done"]
+                    or row.get("finalizing")
+                    or not session.accepting
                     or row["deadline"] <= time.time()
                 ):
                     raise ValueError("invalid stream binding")
@@ -327,7 +491,9 @@ def create_app(config: Config) -> FastAPI:
                     f"/Calls/{start['callSid']}.json",
                     data={"TimeLimit": str(min(600, max(1, int(row["deadline"] - time.time()))))},
                 )
-            await session.receive(websocket, start["streamSid"], start["callSid"])
+            # Cleanup may have started while the provider request was in flight.
+            if session.accepting:
+                await session.receive(websocket, start["streamSid"], start["callSid"])
         except Exception as exc:
             session.error = f"websocket:{type(exc).__name__}"
             session.changed.set()

@@ -57,6 +57,7 @@ SCENARIOS = {
             "when interrupted, answer the replacement question, then say goodbye and use "
             "end_call when asked to finish.",
             (
+                HELLO,
                 Step("expect", r"hello|hi|calling|test", 40),
                 Step(
                     "say",

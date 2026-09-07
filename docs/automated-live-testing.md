@@ -42,7 +42,8 @@ real numbers or generate real call status callbacks. [1]
 
 ## How the automated phone works
 
-The destination's incoming-call webhook returns `<Connect><Stream>` to the test
+The destination first opens a provisional, receive-only stream for call correlation.
+After the audio challenge succeeds, its TwiML switches to `<Connect><Stream>` on the test
 service's secure WebSocket. On this receiving call leg, inbound audio contains what
 the remote agent says; the harness sends the automated callee's speech back into the
 call. Keep this on the destination leg: replacing the application-side conference
@@ -60,9 +61,17 @@ mu-law audio at 8 kHz; `mark` acknowledges playback completion, but can also fol
 buffer clear. A mark alone does not prove the other endpoint heard speech. [3]
 
 Correlate the run, scenario, app call ID, conference SID, and each provider call SID.
-The originating callee leg and the harness's receiving leg have different SIDs. Bind
-an authenticated, expiring scenario reservation to the expected destination/caller
-and then to the incoming SID; caller ID alone is not authorization.
+The originating callee leg and the harness's receiving leg have different SIDs, with
+no parent/child relationship in Twilio-to-Twilio PSTN call records. The harness verifies
+the inbound call's provider state and creation time, discovers the outbound participant
+from the application's single-use plan, and persists that candidate correlation.
+It then privately announces a random audio challenge to that exact outbound participant. [7]
+Only a receiving stream that decodes the challenge may bind the role and obtain the
+conversation's one-use media ticket. The challenge uses single-frequency tones rather
+than telephone DTMF signaling, and provisional audio is neither transcribed nor included
+in scenario recordings. Cross-run SID reuse is rejected transactionally. Busy/rejected
+endpoints issue refusals without taking receiver ownership or consuming media tickets;
+their results are checked against the application's own outbound call.
 
 ## Coverage matrix
 
@@ -193,3 +202,4 @@ custom harness offers more direct control over these repository-specific behavio
 4. [Twilio Play and digits](https://www.twilio.com/docs/voice/twiml/play)
 5. [Twilio Reject](https://www.twilio.com/docs/voice/twiml/reject)
 6. [Hamming platform](https://hamming.ai/) and [FAQ](https://hamming.ai/faqs)
+7. [Twilio participant announcements](https://www.twilio.com/docs/voice/api/conference-participant-resource#update-a-participant-resource)

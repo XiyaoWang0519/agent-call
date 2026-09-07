@@ -28,6 +28,21 @@ is a script voiced by `gpt-4o-mini-tts`, with independent `gpt-4o-mini-transcrib
 English ASR and `gpt-4.1-mini` semantic grading. It is not a second Realtime agent.
 Read current settings before reporting a later run's models.
 
+### PR review verification, 2026-09-07
+
+`basic` passed all **24 checks** again in `run_7bf82037798ff1a954249d50` after adding
+the provider audio-correlation gate. The receiving leg decoded the fresh nonce sent
+privately to this plan's outbound conference participant before it obtained a media
+binding. Received scenario audio lasted **107.229 seconds**; interruption overlap was
+**0.46 seconds**, with no voiced tail after the 1.2-second allowance. Final ASR and both
+WAV files were saved before `done=true`. All three call legs and the conference were
+verified completed, with no forced cleanup.
+
+Four earlier development attempts failed while correcting Twilio's pre-answer update
+restriction and calibrating the audio challenge; their failed reports and verified
+cleanup records remain in the private run directory. This acceptance still covers
+**basic only**, not the full suite or a mobile carrier route.
+
 ## Resume the existing machine
 
 Work from the repository root. Check for these **ignored, private** files without

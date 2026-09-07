@@ -28,9 +28,10 @@ def grade(scenario: Scenario, evidence: dict[str, Any]) -> dict[str, bool]:
         "provider_cleanup_verified": evidence.get("cleanup", {}).get("verified") is True,
         "no_forced_cleanup": evidence.get("cleanup", {}).get("forced") == [],
         "mcp_snapshot_observed": bool(evidence.get("snapshots")),
-        "callee_reservation_consumed": "callee" in evidence.get("receivers", []),
     }
-    if scenario.owner_reject or scenario.owner_steps:
+    if not scenario.reject:
+        checks["callee_reservation_consumed"] = "callee" in evidence.get("receivers", [])
+    if scenario.owner_steps:
         checks["owner_reservation_consumed"] = "owner" in evidence.get("receivers", [])
     if not scenario.reject:
         checks.update(

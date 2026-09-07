@@ -46,6 +46,7 @@ class Session:
         self.hangup = hangup
         self.signals = signals
         self.ready = asyncio.Event()
+        self.accepting = True
         self.closed = asyncio.Event()
         self.drained = asyncio.Event()
         self.finished = asyncio.Event()
