@@ -29,6 +29,7 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
     assert payload["tracing"] == "auto"
     assert payload["audio"]["input"] == {
         "transcription": {"model": "gpt-realtime-whisper"},
+        "noise_reduction": {"type": "far_field"},
         "turn_detection": {
             "type": "semantic_vad",
             "eagerness": "auto",
@@ -47,7 +48,6 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         "record_call_outcome",
         "search_web",
         "send_dtmf",
-        "end_call",
     ]
     assert "ask_agent" not in [tool["name"] for tool in payload["tools"]]
     search_web = payload["tools"][2]
@@ -75,15 +75,11 @@ def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, 
         in send_dtmf["parameters"]["properties"]["digits"]["description"]
     )
     assert send_dtmf["parameters"]["additionalProperties"] is False
-    end_call = payload["tools"][4]
-    assert end_call["parameters"]["required"] == ["reason"]
-    assert "objective_completed" in end_call["parameters"]["properties"]["reason"]["enum"]
-    assert "final goodbye" in end_call["description"].lower()
-    # Ending must be gated on the callee having nothing further, not just objective status;
-    # a pending callee request must be answered as a normal turn before end_call.
-    description = end_call["description"].lower()
-    assert "callee has nothing further" in description
-    assert "answer it fully" in description
+    # Closing is classified silently after speech; no closing tool can induce a
+    # spoken tool preamble instead of the actual farewell.
+    assert "say goodbye" in payload["instructions"].lower()
+    assert "callee has nothing further" in payload["instructions"]
+    assert "answer it fully" in payload["instructions"]
 
 
 def test_accept_payload_includes_ask_agent_when_enabled(settings, packet):
@@ -103,7 +99,6 @@ def test_accept_payload_includes_ask_agent_when_enabled(settings, packet):
         "search_web",
         "send_dtmf",
         "ask_agent",
-        "end_call",
     ]
     ask_agent = next(tool for tool in payload["tools"] if tool["name"] == "ask_agent")
     assert ask_agent["parameters"]["required"] == ["question"]
@@ -189,3 +184,21 @@ def test_activation_echo_must_preserve_configured_semantic_vad(settings):
     assert bridge.activation_update_confirmed(event)
     event["session"]["audio"]["input"]["turn_detection"]["eagerness"] = "high"
     assert not bridge.activation_update_confirmed(event)
+
+
+def test_default_server_vad_payload_preserves_latency_settings(packet):
+    from app.settings import Settings
+
+    settings = Settings(_env_file=None)
+    bridge = RealtimeBridge(
+        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
+    )
+    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
+    assert payload["audio"]["input"]["turn_detection"] == {
+        "type": "server_vad",
+        "threshold": 0.5,
+        "prefix_padding_ms": 300,
+        "silence_duration_ms": 300,
+        "create_response": False,
+        "interrupt_response": False,
+    }

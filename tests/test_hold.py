@@ -189,3 +189,62 @@ async def test_enter_hold_returns_false_when_suspend_fails(hold_service, packet)
     assert call_id not in hold_service._hold_state
     call = await hold_service.db.get_call(call_id)
     assert call["state"] == CallState.ACTIVE.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Press one or say demo. Or stay on the line and I'll help with your request.",
+        "Stay on the line and I'll help with your request.",
+        "Please remain on the line.",
+        "Please hold, or press one to request a callback.",
+        "The next available agent can help. What would you like to do?",
+        "Can you please hold?",
+    ],
+)
+async def test_menu_or_question_does_not_suspend_responses(hold_service, packet, text):
+    call_id = await seed_call(hold_service.db, packet, state=CallState.ACTIVE)
+    hold_service._active_response_ids[call_id] = "first_reply"
+
+    await hold_service.handle_realtime_event(call_id, _transcript_event(text))
+
+    assert call_id not in hold_service._hold_state
+    assert hold_service._test_realtime.suspend_calls == []
+    assert ("cancel_response", call_id) not in hold_service._test_realtime.events
+    assert hold_service._active_response_ids[call_id] == "first_reply"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Please stay on the line while we connect you.",
+        "Remain on the line until a representative is available.",
+        "Please hold.",
+        "All our agents are currently assisting other customers.",
+        "Your call will be answered in the order it was received.",
+    ],
+)
+async def test_explicit_queue_announcement_still_suspends(hold_service, packet, text):
+    call_id = await seed_call(hold_service.db, packet, state=CallState.ACTIVE)
+
+    await hold_service.handle_realtime_event(call_id, _transcript_event(text))
+
+    assert call_id in hold_service._hold_state
+    assert hold_service._test_realtime.suspend_calls == [call_id]
+
+
+@pytest.mark.asyncio
+async def test_queue_menu_request_exits_hold_to_allow_answer(hold_service, packet):
+    call_id = await seed_call(hold_service.db, packet, state=CallState.ACTIVE)
+    hold_service._hold_state[call_id] = HoldState(started_monotonic=time.monotonic())
+
+    await hold_service.handle_realtime_event(
+        call_id,
+        _transcript_event("Please hold, or press one to request a callback."),
+    )
+
+    assert call_id not in hold_service._hold_state
+    assert ("session.update", call_id) in hold_service._test_realtime.events
+    assert hold_service._test_realtime.request_response_calls

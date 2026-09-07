@@ -89,6 +89,7 @@ async def _start_bridge(
     on_event: Callable[[str, dict[str, Any]], Awaitable[None]],
     on_open: Callable[[str], Awaitable[None]] = _noop,
     on_activity: Callable[[str], None] | None = None,
+    on_observe: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> tuple[
     RealtimeBridge,
     RealtimeRuntime,
@@ -110,6 +111,7 @@ async def _start_bridge(
         on_open=on_open,
         on_fatal=on_fatal,
         on_activity=on_activity,
+        on_observe=on_observe,
     )
     runtime = RealtimeRuntime(call_id=call_id, openai_call_id=f"rtc_{call_id}")
     bridge._runtime[call_id] = runtime
@@ -172,6 +174,7 @@ async def test_session_updated_readiness_bypasses_blocked_dispatcher(settings, m
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     handled_types: list[str] = []
+    observed_types: list[str] = []
 
     async def on_event(call_id: str, event: dict[str, Any]) -> None:
         handled_types.append(event["type"])
@@ -185,6 +188,7 @@ async def test_session_updated_readiness_bypasses_blocked_dispatcher(settings, m
         call_id="call_readiness",
         websocket=websocket,
         on_event=on_event,
+        on_observe=lambda call_id, event: observed_types.append(event["type"]),
     )
     await websocket.feed({"type": "test.block"})
     await asyncio.wait_for(first_started.wait(), timeout=1)
@@ -192,15 +196,17 @@ async def test_session_updated_readiness_bypasses_blocked_dispatcher(settings, m
     update = asyncio.create_task(bridge.verify_initial_session("call_readiness"))
     await asyncio.wait_for(websocket.sent.wait(), timeout=1)
     echoed = {"type": "session.updated", "session": {"audio": {"input": {}}}}
+    await websocket.feed({"type": "input_audio_buffer.speech_started"})
     await websocket.feed(echoed)
 
     assert await asyncio.wait_for(update, timeout=1) == echoed
     assert handled_types == ["test.block"]
+    assert observed_types == ["test.block", "input_audio_buffer.speech_started", "session.updated"]
 
     release_first.set()
     await websocket.close()
     await asyncio.wait_for(task, timeout=1)
-    assert handled_types == ["test.block", "session.updated"]
+    assert handled_types == ["test.block", "input_audio_buffer.speech_started", "session.updated"]
     assert fatals == []
 
 

@@ -167,7 +167,12 @@ class Settings(BaseSettings):
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])
     input_transcription_model: str = "gpt-realtime-whisper"
     input_transcription_delay: str | None = None
+    # None omits the API setting and leaves the provider default in effect.
+    input_noise_reduction: Literal["near_field", "far_field"] | None = "far_field"
     semantic_vad_eagerness: Literal["low", "medium", "high", "auto"] = "auto"
+    turn_detection_mode: Literal["semantic_vad", "server_vad"] = "server_vad"
+    server_vad_silence_duration_ms: int = Field(default=300, ge=200, le=1000)
+    server_vad_threshold: float = Field(default=0.5, ge=0, le=1)
     openai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     openai_keepalive_expiry_seconds: float | None = Field(default=60.0, ge=5, le=300)
