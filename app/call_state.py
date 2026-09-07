@@ -1146,6 +1146,17 @@ class CallService:
             return
         item = event.get("item") or {}
         if event_type == "conversation.item.create" and item.get("type") == "function_call_output":
+            try:
+                output = json.loads(item.get("output") or "{}")
+            except (TypeError, ValueError):
+                output = {}
+            if isinstance(output, dict) and (output.get("ok") is False or output.get("error")):
+                self._queue_latency(
+                    call_id,
+                    LatencyStage.TOOL_RESULT_FAILED,
+                    sent,
+                    event_key=str(item.get("call_id") or "unknown"),
+                )
             self._queue_latency(
                 call_id,
                 LatencyStage.TOOL_RESULT_SENT,
@@ -1259,6 +1270,21 @@ class CallService:
         tool_call_id = str(event.get("call_id") or "unknown")
         received = received or LatencyMark.now()
         event_key = event_key or tool_call_id
+        if isinstance(name, str) and name in {
+            "search_web",
+            "send_dtmf",
+            "record_call_outcome",
+            "end_call",
+            "transfer_to_owner",
+            "ask_agent",
+            "report_hold",
+        }:
+            self._queue_latency(
+                call_id,
+                LatencyStage.TOOL_DISPATCHED,
+                received,
+                event_key=f"{name}:{tool_call_id}",
+            )
         try:
             arguments = json.loads(event.get("arguments") or "{}")
         except json.JSONDecodeError:
@@ -1801,6 +1827,7 @@ class CallService:
             return False
         self._note_call_activity(call_id, LatencyMark.now())
         logger.info("call entered hold call_id=%s trigger=%s", call_id, trigger)
+        self._queue_latency(call_id, LatencyStage.HOLD_ENTERED, LatencyMark.now())
         return True
 
     async def _exit_hold(self, call_id: str, *, heard_text: str) -> None:
@@ -1831,6 +1858,7 @@ class CallService:
             return
         self._note_call_activity(call_id, LatencyMark.now())
         logger.info("call exited hold call_id=%s", call_id)
+        self._queue_latency(call_id, LatencyStage.HOLD_EXITED, LatencyMark.now())
 
     def _clear_pending_question(self, call_id: str, question_id: str | None = None) -> None:
         pending = self._pending_questions.get(call_id)

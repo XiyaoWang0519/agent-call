@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -29,7 +30,10 @@ DEBUG_AUDIT_CALL_FIELDS = {
     "advisory_outcome",
     "twilio_ai_call_sid",
     "twilio_callee_call_sid",
+    "twilio_owner_call_sid",
+    "transfer_outcome",
     "conference_sid",
+    "conference_name",
     "openai_call_id",
 }
 
@@ -48,6 +52,22 @@ DEBUG_SAFE_CALL_FIELDS = {
     "duration_seconds",
     "termination_reason",
 }
+
+
+@router.get("/diagnostics/live-test")
+async def live_test_capabilities(request: Request) -> dict[str, Any]:
+    settings = request.app.state.call_service.settings
+    if not settings.live_test_instance_id:
+        raise HTTPException(status_code=404, detail="live test instance is not configured")
+    return {
+        "instance_id": settings.live_test_instance_id,
+        "live_calls_enabled": settings.live_calls_enabled,
+        "caller_hash": hashlib.sha256((settings.twilio_caller_id or "").encode()).hexdigest(),
+        "owner_hash": hashlib.sha256((settings.owner_phone_e164 or "").encode()).hexdigest(),
+        "ask_agent_enabled": settings.ask_agent_enabled,
+        "hold_detection_enabled": settings.hold_detection_enabled,
+        "agent_push_enabled": settings.agent_push_enabled,
+    }
 
 
 @router.get("/calls/{call_id}")
