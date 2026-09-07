@@ -352,15 +352,18 @@ async def spoken_farewell(service, call_id):
     assert service._test_realtime.closing_checks == [(call_id, "goodbye_spoken")]
 
 
-def classification_event(text="FINISHED", status="completed", event_type="response.done"):
+def classification_event(
+    text="FINISHED", status="completed", event_type="response.done", attempt=1
+):
     return {
         "type": event_type,
         "response": {
-            "id": "silent_check",
+            "id": f"silent_check_{attempt}",
             "status": status,
             "metadata": {
                 "agent_call_purpose": "closing_check",
                 "spoken_response_id": "goodbye_spoken",
+                "closing_check_request_id": f"closing_check_goodbye_spoken_{attempt}",
             },
             "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
         },

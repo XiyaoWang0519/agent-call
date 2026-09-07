@@ -675,19 +675,22 @@ class RealtimeBridge:
             response["tool_choice"] = tool_choice
         await self.send(call_id, {"type": "response.create", "response": response})
 
-    async def check_spoken_closing(self, call_id: str, response_id: str) -> None:
+    async def check_spoken_closing(
+        self, call_id: str, response_id: str, *, request_id: str
+    ) -> None:
         # This text-only response reads the conversation but never joins it. Speech
         # has already been generated; classification runs behind its playback.
         await self.send(
             call_id,
             {
                 "type": "response.create",
-                "event_id": f"closing_check_{response_id}",
+                "event_id": request_id,
                 "response": {
                     "conversation": "none",
                     "metadata": {
                         RESPONSE_PURPOSE_METADATA_KEY: CLOSING_CHECK_RESPONSE_PURPOSE,
                         "spoken_response_id": response_id,
+                        "closing_check_request_id": request_id,
                     },
                     "output_modalities": ["text"],
                     "tools": [],
@@ -915,6 +918,7 @@ class RealtimeBridge:
         turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
         return (
             self._vad_configuration_echoed(turn)
+            and self._noise_reduction_echoed(event)
             and turn.get("create_response") is False
             and turn.get("interrupt_response") is False
         )
@@ -923,9 +927,23 @@ class RealtimeBridge:
         turn = event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection", {})
         return (
             self._vad_configuration_echoed(turn)
+            and self._noise_reduction_echoed(event)
             and turn.get("create_response") is True
             and turn.get("interrupt_response") is True
         )
+
+    def _noise_reduction_echoed(self, event: dict[str, Any]) -> bool:
+        audio_input = event.get("session", {}).get("audio", {}).get("input", {})
+        noise_reduction = audio_input.get("noise_reduction")
+        expected = self.settings.input_noise_reduction
+        if expected is None:
+            # None omits the request setting rather than sending explicit null. The
+            # effective provider default may be disabled or either supported filter.
+            return noise_reduction is None or (
+                isinstance(noise_reduction, dict)
+                and noise_reduction.get("type") in ("near_field", "far_field")
+            )
+        return isinstance(noise_reduction, dict) and noise_reduction.get("type") == expected
 
     def _vad_configuration_echoed(self, turn: dict[str, Any]) -> bool:
         expected = self._turn_detection_config(create_response=False, interrupt_response=False)

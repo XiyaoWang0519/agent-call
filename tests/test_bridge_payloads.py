@@ -727,9 +727,11 @@ async def test_closing_classification_is_text_only_and_outside_conversation(sett
     bridge._runtime["call_check"] = RealtimeRuntime(
         call_id="call_check", openai_call_id="rtc_check", websocket=websocket
     )
-    await bridge.check_spoken_closing("call_check", "spoken_response")
+    await bridge.check_spoken_closing(
+        "call_check", "spoken_response", request_id="closing_check_spoken_response_1"
+    )
     event = websocket.messages[0]
-    assert event["event_id"] == "closing_check_spoken_response"
+    assert event["event_id"] == "closing_check_spoken_response_1"
     response = event["response"]
     assert response["conversation"] == "none"
     assert response["output_modalities"] == ["text"]
@@ -738,4 +740,5 @@ async def test_closing_classification_is_text_only_and_outside_conversation(sett
     assert response["metadata"] == {
         "agent_call_purpose": "closing_check",
         "spoken_response_id": "spoken_response",
+        "closing_check_request_id": "closing_check_spoken_response_1",
     }

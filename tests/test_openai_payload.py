@@ -120,6 +120,7 @@ def test_session_created_echo_requires_transcription_and_full_initial_vad(settin
             "audio": {
                 "input": {
                     "transcription": {"model": "gpt-realtime-whisper"},
+                    "noise_reduction": {"type": "far_field"},
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "auto",
@@ -154,7 +155,7 @@ def test_semantic_vad_high_setting_is_available_for_tuning(settings, packet):
     turn = payload["audio"]["input"]["turn_detection"]
     assert turn["eagerness"] == "high"
     assert bridge.expected_initial_vad_echoed(
-        {"session": {"audio": {"input": {"turn_detection": turn}}}}
+        {"session": {"audio": {"input": payload["audio"]["input"]}}}
     )
 
 
@@ -170,12 +171,13 @@ def test_activation_echo_must_preserve_configured_semantic_vad(settings):
         "session": {
             "audio": {
                 "input": {
+                    "noise_reduction": {"type": "far_field"},
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "auto",
                         "create_response": True,
                         "interrupt_response": True,
-                    }
+                    },
                 }
             }
         }

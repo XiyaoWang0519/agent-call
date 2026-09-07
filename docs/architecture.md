@@ -9,6 +9,13 @@ model round trip. Only an exact completed `FINISHED` result can arm closing, and
 the latest uncut spoken response with no intervening callee speech. Other results leave
 the call connected. Classifier usage is counted without changing the active audio response.
 
+Each classification attempt has a three-second deadline covering send and result receipt.
+A failed send, provider rejection, failed/incomplete response, malformed decision, or missing
+result gets one retry while the same uninterrupted spoken response is current. Request IDs
+correlate errors and decisions to attempts; late attempts still contribute usage but cannot
+override the current attempt. Call teardown cancels outstanding checks. Exhaustion leaves
+the call connected without asserting success or bypassing the normal liveness limits.
+
 Closing waits for SIP playback to finish, then leaves a three-second reply window. Callee
 speech cancels the pending close at frame arrival. A silent context update tells the voice
 model that the conversation resumed; native VAD owns its reply. A late classifier uses
@@ -50,7 +57,7 @@ prepared → prewarming → ready_to_activate → activating → active → term
 
 Terminal states: `completed`, `failed`, `timed_out`, `transferred`. Telephony state and extraction state are separate: a successful phone call whose extractor fails stays `call_status=completed` with `finalization_status=failed` and `outcome=unknown`, and still retains the raw transcript.
 
-Once the verified sideband is ready and the callee answers, automatic turn-taking is enabled without waiting for the asynchronous AMD result. The agent listens first: a 1.5-second fallback requests an opening only if no speech or automatic response has arrived. A completed turn heard before automatic responses were enabled can receive one continuation. The prompt adapts to greetings, questions, and menus without requiring a separate automated-line mode.
+Once the verified sideband is ready and the callee answers, the agent listens and transcribes while the outbound leg remains muted and automatic responses remain disabled until asynchronous AMD classifies the answer. This classification delay is necessary to prevent ordinary replies from reaching a voicemail recording before the beep callback can suppress them. Human, unknown, and ambiguous `machine_end_other` results enable ordinary conversation; beep/silence results produce only the voicemail message. A greeting already committed during classification receives an immediate continuation, without another 1.5-second listening delay. Otherwise the 1.5-second fallback requests an opening only if no speech or automatic response has arrived. Existing setup deadlines bound a missing classification. The prompt adapts to greetings, questions, and menus without a separate automated-line mode. Earlier live-call timings measured the previous gate and do not validate latency under this classification requirement.
 
 Late voicemail detection suspends automatic responses and cancels any in-flight reply before requesting the voicemail message. Fax detection terminates the call. These callbacks remain active after conversational activation.
 

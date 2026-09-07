@@ -31,6 +31,7 @@ class Scenario:
     terminate_after: float | None = None
     audit: dict[str, Any] = field(default_factory=dict)
     advisory: Literal["present", "absent"] | None = None
+    spoken_closing: bool = False
 
     def public(self) -> dict[str, Any]:
         return asdict(self)
@@ -54,8 +55,8 @@ SCENARIOS = {
             "The desk is also authorized to request a thirty-second explanation of the seasons "
             "to test interruption, then replace it with the arithmetic question two plus two. "
             "These harmless requests are explicitly within this test's scope. Stop talking "
-            "when interrupted, answer the replacement question, then say goodbye and use "
-            "end_call when asked to finish.",
+            "when interrupted, answer the replacement question, then say goodbye "
+            "when asked to finish.",
             (
                 HELLO,
                 Step("expect", r"hello|hi|calling|test", 40),
@@ -82,20 +83,23 @@ SCENARIOS = {
                 Step("expect", r"goodbye|bye|take care|have a (?:good|great|nice)", 40),
             ),
             seconds=240,
-            tools=("search_web", "end_call"),
+            tools=("search_web",),
+            spoken_closing=True,
         ),
         Scenario(
             "conversation",
-            OBJECTIVE + " Record the agreed test outcome before ending.",
+            OBJECTIVE + " Record the confirmed test fact as an interim outcome note when the desk "
+            "provides it. Finish with a spoken goodbye when asked.",
             (HELLO, Step("expect", r".+"), FACT, FACT_CHECK, GOODBYE, END),
-            tools=("record_call_outcome", "end_call"),
+            tools=("record_call_outcome",),
+            spoken_closing=True,
             advisory="present",
         ),
         Scenario(
             "no-outcome-tool",
-            OBJECTIVE + " Do not use record_call_outcome; end_call is still required.",
+            OBJECTIVE + " Do not use record_call_outcome; finish with a spoken goodbye.",
             (HELLO, Step("expect", r".+"), FACT, FACT_CHECK, GOODBYE, END),
-            tools=("end_call",),
+            spoken_closing=True,
             forbidden_tools=("record_call_outcome",),
             advisory="absent",
         ),
@@ -332,7 +336,7 @@ SCENARIOS = {
             "wrong-number",
             OBJECTIVE,
             (Step("say", "You have the wrong number. Please do not call again. Goodbye."), END),
-            tools=("end_call",),
+            spoken_closing=True,
         ),
         Scenario(
             "authority",
@@ -378,7 +382,7 @@ SCENARIOS = {
                 ),
                 END,
             ),
-            tools=("end_call",),
+            spoken_closing=True,
         ),
     )
 }

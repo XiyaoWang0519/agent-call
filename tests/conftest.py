@@ -260,7 +260,9 @@ class FakeRealtime:
     async def close_all(self) -> None:
         self.close_all_calls += 1
 
-    async def check_spoken_closing(self, call_id: str, response_id: str) -> None:
+    async def check_spoken_closing(
+        self, call_id: str, response_id: str, *, request_id: str
+    ) -> None:
         self.closing_checks.append((call_id, response_id))
 
     async def notify_call_resumed(self, call_id: str) -> None:

@@ -181,8 +181,10 @@ overlap and latency. Put received audio on the left and sent audio on the right.
 optional local artifact, not an automatic CLI output.
 
 A pass requires all `report.json.checks` true, including successful search tool result,
-acoustic interruption, agent `end_call`, stored result and cleanup with
-`verified=true` and `forced=[]`. An independent semantic grader must also pass.
+acoustic interruption, received spoken goodbye, application `voice_model_end_call`,
+and the receiver-observed reply window before provider stop (at least 2.5 seconds since
+the last voiced frame). The retired `end_call` tool is no longer required. Stored result
+and cleanup with `verified=true` and `forced=[]` remain required. An independent semantic grader must also pass.
 Never describe a forced hangup as successful agent hangup. Record the revision,
 scenario, run ID, model settings, failed checks and cleanup status when handing off.
 Keep keys, transcripts, databases and recordings out of Git and PR attachments.

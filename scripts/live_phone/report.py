@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from scripts.live_phone.scenarios import Scenario
+from scripts.live_phone.scenarios import END, Scenario
 
 
 def grade(scenario: Scenario, evidence: dict[str, Any]) -> dict[str, bool]:
@@ -52,6 +53,33 @@ def grade(scenario: Scenario, evidence: dict[str, Any]) -> dict[str, bool]:
                 session.get("steps_finished") is True and session.get("error") is None
             )
             checks[f"{role}:closed"] = session.get("closed") is True
+    if scenario.spoken_closing:
+        callee = evidence.get("sessions", {}).get("callee", {})
+        events = callee.get("events", [])
+        final_step = len(scenario.steps) - 1
+        checks["spoken_goodbye_received"] = any(
+            re.search(END.text, turn.get("text", ""), re.IGNORECASE)
+            for turn in callee.get("transcripts", [])
+        ) and any(
+            event.get("type") == "step_passed"
+            and event.get("step") == final_step
+            and event.get("action") == "expect"
+            for event in events
+        )
+        checks["app_initiated_closing"] = audit.get("termination_reason") == "voice_model_end_call"
+        # Receiver timestamps share one monotonic clock. A provider stop after the last
+        # voiced frame proves the phone heard a reply opportunity, not just generated text.
+        # Allow 0.5s transport/frame jitter around the app's 3s goodbye reply window.
+        checks["goodbye_reply_window_received"] = any(
+            event.get("type") == "remote_stop"
+            and isinstance(event.get("last_voice_at"), (int, float))
+            and isinstance(event.get("at"), (int, float))
+            and event["at"] - event["last_voice_at"] >= 2.5
+            for event in events
+        )
+        checks["no_receiver_hangup"] = not any(
+            event.get("type") == "receiver_hangup" for event in events
+        )
     if any(step.action == "interrupt" for step in scenario.steps):
         checks["interruption_audio_verified"] = any(
             event.get("type") == "interruption_verified"
