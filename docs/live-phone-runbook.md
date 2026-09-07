@@ -81,8 +81,11 @@ uv run python -m scripts.live_phone --env-file .env.live-phone run \
 spoken explanation of Python's pathlib module. It then asks for a long explanation,
 waits to hear it begin, interrupts with an arithmetic question, and requires the agent
 to stop speaking within 1.2 seconds and answer the replacement question. Finally it
-requires an audible goodbye, the agent's `end_call` tool, a persisted result and verified
-provider termination without forced cleanup. Ordinary replies wait for acoustic silence;
+requires an independently transcribed goodbye, application-initiated `voice_model_end_call`,
+and a provider stop at least 2.5 seconds after the last received voiced frame. That interval
+checks the 3-second post-goodbye reply window with 0.5 seconds of transport tolerance. A
+persisted result and verified provider termination without forced cleanup are also required.
+The receiver must not initiate hangup; a missing provider stop fails this check. Ordinary replies wait for acoustic silence;
 only the interruption step intentionally overlaps speech. The synthetic scripts and
 independent ASR are English. The 240-second scenario deadline is not a latency benchmark.
 

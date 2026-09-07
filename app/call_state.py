@@ -47,6 +47,7 @@ from app.models import (
 )
 from app.openai_client import create_openai_client
 from app.openai_realtime import (
+    CLOSING_CHECK_RESPONSE_PURPOSE,
     REALTIME_SEND_TIMEOUT_SECONDS,
     RESPONSE_PURPOSE_METADATA_KEY,
     VOICEMAIL_RESPONSE_PURPOSE,
@@ -69,6 +70,14 @@ _PLAN_ID_PATTERN = re.compile(r"^plan_[A-Za-z0-9_-]{1,128}$")
 # below bounds that wait in case the event is never delivered; it stays under the 15s
 # watchdog staleness window so a completed call is not misreported as timed out.
 TERMINATION_AUDIO_DRAIN_TIMEOUT_SECONDS = 12.0
+# Give the other person a turn after hearing our goodbye. Speech cancels this close.
+VOICE_END_REPLY_GRACE_SECONDS = 3.0
+# Classification is off the audible path. Bound each attempt and retry once so a
+# transient send/provider failure cannot strand a completed farewell until the
+# stale watchdog. Never infer completion merely because classification failed.
+CLOSING_CHECK_TIMEOUT_SECONDS = 3.0
+CLOSING_CHECK_RETRY_DELAY_SECONDS = 0.1
+CLOSING_CHECK_MAX_ATTEMPTS = 2
 TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
@@ -96,12 +105,7 @@ ASK_AGENT_POLL_WARNING = (
 # DetectMessageEnd can report machine_end_other for long IVR prompts as well as machines.
 # A beep or greeting-ending silence is actionable voicemail evidence; "other" is not.
 VOICEMAIL_AMD_RESULTS = frozenset({"machine_end_beep", "machine_end_silence"})
-AMBIGUOUS_AMD_RESULTS = frozenset({"machine_end_other"})
-AMBIGUOUS_AMD_CONTINUATION = (
-    "Continue from the callee's latest speech. If it was an automated menu asking for "
-    "keypad input, use send_dtmf with the best option for the approved objective without "
-    "speaking first. Otherwise respond naturally."
-)
+OPENING_LISTEN_SECONDS = 1.5
 
 
 def _seconds_until(iso_timestamp: str | None) -> float | None:
@@ -123,6 +127,32 @@ class PendingQuestion:
 
 
 @dataclass(slots=True)
+class VoiceResponseAudio:
+    speech_epoch: int
+    has_audio: bool = False
+    closing_check_requested: bool = False
+    closing_check_attempts: int = 0
+    status: str | None = None
+    stopped_at: float | None = None
+    cleared: bool = False
+
+
+@dataclass(slots=True)
+class ClosingCheckAttempt:
+    request_id: str
+    result: asyncio.Future[bool]
+
+
+@dataclass(slots=True)
+class OpeningListenState:
+    speech_seen: bool = False
+    speech_active: bool = False
+    early_committed: bool = False
+    response_seen: bool = False
+    enabled: bool = False
+
+
+@dataclass(slots=True)
 class HoldState:
     started_monotonic: float
 
@@ -130,12 +160,33 @@ class HoldState:
 # Classic hold/queue announcements only (hold music cues, IVR queue messages) — deliberately
 # narrow so ordinary conversational "hang on a sec" from the callee does not mute the agent.
 HOLD_PHRASE_PATTERN = re.compile(
-    r"(please hold|hold the line|stay on the line|remain on the line|"
+    r"(please hold|hold the line|please continue to hold|"
     r"placed? you on hold|puts? you on hold|put you on (a brief )?hold|"
     r"your call is (very )?important|next available (agent|representative|operator|team member)|"
     r"call volume|currently (assisting|helping) other|in the order (it was|they were) received)",
     re.IGNORECASE,
 )
+
+# A menu can mention a queue while still asking for input (including a callback choice).
+# Let the model answer rather than suspending it based on words elsewhere in the prompt.
+# Punctuation alone is not a request: queue announcements can contain rhetorical questions.
+HOLD_INPUT_REQUEST_PATTERN = re.compile(
+    r"\b(press|dial|say|tell me|tell us|enter|select|choose)\b|"
+    r"\b(how (can|may) (I|we) help|what (would|can|is|are)|would you|can you|"
+    r"do you (want|need|prefer)|are you (calling|ready)|is (that|this) (correct|right))\b",
+    re.IGNORECASE,
+)
+HOLD_CONNECTION_PATTERN = re.compile(
+    r"\b(stay|remain) on the line\b.{0,80}\b(while|until)\b.{0,80}"
+    r"\b(connect|transfer|available|answer)\w*\b",
+    re.IGNORECASE,
+)
+
+
+def _is_hold_announcement(text: str) -> bool:
+    if HOLD_INPUT_REQUEST_PATTERN.search(text):
+        return False
+    return bool(HOLD_PHRASE_PATTERN.search(text) or HOLD_CONNECTION_PATTERN.search(text))
 
 
 # Assistant speech / SIP playback evidence. On SIP sidebands, RTP carries the media, so
@@ -185,11 +236,14 @@ class CallService:
         self.realtime = RealtimeBridge(
             settings,
             self.openai,
-            on_event=self.handle_realtime_event,
+            on_event=lambda call_id, event: self.handle_realtime_event(
+                call_id, event, _observed=True
+            ),
             on_open=self.handle_sideband_open,
             on_fatal=self._handle_sideband_fatal,
             on_send=self.handle_realtime_send,
             on_activity=self._note_call_activity,
+            on_observe=self._observe_opening_event,
         )
         self.finalizer = Finalizer(settings, db, self.openai)
         self._background: set[asyncio.Task[Any]] = set()
@@ -215,13 +269,25 @@ class CallService:
                 call_id, reason, **kwargs
             ),
         )
+        self._opening_listen: dict[str, OpeningListenState] = {}
+        self._opening_tasks: dict[str, asyncio.Task[Any]] = {}
         self._opening_transition_locks: dict[str, asyncio.Lock] = {}
         self._voice_end_pending: dict[str, tuple[str, str | None]] = {}
+        self._voice_end_reply_waits: dict[str, object] = {}
+        self._callee_speech_epochs: dict[str, int] = {}
+        self._callee_speaking: set[str] = set()
+        self._voice_end_event_epochs: dict[str, dict[str, int]] = {}
+        self._voice_response_audio: dict[str, OrderedDict[str, VoiceResponseAudio]] = {}
+        self._closing_check_responses: dict[str, OrderedDict[str, str]] = {}
+        self._closing_check_completed: set[tuple[str, str]] = set()
+        self._closing_check_attempts: dict[tuple[str, str], ClosingCheckAttempt] = {}
+        self._closing_check_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         self._audio_drain_terminations: dict[str, tuple[str | None, str]] = {}
         self._tool_seen_calls: set[str] = set()
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
+        self._question_answer_deliveries: dict[str, int] = {}
         self._hold_state: dict[str, HoldState] = {}
         # Answered questions whose tool result never reached the sideband; an agent retry
         # of answer_call_question re-attempts delivery instead of reporting already_answered.
@@ -695,6 +761,7 @@ class CallService:
                 await self.terminate_call(call_id, "plan_missing_after_sideband_open")
                 return
             packet = ContextPacket.model_validate(plan["context"])
+            self._opening_listen.setdefault(call_id, OpeningListenState())
             participant = await self._run_latency_marked_step(
                 call_id,
                 lambda: self.twilio.create_callee_participant(
@@ -763,6 +830,8 @@ class CallService:
             await self.terminate_call(call_id, "fax_detected")
             return
         await self._check_activation_gate(call_id)
+        if handling == "voicemail":
+            await self._send_voicemail(call_id)
 
     async def handle_conference_event(self, call_id: str, form: dict[str, str]) -> None:
         received = LatencyMark.now()
@@ -792,7 +861,6 @@ class CallService:
                     if not call.get("answered_at"):
                         await self.db.update_call(call_id, answered_at=answered.occurred_at)
                     await self._start_opening_on_answer(call_id)
-                    await self._check_activation_gate(call_id)
                 finally:
                     self._queue_latency_batch(
                         call_id,
@@ -823,14 +891,13 @@ class CallService:
         await self.db.touch_call(call_id)
         if leg == "callee" and status in {"in-progress", "answered"}:
             # The callee's answered status callback usually reaches us before the
-            # conference participant-join event; whichever arrives first starts the
-            # opening turn so the callee hears the model sooner.
+            # conference participant-join event; whichever arrives first records
+            # answer readiness. Async AMD must not add its classification delay.
             answered = received
             try:
                 if await self.db.set_flag_once(call_id, "callee_joined"):
                     await self.db.update_call(call_id, answered_at=answered.occurred_at)
                 await self._start_opening_on_answer(call_id)
-                await self._check_activation_gate(call_id)
             finally:
                 self._queue_latency_batch(
                     call_id,
@@ -854,7 +921,6 @@ class CallService:
         if not (
             call["sideband_open"]
             and call["callee_joined"]
-            and call["amd_result"]
             and call["transcription_verified"]
             and call["semantic_vad_verified"]
         ):
@@ -864,37 +930,304 @@ class CallService:
         await self._activate(call_id)
 
     async def _start_opening_on_answer(self, call_id: str) -> None:
-        """Let the model open the call as soon as the callee joins.
+        await self._check_activation_gate(call_id)
 
-        Conference Participant AMD runs asynchronously, so waiting for its callback leaves a
-        human callee in several seconds of silence. Keep automatic responses disabled until AMD
-        completes, but ask the model for an opening turn immediately. The application supplies no
-        response-specific script; the model chooses the opening from the approved context.
-        """
-        async with self._opening_transition_lock(call_id):
-            call = await self.db.get_call(call_id)
-            if call is None or CallState(call["state"]) in TERMINAL_STATES:
-                return
-            if not (
-                call["sideband_open"]
-                and call["callee_joined"]
-                and call["transcription_verified"]
-                and call["semantic_vad_verified"]
+    def _closing_check_source(self, call_id: str, event: dict[str, Any]) -> str | None:
+        response = event.get("response") or {}
+        response_id = response.get("id") or event.get("response_id")
+        metadata = response.get("metadata") or {}
+        source = metadata.get("spoken_response_id")
+        if metadata.get(RESPONSE_PURPOSE_METADATA_KEY) == CLOSING_CHECK_RESPONSE_PURPOSE and source:
+            audio = self._voice_audio_for(call_id, source)
+            if audio is not None and audio.closing_check_attempts and response_id:
+                responses = self._closing_check_responses.setdefault(call_id, OrderedDict())
+                responses[response_id] = source
+                if len(responses) > 32:
+                    old_id, _ = responses.popitem(last=False)
+                    self._closing_check_completed.discard((call_id, old_id))
+        known = self._closing_check_responses.get(call_id)
+        return known.get(response_id or "") if known is not None else None
+
+    def _request_spoken_closing_check(self, call_id: str, response: dict[str, Any]) -> None:
+        response_id = response.get("id")
+        audio = self._voice_audio_for(call_id, response_id)
+        output = response.get("output") or []
+        has_spoken_text = any(
+            part.get("transcript", "").strip()
+            for item in output
+            for part in item.get("content", [])
+        )
+        if (
+            not response_id
+            or audio is None
+            or audio.closing_check_requested
+            or audio.closing_check_attempts >= CLOSING_CHECK_MAX_ATTEMPTS
+            or not has_spoken_text
+            or response.get("status") != "completed"
+            or audio.cleared
+            or call_id in self._hold_state
+            # Owner-answer and timeout continuations need the response channel.
+            # Do not start a separate classifier while their question is pending.
+            or call_id in self._pending_questions
+            or call_id in self._question_answer_deliveries
+            or call_id in self._voice_end_pending
+            or any(item.get("type") == "function_call" for item in output)
+            or (response.get("metadata") or {}).get(RESPONSE_PURPOSE_METADATA_KEY)
+            == VOICEMAIL_RESPONSE_PURPOSE
+        ):
+            return
+        audio.closing_check_requested = True
+        key = (call_id, response_id)
+        self._closing_check_tasks[key] = self._spawn(
+            self._run_spoken_closing_check(call_id, response_id),
+            name=f"closing-check:{call_id}:{response_id}",
+        )
+
+    async def _run_spoken_closing_check(self, call_id: str, source: str) -> None:
+        key = (call_id, source)
+        audio = self._voice_audio_for(call_id, source)
+        resolved = False
+        try:
+            while (
+                audio is not None
+                and not self._stopping
+                and audio.closing_check_attempts < CLOSING_CHECK_MAX_ATTEMPTS
+                and self._spoken_close_is_current(call_id, source)
+                and call_id not in self._voice_end_pending
             ):
+                audio.closing_check_attempts += 1
+                request_id = f"closing_check_{source}_{audio.closing_check_attempts}"
+                attempt = ClosingCheckAttempt(
+                    request_id=request_id,
+                    result=asyncio.get_running_loop().create_future(),
+                )
+                self._closing_check_attempts[key] = attempt
+                try:
+                    async with asyncio.timeout(CLOSING_CHECK_TIMEOUT_SECONDS):
+                        await self.realtime.check_spoken_closing(
+                            call_id, source, request_id=request_id
+                        )
+                        resolved = await asyncio.shield(attempt.result)
+                except Exception:
+                    logger.warning(
+                        "silent closing check attempt failed call_id=%s attempt=%s",
+                        call_id,
+                        audio.closing_check_attempts,
+                        exc_info=True,
+                    )
+                finally:
+                    if self._closing_check_attempts.get(key) is attempt:
+                        self._closing_check_attempts.pop(key, None)
+                    if not attempt.result.done():
+                        attempt.result.cancel()
+                if resolved:
+                    return
+                if audio.closing_check_attempts < CLOSING_CHECK_MAX_ATTEMPTS:
+                    await asyncio.sleep(CLOSING_CHECK_RETRY_DELAY_SECONDS)
+            if audio is not None and self._spoken_close_is_current(call_id, source):
+                logger.warning("silent closing check recovery exhausted call_id=%s", call_id)
+        finally:
+            if audio is not None and not resolved:
+                audio.closing_check_requested = False
+            self._closing_check_tasks.pop(key, None)
+
+    def _fail_closing_check_request(self, call_id: str, request_id: str) -> None:
+        for (active_call_id, _source), attempt in self._closing_check_attempts.items():
+            if active_call_id == call_id and attempt.request_id == request_id:
+                if not attempt.result.done():
+                    attempt.result.set_result(False)
                 return
-            if call.get("answer_handling") == "voicemail":
+
+    def _spoken_close_is_current(self, call_id: str, source: str) -> bool:
+        audio = self._voice_audio_for(call_id, source)
+        responses = self._voice_response_audio.get(call_id)
+        return bool(
+            audio is not None
+            and audio.status == "completed"
+            and not audio.cleared
+            and responses
+            and next(reversed(responses)) == source
+            and not self._voice_end_overtaken_by_speech(call_id, audio.speech_epoch)
+            and call_id not in self._hold_state
+            and call_id not in self._pending_questions
+            and call_id not in self._question_answer_deliveries
+            and call_id not in self._activity.tombstones
+            and call_id not in self._activity.watchdog_claims
+        )
+
+    async def _handle_closing_check_done(
+        self, call_id: str, source: str, response: dict[str, Any]
+    ) -> None:
+        key = (call_id, str(response.get("id")))
+        if key in self._closing_check_completed:
+            return
+        self._closing_check_completed.add(key)
+        attempt = self._closing_check_attempts.get((call_id, source))
+        request_id = (response.get("metadata") or {}).get("closing_check_request_id")
+        current_attempt = (
+            attempt is not None and attempt.request_id == request_id and not attempt.result.done()
+        )
+        text = "".join(
+            part.get("text", "")
+            for item in response.get("output", [])
+            for part in item.get("content", [])
+        ).strip()
+        valid = response.get("status") == "completed" and text in {"FINISHED", "CONTINUE"}
+        if current_attempt and attempt is not None:
+            # Receipt resolves the network attempt before usage persistence can
+            # yield long enough to trigger an unnecessary retry.
+            attempt.result.set_result(valid)
+        await self._record_realtime_usage(call_id, response)
+        if (
+            not current_attempt
+            or not valid
+            or text != "FINISHED"
+            or not self._spoken_close_is_current(call_id, source)
+        ):
+            return
+        # The classifier never enters the audible conversation and has no tool
+        # result. Retain the original response's epoch and playback receipt.
+        self._clear_pending_question(call_id)
+        await self.db.cancel_pending_questions(call_id)
+        if not self._spoken_close_is_current(call_id, source):
+            return
+        self._terminate_after_audio_drain(call_id, source, "voice_model_end_call")
+
+    def _voice_audio_for(self, call_id: str, response_id: str | None) -> VoiceResponseAudio | None:
+        responses = self._voice_response_audio.get(call_id)
+        return responses.get(response_id or "") if responses is not None else None
+
+    def _observe_voice_response_audio(self, call_id: str, event: dict[str, Any]) -> None:
+        event_type = event.get("type", "")
+        response = event.get("response") or {}
+        response_id = response.get("id") or event.get("response_id")
+        if not response_id or event_type not in {
+            "response.created",
+            "response.done",
+            "response.content_part.added",
+            "response.output_audio.delta",
+            "response.audio.delta",
+            "response.output_audio_transcript.delta",
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.delta",
+            "response.audio_transcript.done",
+            "output_audio_buffer.started",
+            "output_audio_buffer.stopped",
+            "output_audio_buffer.cleared",
+        }:
+            return
+        responses = self._voice_response_audio.setdefault(call_id, OrderedDict())
+        audio = responses.get(response_id)
+        if audio is None:
+            audio = VoiceResponseAudio(speech_epoch=self._callee_speech_epochs.get(call_id, 0))
+            responses[response_id] = audio
+            if len(responses) > 32:
+                responses.popitem(last=False)
+        if event_type == "response.done":
+            audio.status = response.get("status")
+        elif event_type == "output_audio_buffer.stopped":
+            if audio.stopped_at is None:
+                audio.stopped_at = time.monotonic()
+        elif event_type == "output_audio_buffer.cleared":
+            audio.cleared = True
+        elif event_type == "response.content_part.added":
+            audio.has_audio |= (event.get("part") or {}).get("type") in {"audio", "output_audio"}
+        elif event_type != "response.created":
+            audio.has_audio = True
+
+    def _observe_opening_event(self, call_id: str, event: dict[str, Any]) -> None:
+        if call_id in self._activity.tombstones or call_id in self._activity.watchdog_claims:
+            return
+        if self._closing_check_source(call_id, event) is not None:
+            return
+        self._observe_voice_response_audio(call_id, event)
+        if event.get("type") == "response.done":
+            self._request_spoken_closing_check(call_id, event.get("response") or {})
+        # Closing deadlines must see incoming speech at frame arrival too: a slow
+        # transcript/database handler must not hang up on a reply already received.
+        if event.get("type") == "input_audio_buffer.speech_started":
+            self._callee_speech_epochs[call_id] = self._callee_speech_epochs.get(call_id, 0) + 1
+            self._callee_speaking.add(call_id)
+            if self._cancel_voice_end(call_id):
+                self._spawn(self._notify_call_resumed(call_id), name=f"voice-end-resumed:{call_id}")
+        elif event.get("type") == "input_audio_buffer.speech_stopped":
+            self._callee_speaking.discard(call_id)
+        elif event.get("type") == "response.function_call_arguments.done" and event.get("name") in {
+            "end_call",
+            "finish_call_after_goodbye",
+        }:
+            self._voice_end_event_epochs.setdefault(call_id, {})[
+                str(event.get("call_id") or "unknown")
+            ] = self._callee_speech_epochs.get(call_id, 0)
+        # Run on frame arrival, before a session ACK wakes activation and before any
+        # database/tool work in the dispatcher can hide an already-heard greeting.
+        state = self._opening_listen.get(call_id)
+        if state is None and event.get("type") in {
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+        }:
+            # Frames may precede sideband setup's database/network awaits. Preserve
+            # that greeting so activation does not cause a duplicate opening.
+            state = self._opening_listen.setdefault(call_id, OpeningListenState())
+        if state is None:
+            return
+        event_type = event.get("type")
+        if event_type == "input_audio_buffer.speech_started":
+            state.speech_seen = True
+            state.speech_active = True
+        elif event_type == "input_audio_buffer.speech_stopped":
+            state.speech_active = False
+        elif event_type == "input_audio_buffer.committed":
+            state.speech_seen = True
+            state.early_committed |= not state.enabled
+        elif event_type == "response.created":
+            state.response_seen = True
+        elif event_type == "session.updated":
+            turn = (
+                event.get("session", {}).get("audio", {}).get("input", {}).get("turn_detection")
+                or {}
+            )
+            if turn.get("create_response") is True:
+                state.enabled = True
+
+    async def _opening_after_listen(self, call_id: str, *, delay: float | None = None) -> None:
+        await asyncio.sleep(OPENING_LISTEN_SECONDS if delay is None else delay)
+        async with self._opening_transition_lock(call_id):
+            state = self._opening_listen.get(call_id)
+            if state is None or not self._needs_opening(state):
+                return
+            call = await self.db.get_call(call_id)
+            if (
+                call is None
+                or call["state"] != CallState.ACTIVE.value
+                or call.get("answer_handling") == "voicemail"
+                or call_id in self._hold_state
+            ):
                 return
             if not await self.db.claim_opening_if_not_voicemail(call_id):
                 return
-
-            # Keep the atomic claim and its WebSocket write ordered against the voicemail
-            # cancel/write pair. The lock is per call and does not cover Twilio network I/O.
+            # Speech/response frames can arrive while the atomic database claim waits.
+            current = await self.db.get_call(call_id)
+            if (
+                self._opening_listen.get(call_id) is not state
+                or not self._needs_opening(state)
+                or current is None
+                or current["state"] != CallState.ACTIVE.value
+                or current.get("answer_handling") == "voicemail"
+            ):
+                return
             await self.realtime.create_opening(call_id)
 
-        conference = call.get("conference_sid") or call.get("conference_name")
-        # The explicit unmute is a race-safety net. Sending the opening first ensures its
-        # Twilio round-trip can never delay the model's response.create.
-        await self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))
+    @staticmethod
+    def _needs_opening(state: OpeningListenState) -> bool:
+        # VAD answers ordinary greetings. A turn committed before auto-response was
+        # enabled needs a single continuation because enabling it is not retroactive.
+        return (
+            not state.response_seen
+            and not state.speech_active
+            and (not state.speech_seen or state.early_committed)
+        )
 
     async def _unmute_agent(
         self, call_id: str, conference: str | None, agent_call_sid: str | None
@@ -909,59 +1242,92 @@ class CallService:
             )
 
     async def _activate(self, call_id: str) -> None:
-        if not await self.db.cas_state(call_id, CallState.READY_TO_ACTIVATE, CallState.ACTIVATING):
-            return
-        call = await self.db.get_call(call_id)
-        if call is None:
-            return
-        is_voicemail = call["answer_handling"] == "voicemail"
-        if not is_voicemail:
-            try:
-                updated = await self.realtime.enable_automatic_responses(call_id)
-            except Exception:
-                await self.terminate_call(call_id, "session_update_timeout")
+        async with self._opening_transition_lock(call_id):
+            if not await self.db.cas_state(
+                call_id, CallState.READY_TO_ACTIVATE, CallState.ACTIVATING
+            ):
                 return
-            if not self.realtime.activation_update_confirmed(updated):
-                await self.terminate_call(call_id, "session_update_mismatch")
+            call = await self.db.get_call(call_id)
+            if call is None:
                 return
-        if not await self.db.cas_state(call_id, CallState.ACTIVATING, CallState.ACTIVE):
-            return
-        if is_voicemail:
+            state = self._opening_listen.setdefault(call_id, OpeningListenState())
+            # Open the media path while responses are still disabled, before
+            # ordinary/voicemail generation. AMD may arrive during this await.
             conference = call.get("conference_sid") or call.get("conference_name")
-            unmute = asyncio.create_task(
-                self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid")),
-                name=f"unmute:{call_id}:voicemail",
-            )
-            try:
-                async with self._opening_transition_lock(call_id):
-                    current = await self.db.get_call(call_id)
-                    if current is None:
-                        return
-                    if await self.db.set_flag_once(call_id, "voicemail_sent"):
-                        # If the opening claim won, its response.create completed under this
-                        # same lock. Otherwise AMD was persisted first and the atomic opening
-                        # claim cannot succeed after this voicemail write.
-                        if current.get("opening_sent"):
-                            response_id = self._activity.active_response_ids.pop(call_id, None)
-                            await self.realtime.cancel_response(call_id, response_id)
-                        await self.realtime.create_voicemail(call_id)
-            finally:
-                await unmute
-        else:
-            opening_was_already_sent = bool(call.get("opening_sent"))
-            await self._start_opening_on_answer(call_id)
-            if call.get("amd_result") in AMBIGUOUS_AMD_RESULTS and opening_was_already_sent:
-                # AMD can take the full 30 seconds, during which the IVR prompt is already
-                # in the conversation but automatic responses are disabled. Enabling VAD
-                # does not retroactively answer that completed turn, so explicitly resume it.
-                await self.realtime.request_response(
-                    call_id,
-                    instructions=AMBIGUOUS_AMD_CONTINUATION,
+            await self._unmute_agent(call_id, conference, call.get("twilio_ai_call_sid"))
+            current = await self.db.get_call(call_id)
+            if current is None or current["state"] != CallState.ACTIVATING.value:
+                return
+            call = current
+            if call["answer_handling"] != "voicemail":
+                try:
+                    updated = await self.realtime.enable_automatic_responses(call_id)
+                except Exception:
+                    await self.terminate_call(call_id, "session_update_timeout")
+                    return
+                if not self.realtime.activation_update_confirmed(updated):
+                    await self.terminate_call(call_id, "session_update_mismatch")
+                    return
+                state.enabled = True
+            if not await self.db.cas_state(call_id, CallState.ACTIVATING, CallState.ACTIVE):
+                return
+            if call["answer_handling"] != "voicemail":
+                # A greeting committed during setup needs an immediate continuation,
+                # not a second artificial listening pause after activation.
+                self._opening_tasks[call_id] = self._spawn(
+                    self._opening_after_listen(
+                        call_id, delay=0.0 if state.early_committed else None
+                    ),
+                    name=f"opening-listen:{call_id}",
                 )
+        await self._send_voicemail(call_id)
 
-    async def handle_realtime_event(self, call_id: str, event: dict[str, Any]) -> None:
+    async def _send_voicemail(self, call_id: str) -> None:
+        async with self._opening_transition_lock(call_id):
+            call = await self.db.get_call(call_id)
+            if (
+                call is None
+                or call["state"] != CallState.ACTIVE.value
+                or call.get("answer_handling") != "voicemail"
+                or call.get("voicemail_sent")
+            ):
+                return
+            task = self._opening_tasks.pop(call_id, None)
+            if task is not None:
+                task.cancel()
+            state = self._opening_listen.get(call_id)
+            if state is not None and state.enabled:
+                try:
+                    updated = await self.realtime.suspend_automatic_responses(call_id)
+                    if not self.realtime.expected_initial_vad_echoed(updated):
+                        await self.terminate_call(call_id, "session_update_mismatch")
+                        return
+                    state.enabled = False
+                except Exception:
+                    await self.terminate_call(call_id, "session_update_timeout")
+                    return
+                # A native VAD response may already be in flight, even without an
+                # opening claim or response.created reaching the dispatcher yet.
+                await self.realtime.cancel_response(
+                    call_id, self._activity.active_response_ids.pop(call_id, None)
+                )
+            if await self.db.set_flag_once(call_id, "voicemail_sent"):
+                await self.realtime.create_voicemail(call_id)
+
+    async def handle_realtime_event(
+        self, call_id: str, event: dict[str, Any], *, _observed: bool = False
+    ) -> None:
         received = LatencyMark.now()
+        if not _observed:
+            self._observe_opening_event(call_id, event)
         event_type = event.get("type", "")
+        closing_source = self._closing_check_source(call_id, event)
+        if closing_source is not None:
+            if event_type == "response.done":
+                await self._handle_closing_check_done(
+                    call_id, closing_source, event.get("response") or {}
+                )
+            return
         event_id = event.get("event_id") or f"evt_{secrets.token_urlsafe(12)}"
         # Reader already heartbeats on frame arrival; re-assert here for assistant speech
         # so dispatcher-only paths (and sparse SIP sidebands) still refresh the watchdog.
@@ -994,12 +1360,12 @@ class CallService:
                 )
                 if self.settings.hold_detection_enabled:
                     if call_id in self._hold_state:
-                        if HOLD_PHRASE_PATTERN.search(text):
+                        if _is_hold_announcement(text):
                             # Still on hold (re-announcement); just refresh liveness.
                             self._note_call_activity(call_id)
                         elif len(text) >= 3:
                             await self._exit_hold(call_id, heard_text=text)
-                    elif HOLD_PHRASE_PATTERN.search(text):
+                    elif _is_hold_announcement(text):
                         await self._enter_hold(call_id, trigger="transcript")
         elif event_type in {
             "response.output_audio_transcript.done",
@@ -1038,7 +1404,9 @@ class CallService:
             response = event.get("response") or {}
             status = response.get("status")
             if event_type == "response.done":
-                self._activity.active_response_ids.pop(call_id, None)
+                done_id = response.get("id") or event.get("response_id")
+                if done_id == self._activity.active_response_ids.get(call_id):
+                    self._activity.active_response_ids.pop(call_id, None)
                 await self._record_realtime_usage(call_id, response)
             if status in {"cancelled", "canceled"}:
                 await self.db.update_call(call_id, interruption_observed=1)
@@ -1084,6 +1452,16 @@ class CallService:
             )
         elif event_type == "error":
             error = event.get("error") or {}
+            if str(error.get("event_id") or "").startswith("closing_check_"):
+                logger.warning("silent closing check failed call_id=%s", call_id)
+                self._fail_closing_check_request(call_id, str(error["event_id"]))
+                return
+            if (
+                error.get("code") == "conversation_already_has_active_response"
+                and error.get("event_id") == f"opening_{call_id}"
+            ):
+                # Native VAD won the race with the one-time silence fallback.
+                return
             if error.get("code") == "response_cancel_not_active":
                 # Benign race: the response we tried to cancel finished on its own.
                 logger.info("stale response.cancel ignored call_id=%s", call_id)
@@ -1142,6 +1520,10 @@ class CallService:
         self._activity.note(call_id, sent)
         event_type = event.get("type")
         if event_type == "response.create":
+            if (event.get("response", {}).get("metadata") or {}).get(
+                RESPONSE_PURPOSE_METADATA_KEY
+            ) == CLOSING_CHECK_RESPONSE_PURPOSE:
+                return
             self._queue_latency(call_id, LatencyStage.FIRST_RESPONSE_CREATE, sent)
             return
         item = event.get("item") or {}
@@ -1275,6 +1657,7 @@ class CallService:
             "send_dtmf",
             "record_call_outcome",
             "end_call",
+            "finish_call_after_goodbye",
             "transfer_to_owner",
             "ask_agent",
             "report_hold",
@@ -1370,9 +1753,14 @@ class CallService:
             await self._tool_record_call_outcome(
                 call_id, tool_call_id, arguments, received=received, event_key=event_key
             )
-        elif name == "end_call":
+        elif name in {"end_call", "finish_call_after_goodbye"}:
             await self._tool_end_call(
-                call_id, tool_call_id, arguments, received=received, event_key=event_key
+                call_id,
+                tool_call_id,
+                arguments,
+                received=received,
+                event_key=event_key,
+                response_id=event.get("response_id"),
             )
         elif name == "transfer_to_owner":
             await self._tool_transfer_to_owner_branch(
@@ -1496,7 +1884,16 @@ class CallService:
         *,
         received: LatencyMark,
         event_key: str,
+        response_id: str | None = None,
     ) -> None:
+        epochs = self._voice_end_event_epochs.get(call_id, {})
+        speech_epoch = epochs.pop(tool_call_id, self._callee_speech_epochs.get(call_id, 0))
+        if not epochs:
+            self._voice_end_event_epochs.pop(call_id, None)
+        audio = self._voice_audio_for(call_id, response_id)
+        spoken_response_id = response_id if audio is not None and audio.has_audio else None
+        if spoken_response_id and audio is not None:
+            speech_epoch = audio.speech_epoch
         try:
             request = VoiceEndCallRequest.model_validate(arguments)
         except Exception as exc:
@@ -1508,7 +1905,20 @@ class CallService:
                 event_key=event_key,
             )
             return
-        pending = (tool_call_id, None)
+        if self._voice_end_overtaken_by_speech(call_id, speech_epoch) or (
+            spoken_response_id and audio is not None and audio.cleared
+        ):
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"accepted": False, "error": "callee_resumed"},
+                received=received,
+                event_key=event_key,
+                continue_response=False,
+            )
+            return
+        self._cancel_voice_end(call_id)
+        pending = (tool_call_id, spoken_response_id)
         self._voice_end_pending[call_id] = pending
         # Arm teardown before either the WebSocket send or post-send bookkeeping
         # can fail. Otherwise a durable-write failure could skip the only fallback.
@@ -1534,17 +1944,50 @@ class CallService:
                 exc_info=True,
             )
         self._notify_call_event(call_id)
+        # Speech can arrive while question cancellation awaits SQLite. Let native
+        # VAD handle that turn instead of forcing the now-stale goodbye over it.
+        if self._voice_end_pending.get(
+            call_id
+        ) is not pending or self._voice_end_overtaken_by_speech(call_id, speech_epoch):
+            await self._send_nontransfer_tool_result(
+                call_id,
+                tool_call_id,
+                {"accepted": False, "error": "callee_resumed"},
+                received=received,
+                event_key=event_key,
+                continue_response=False,
+            )
+            return
         await self._send_nontransfer_tool_result(
             call_id,
             tool_call_id,
-            {"accepted": True, "reason": request.reason},
+            {
+                "accepted": True,
+                "status": "closing_pending",
+                "call_connected": True,
+                "reason": request.reason,
+                "next_action": (
+                    "The existing goodbye audio will finish before disconnecting. Stay silent."
+                    if spoken_response_id
+                    else "Say a brief goodbye, then listen. The call has NOT disconnected. "
+                    "If the callee speaks again, this pending close is cancelled. "
+                    "Address their follow-up, then use finish_call_after_goodbye again when finished."
+                ),
+            },
             received=received,
             event_key=event_key,
+            continue_response=spoken_response_id is None,
             continuation_instructions=(
-                "The call is now ending. Say one short, natural goodbye and nothing else. "
-                "Do not recap details already confirmed. Do not call any function."
+                "Thank the person warmly for their help and say a brief natural goodbye. "
+                "Then yield so they can reply. Do not recap or call any function."
             ),
         )
+        # The receiver may already have observed completion while this tool waited
+        # for SQLite. Use that receipt, including an earlier playback stop.
+        if spoken_response_id and audio is not None and audio.status is not None:
+            await self._handle_voice_end_response_done(
+                call_id, {"response": {"id": spoken_response_id, "status": audio.status}}
+            )
 
     async def _tool_transfer_to_owner_branch(
         self,
@@ -1874,6 +2317,21 @@ class CallService:
             pending.delivering = True
 
     async def _deliver_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
+        # A losing expiry claim may clear the pending-question entry while this
+        # continuation still owns the channel. Keep delivery ownership separately.
+        self._question_answer_deliveries[call_id] = (
+            self._question_answer_deliveries.get(call_id, 0) + 1
+        )
+        try:
+            await self._send_question_answer(call_id, question_row)
+        finally:
+            remaining = self._question_answer_deliveries.get(call_id, 0) - 1
+            if remaining > 0:
+                self._question_answer_deliveries[call_id] = remaining
+            else:
+                self._question_answer_deliveries.pop(call_id, None)
+
+    async def _send_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
         question_id = question_row["question_id"]
         if call_id in self._voice_end_pending:
             # The goodbye turn owns the sideband now; do not inject an answer relay.
@@ -2293,17 +2751,74 @@ class CallService:
         self._voice_end_pending.pop(call_id, None)
         await self.terminate_call(call_id, "voice_model_end_call")
 
+    def _cancel_voice_end(self, call_id: str) -> bool:
+        closing = call_id in self._voice_end_pending or call_id in self._voice_end_reply_waits
+        self._voice_end_pending.pop(call_id, None)
+        self._voice_end_reply_waits.pop(call_id, None)
+        pending = self._audio_drain_terminations.get(call_id)
+        if pending is not None and pending[1] == "voice_model_end_call":
+            self._audio_drain_terminations.pop(call_id, None)
+            closing = True
+        return closing
+
+    async def _notify_call_resumed(self, call_id: str) -> None:
+        # Sent from the receiver path, without waiting for transcript persistence.
+        # Native VAD owns the reply; this adds context without creating a second turn.
+        if (
+            call_id in self._activity.tombstones
+            or call_id in self._activity.watchdog_claims
+            or call_id in self._voice_end_pending
+            or call_id in self._voice_end_reply_waits
+            or self._audio_drain_terminations.get(call_id, (None, None))[1]
+            == "voice_model_end_call"
+        ):
+            return
+        await self.realtime.notify_call_resumed(call_id)
+
+    def _voice_end_overtaken_by_speech(self, call_id: str, speech_epoch: int) -> bool:
+        return (
+            call_id in self._callee_speaking
+            or self._callee_speech_epochs.get(call_id, 0) != speech_epoch
+        )
+
+    def _wait_for_goodbye_reply(self, call_id: str, *, stopped_at: float | None = None) -> None:
+        token = object()
+        self._voice_end_reply_waits[call_id] = token
+        self._spawn(
+            self._end_after_goodbye_reply_window(call_id, token, stopped_at=stopped_at),
+            name=f"voice-end-reply:{call_id}",
+        )
+
+    async def _end_after_goodbye_reply_window(
+        self, call_id: str, token: object, *, stopped_at: float | None = None
+    ) -> None:
+        elapsed = 0.0 if stopped_at is None else time.monotonic() - stopped_at
+        await asyncio.sleep(max(0.0, VOICE_END_REPLY_GRACE_SECONDS - elapsed))
+        if self._voice_end_reply_waits.get(call_id) is not token:
+            return
+        self._voice_end_reply_waits.pop(call_id, None)
+        await self.terminate_call(call_id, "voice_model_end_call")
+
     def _terminate_after_audio_drain(
         self, call_id: str, response_id: str | None, reason: str
     ) -> None:
         """Delay a post-final-response termination until SIP playback finishes.
 
         response.done only means generation finished; hanging up right away truncates the
-        closing words still buffered on OpenAI's side. output_audio_buffer.stopped (or
-        .cleared, when the callee interrupts) marks actual end of playback. A bounded
-        fallback still terminates if neither event is ever delivered.
+        closing words still buffered on OpenAI's side. output_audio_buffer.stopped
+        marks actual end of playback. A voice goodbye then leaves time for a reply;
+        interrupted goodbyes return to conversation. Voicemail still ends after drain.
+        A bounded fallback still terminates if neither event is ever delivered.
         """
 
+        if reason == "voice_model_end_call":
+            audio = self._voice_audio_for(call_id, response_id)
+            if audio is not None:
+                if audio.cleared:
+                    return
+                if audio.stopped_at is not None:
+                    self._wait_for_goodbye_reply(call_id, stopped_at=audio.stopped_at)
+                    return
         self._audio_drain_terminations[call_id] = (response_id, reason)
         self._spawn(
             self._audio_drain_fallback(call_id, response_id, reason),
@@ -2317,6 +2832,17 @@ class CallService:
         expected_response_id, reason = pending
         response_id = event.get("response_id")
         if expected_response_id and response_id and expected_response_id != response_id:
+            return
+        if reason == "voice_model_end_call":
+            if event.get("type") == "output_audio_buffer.cleared":
+                self._cancel_voice_end(call_id)
+                self._spawn(self._notify_call_resumed(call_id), name=f"voice-end-resumed:{call_id}")
+            else:
+                self._audio_drain_terminations.pop(call_id, None)
+                audio = self._voice_audio_for(call_id, response_id)
+                self._wait_for_goodbye_reply(
+                    call_id, stopped_at=audio.stopped_at if audio is not None else None
+                )
             return
         self._audio_drain_terminations.pop(call_id, None)
         self._spawn(
@@ -2691,10 +3217,32 @@ class CallService:
         """
         self._tombstone_call_activity(call_id)
         self._owner_transfer.clear_call(call_id)
+        opening_task = self._opening_tasks.pop(call_id, None)
+        if opening_task is not None and opening_task is not asyncio.current_task():
+            opening_task.cancel()
+        self._opening_listen.pop(call_id, None)
         self._opening_transition_locks.pop(call_id, None)
         self._tool_seen_calls.discard(call_id)
         self._pending_questions.pop(call_id, None)
+        self._question_answer_deliveries.pop(call_id, None)
         self._voice_end_pending.pop(call_id, None)
+        self._voice_end_reply_waits.pop(call_id, None)
+        self._callee_speech_epochs.pop(call_id, None)
+        self._callee_speaking.discard(call_id)
+        self._voice_end_event_epochs.pop(call_id, None)
+        self._voice_response_audio.pop(call_id, None)
+        self._closing_check_responses.pop(call_id, None)
+        for key, task in list(self._closing_check_tasks.items()):
+            if key[0] == call_id:
+                self._closing_check_tasks.pop(key, None)
+                if task is not asyncio.current_task():
+                    task.cancel()
+                attempt = self._closing_check_attempts.pop(key, None)
+                if attempt is not None and not attempt.result.done():
+                    attempt.result.cancel()
+        self._closing_check_completed = {
+            key for key in self._closing_check_completed if key[0] != call_id
+        }
 
     async def _finalize_call_best_effort(self, call_id: str) -> None:
         try:
@@ -2718,6 +3266,7 @@ class CallService:
         # teardown below finishes.
         self._tombstone_call_activity(call_id)
         self._voice_end_pending.pop(call_id, None)
+        self._voice_end_reply_waits.pop(call_id, None)
         conference_failed = await self._teardown_call_media(
             call, preserve_conference=preserve_conference
         )

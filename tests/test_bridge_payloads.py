@@ -114,6 +114,7 @@ async def test_opening_response_uses_session_context_without_a_script(settings):
     assert websocket.messages == [
         {
             "type": "response.create",
+            "event_id": "opening_call_1",
             "response": {"output_modalities": ["audio"]},
         }
     ]
@@ -302,6 +303,7 @@ async def test_activation_update_is_serialized_and_waits_for_echo(settings):
                         # nested audio.input object, so omitting it would drop callee
                         # transcription for the rest of the call.
                         "transcription": {"model": "gpt-realtime-whisper"},
+                        "noise_reduction": {"type": "far_field"},
                         "turn_detection": {
                             "type": "semantic_vad",
                             "eagerness": "auto",
@@ -357,6 +359,7 @@ async def test_initial_session_update_reasserts_safe_audio_gate(settings):
                 "audio": {
                     "input": {
                         "transcription": {"model": "gpt-realtime-whisper"},
+                        "noise_reduction": {"type": "far_field"},
                         "turn_detection": {
                             "type": "semantic_vad",
                             "eagerness": "auto",
@@ -697,3 +700,45 @@ async def test_complete_conference_treats_missing_resource_as_already_closed(set
     bridge = TwilioBridge(settings, client=client)
 
     await bridge.complete_conference("CF-missing")
+
+
+async def test_resumed_call_state_is_silent_context_without_an_extra_response(settings):
+    websocket = FakeWebSocket()
+    bridge = RealtimeBridge(
+        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
+    )
+    bridge._runtime["call_resumed"] = RealtimeRuntime(
+        call_id="call_resumed", openai_call_id="rtc_resumed", websocket=websocket
+    )
+    await bridge.notify_call_resumed("call_resumed")
+    assert len(websocket.messages) == 1
+    event = websocket.messages[0]
+    assert event["type"] == "conversation.item.create"
+    assert event["item"]["role"] == "system"
+    assert "still connected" in event["item"]["content"][0]["text"]
+    assert "brief natural goodbye FIRST" in event["item"]["content"][0]["text"]
+
+
+async def test_closing_classification_is_text_only_and_outside_conversation(settings):
+    websocket = FakeWebSocket()
+    bridge = RealtimeBridge(
+        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
+    )
+    bridge._runtime["call_check"] = RealtimeRuntime(
+        call_id="call_check", openai_call_id="rtc_check", websocket=websocket
+    )
+    await bridge.check_spoken_closing(
+        "call_check", "spoken_response", request_id="closing_check_spoken_response_1"
+    )
+    event = websocket.messages[0]
+    assert event["event_id"] == "closing_check_spoken_response_1"
+    response = event["response"]
+    assert response["conversation"] == "none"
+    assert response["output_modalities"] == ["text"]
+    assert response["tools"] == []
+    assert response["tool_choice"] == "none"
+    assert response["metadata"] == {
+        "agent_call_purpose": "closing_check",
+        "spoken_response_id": "spoken_response",
+        "closing_check_request_id": "closing_check_spoken_response_1",
+    }

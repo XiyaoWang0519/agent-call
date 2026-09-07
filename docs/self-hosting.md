@@ -67,6 +67,17 @@ Booting a **live** process requires every variable in `Settings.require_runtime_
 
 Do not put `ALLOWED_COUNTRY_CODES` in `.env.local`. pydantic-settings JSON-decodes list-typed fields, so `ALLOWED_COUNTRY_CODES=+1` crashes boot. Omit it and rely on the `+1` default. For a non-default allowlist, set a JSON list in the process environment (for example `ALLOWED_COUNTRY_CODES=["+1"]`).
 
+`INPUT_NOISE_REDUCTION` defaults to OpenAI's `far_field` input filter; `near_field` is also
+available. Far-field was selected after a controlled synthetic speech/noise comparison;
+that small local-transport sample does not establish real-phone robustness. Compare received
+audio and speech-start events when changing the setting: filtering can introduce false speech
+turns or delay real speech. `TURN_DETECTION_MODE=server_vad` uses a 300 ms silence threshold
+by default to reduce delayed responses. `semantic_vad` remains available for comparison; its
+eagerness controls turn completion, not background-noise sensitivity. Keep real interruptions enabled and verify them separately
+from noise rejection. A generated transcript alone does not prove that the callee heard a full sentence.
+See [conversational audio validation](call-audio-validation.md) for the non-speech noise
+acceptance scope, measured results, and remaining latency limits.
+
 Do not run `doctor --live-ready` yet. That command includes DNS/TLS and health-path checks, so it is truthful only after the live server and a public HTTPS origin exist.
 
 ### Boot the live server
@@ -311,7 +322,8 @@ See the [README](../README.md#live-sip-canary). Those commands place a real bill
 
 - Live-call control requests use `OPENAI_CONNECT_TIMEOUT_SECONDS` and `OPENAI_HTTP_TIMEOUT_SECONDS` (3 and 10 seconds by default) with no SDK retries; post-call extraction uses `OPENAI_EXTRACTION_TIMEOUT_SECONDS` and keeps its single application-level retry.
 - Twilio requests use the pooled, no-retry transport bounded by `TWILIO_HTTP_TIMEOUT_SECONDS`.
-- `SEMANTIC_VAD_EAGERNESS` defaults to `auto` (OpenAI's medium-eagerness behavior); set `high` for quicker turn completion.
+- `TURN_DETECTION_MODE` defaults to `server_vad`, with `SERVER_VAD_SILENCE_DURATION_MS=300` and `SERVER_VAD_THRESHOLD=0.5`. Short silence windows can split hesitations; compare heard audio, false interruptions, and response latency before tuning.
+- `TURN_DETECTION_MODE=semantic_vad` enables semantic turn detection. `SEMANTIC_VAD_EAGERNESS` defaults to `auto`; `high` requests quicker completion, but provider turn decisions may still add latency.
 - `OPENAI_KEEPALIVE_EXPIRY_SECONDS=60` keeps the control-plane TLS connection reusable between sporadic calls; only set it to a bounded 5–300 second value.
 - The voice model can call `search_web` for current or uncertain facts. The application fixes Exa Search to `type=auto`, 10 results, moderation, and token-efficient highlights, with a three-second wall-clock deadline controlled by `EXA_SEARCH_TIMEOUT_SECONDS`.
 - Locked dependency versions live in `uv.lock` (authoritative).
@@ -326,7 +338,7 @@ Live-schema deviations from the original contract are intentional:
 - The current Conference Participants API has no `async_amd` parameter. AMD on Participants is asynchronous by design; the installed SDK uses `machine_detection="DetectMessageEnd"` plus `amd_status_callback` and `amd_status_callback_method`.
 - OpenAI call accept is invoked through the installed typed SDK; hangup has no JSON body. REFER's live request field is `target_uri`, but v1 transfer deliberately does not use REFER.
 - The installed transcription schema permits `INPUT_TRANSCRIPTION_DELAY` only for `gpt-realtime-whisper`, with `minimal|low|medium|high|xhigh` values.
-- The OpenAI SIP agent participant is created with `early_media=false` and is explicitly unmuted before the model's opening turn, because Twilio mutes legs that join with `start_conference_on_enter=false` until the conference starts.
+- The OpenAI SIP agent participant is created with `early_media=false` and receives an explicit unmute when the callee answers, because Twilio mutes legs that join with `start_conference_on_enter=false` until the conference starts.
 
 ## Result semantics
 

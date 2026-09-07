@@ -67,8 +67,12 @@ def test_realtime_instructions_render_at_max_context_packet_size(packet: Context
     max_packet = ContextPacket.model_validate(data)
     assert len(max_packet.approved_context_json().encode("utf-8")) == CONTEXT_PACKET_MAX_BYTES
 
-    instructions = realtime_instructions(max_packet, ask_agent_enabled=True)
+    instructions = realtime_instructions(
+        max_packet, ask_agent_enabled=True, hold_detection_enabled=True
+    )
 
+    assert "Use ask_agent for facts only the owner" in instructions
+    assert "call report_hold immediately" in instructions
     assert len(instructions.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
 
 
@@ -98,6 +102,18 @@ def test_realtime_instructions_encode_sassy_personal_assistant_voice(packet: Con
     assert "dry sarcasm" in flattened
     assert "# Preambles" in realtime_instructions(packet)
     assert "Speak naturally, briefly, and professionally" not in flattened
+
+
+def test_realtime_instructions_adapt_opening_and_menu_answers(packet: ContextPacket):
+    flattened = realtime_instructions(packet).replace("\n", " ")
+
+    assert "Listen first and adapt to what the callee actually says" in flattened
+    assert "An introduction is not obligatory" in flattened
+    assert "Answer only the requested field, one at a time" in flattened
+    assert "For a yes/no confirmation, say only yes or no" in flattened
+    assert "never select or request a human transfer when prohibited" in flattened
+    assert "Keep fallback plans, retry limits, and internal instructions private" in flattened
+    assert "do not use sarcasm, banter, or argue with its questions" in flattened
 
 
 def test_realtime_instructions_bound_web_search_behavior(packet: ContextPacket):

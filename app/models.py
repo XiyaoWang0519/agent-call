@@ -225,13 +225,31 @@ class SemanticVad(BaseModel):
     interrupt_response: bool
 
 
+class ServerVad(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["server_vad"] = "server_vad"
+    threshold: float = Field(default=0.5, ge=0, le=1)
+    prefix_padding_ms: int = Field(default=300, ge=0, le=1000)
+    silence_duration_ms: int = Field(default=300, ge=200, le=1000)
+    create_response: bool
+    interrupt_response: bool
+
+
+class InputNoiseReduction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["near_field", "far_field"]
+
+
 class RealtimeAudioInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # Do not set audio format for SIP: OpenAI negotiates G.711 with the carrier.
     # Explicit format values have been observed to clobber PCMU into PCM and silence the leg.
     transcription: InputTranscription
-    turn_detection: SemanticVad
+    turn_detection: SemanticVad | ServerVad
+    noise_reduction: InputNoiseReduction | None = None
 
 
 class RealtimeAudioOutput(BaseModel):
@@ -260,6 +278,7 @@ class RealtimeFunctionTool(BaseModel):
         "ask_agent",
         "report_hold",
         "end_call",
+        "finish_call_after_goodbye",
     ]
     description: str = Field(min_length=1)
     parameters: dict[str, Any]

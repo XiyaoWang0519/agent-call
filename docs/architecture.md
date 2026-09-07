@@ -1,5 +1,34 @@
 # Architecture
 
+Voice closing keeps ordinary speech independent of the closing decision. The voice model
+speaks its actual farewell without a closing tool. After a completed spoken response, a
+separate text-only Realtime response classifies whether the conversation is finished. It
+uses `conversation=none`, no tools, and purpose metadata; its output is never played or
+added to the conversation. It runs behind playback, so speech does not wait for another
+model round trip. Only an exact completed `FINISHED` result can arm closing, and only for
+the latest uncut spoken response with no intervening callee speech. Other results leave
+the call connected. Classifier usage is counted without changing the active audio response.
+Pending owner questions, including answer delivery and timeout continuations, suppress
+new closing checks so those continuations can use the response channel. A question
+registered before a retry or decision also prevents that stale check from closing the call.
+
+Each classification attempt has a three-second deadline covering send and result receipt.
+A failed send, provider rejection, failed/incomplete response, malformed decision, or missing
+result gets one retry while the same uninterrupted spoken response is current. Request IDs
+correlate errors and decisions to attempts; late attempts still contribute usage but cannot
+override the current attempt. Call teardown cancels outstanding checks. Exhaustion leaves
+the call connected without asserting success or bypassing the normal liveness limits.
+
+Closing waits for SIP playback to finish, then leaves a three-second reply window. Callee
+speech cancels the pending close at frame arrival. A silent context update tells the voice
+model that the conversation resumed; native VAD owns its reply. A late classifier uses
+the original playback-stop time rather than restarting the reply window. Legacy `end_call`
+and `finish_call_after_goodbye` events remain supported for in-flight/older sessions,
+including a separate goodbye response when no audio accompanied the tool. Interrupted
+goodbyes return to conversation; voicemail keeps its playback-drain termination. Missing
+provider playback events retain bounded teardown fallbacks. Outcome extraction runs after
+hangup, so advisory outcome recording is not a closing step.
+
 Agent Call is a single-process FastAPI service that mounts an authenticated FastMCP endpoint and coordinates one outbound call at a time for a single owner.
 
 `AGENT_CALL_PROFILE=evaluation` is a fail-closed dummy boot: required settings are filled with obvious placeholders, `/healthz` and `prepare_phone_call` work, and `CallService.start` returns `live_calls_disabled` before any OpenAI or Twilio client request. The default evaluation listener is loopback. The live profile is unchanged: `prepare_phone_call` never dials, and `start_phone_call` still requires an unexpired single-use plan, `explicit_confirmation=true`, and the exact confirmation read-back.
@@ -30,6 +59,10 @@ prepared → prewarming → ready_to_activate → activating → active → term
 ```
 
 Terminal states: `completed`, `failed`, `timed_out`, `transferred`. Telephony state and extraction state are separate: a successful phone call whose extractor fails stays `call_status=completed` with `finalization_status=failed` and `outcome=unknown`, and still retains the raw transcript.
+
+Once the verified sideband is ready and the callee answers, the agent unmutes before enabling automatic responses, without waiting for asynchronous AMD. A greeting already committed during setup receives an immediate continuation. Otherwise the 1.5-second fallback requests an opening only if no speech or automatic response has arrived. The prompt adapts to greetings, questions, and menus without a separate automated-line mode. AMD continues in the background: human, unknown, and ambiguous `machine_end_other` results retain ordinary conversation; beep/silence results switch to the voicemail message. A result received before activation selects voicemail without enabling ordinary replies.
+
+Late voicemail detection suspends automatic responses and cancels any in-flight reply before requesting the voicemail message. It cannot retract ordinary audio already delivered to a recorder. This is the explicit tradeoff for avoiding a potentially lengthy AMD wait before conversation. Fax detection terminates the call. These callbacks remain active after conversational activation.
 
 ## Webhook verification and replay protection
 

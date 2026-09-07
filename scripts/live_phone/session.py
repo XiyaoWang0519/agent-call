@@ -166,6 +166,10 @@ class Session:
                     # Keep provider events separate; audio decoding is the IVR assertion.
                     self.event("digit_provider", digit=message["dtmf"]["digit"])
                 elif kind == "stop":
+                    self.event(
+                        "remote_stop",
+                        last_voice_at=self.voiced[-1][0] if self.voiced else None,
+                    )
                     break
         except Exception as exc:
             if type(exc).__name__ != "WebSocketDisconnect":
@@ -284,6 +288,7 @@ class Session:
                 elif step.action == "signal":
                     await asyncio.wait_for(self.signals[text].wait(), timeout=step.seconds)
                 elif step.action == "hangup":
+                    self.event("receiver_hangup")
                     await self.hangup(self.call_sid)
                 self.event("step_passed", step=index, action=step.action)
         except Exception as exc:

@@ -608,6 +608,9 @@ def test_signed_websocket_receives_audio_and_independent_asr(
         assert asr_args["language"] == "en"
         assert "prompt" not in asr_args
         assert session.evidence()["voiced_seconds"] > 0
+        stop = next(event for event in session.events if event["type"] == "remote_stop")
+        assert stop["last_voice_at"] is not None
+        assert stop["at"] >= stop["last_voice_at"]
         assert (store.root / "run_one/callee-received.wav").read_bytes().startswith(b"RIFF")
 
 
@@ -1085,7 +1088,9 @@ def test_basic_requires_search_hangup_and_acoustic_interruption():
     checks = grade(SCENARIOS["basic"], {})
     assert checks["tool:search_web"] is False
     assert checks["search_succeeded"] is False
-    assert checks["tool:end_call"] is False
+    assert checks["app_initiated_closing"] is False
+    assert checks["spoken_goodbye_received"] is False
+    assert checks["goodbye_reply_window_received"] is False
     assert checks["interruption_audio_verified"] is False
     evidence = {"sessions": {"callee": {"events": [{"type": "interruption_verified"}]}}}
     assert grade(SCENARIOS["basic"], evidence)["interruption_audio_verified"] is True
@@ -1111,3 +1116,90 @@ async def test_normal_reply_waits_for_agent_silence(tmp_path, monkeypatch):
     session.until.assert_awaited_once()
     session.play.assert_awaited_once_with(b"pcm", "reply")
     assert session.error is None
+
+
+@pytest.mark.parametrize(
+    "name", ["basic", "conversation", "no-outcome-tool", "wrong-number", "declined"]
+)
+def test_spoken_closing_scenarios_do_not_require_retired_end_call_tool(name):
+    scenario = SCENARIOS[name]
+    assert scenario.spoken_closing
+    assert "end_call" not in scenario.tools
+    assert "end_call" not in scenario.objective
+
+
+def _spoken_close_evidence():
+    scenario = SCENARIOS["no-outcome-tool"]
+    return {
+        "debug": {"canary_evidence": {"termination_reason": "voice_model_end_call"}},
+        "sessions": {
+            "callee": {
+                "transcripts": [{"text": "Goodbye."}],
+                "events": [
+                    {"type": "step_passed", "step": len(scenario.steps) - 1, "action": "expect"},
+                    {"type": "remote_stop", "at": 20.0, "last_voice_at": 17.0},
+                ],
+            }
+        },
+        "cleanup": {"verified": True, "forced": []},
+    }
+
+
+def test_spoken_closing_grade_requires_received_goodbye_and_reply_window():
+    checks = grade(SCENARIOS["no-outcome-tool"], _spoken_close_evidence())
+    for name in (
+        "spoken_goodbye_received",
+        "app_initiated_closing",
+        "goodbye_reply_window_received",
+        "no_receiver_hangup",
+        "provider_cleanup_verified",
+        "no_forced_cleanup",
+        "tool_absent:record_call_outcome",
+        "advisory_outcome",
+    ):
+        assert checks[name], name
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "no_asr",
+        "no_final_step",
+        "wrong_reason",
+        "short_window",
+        "no_stop",
+        "receiver_hangup",
+        "forced_cleanup",
+        "outcome_tool",
+    ],
+)
+def test_spoken_closing_grade_rejects_incomplete_or_forced_endings(failure):
+    evidence = _spoken_close_evidence()
+    session = evidence["sessions"]["callee"]
+    if failure == "no_asr":
+        session["transcripts"] = []
+        expected = "spoken_goodbye_received"
+    elif failure == "no_final_step":
+        session["events"].pop(0)
+        expected = "spoken_goodbye_received"
+    elif failure == "wrong_reason":
+        evidence["debug"]["canary_evidence"]["termination_reason"] = "owner_request"
+        expected = "app_initiated_closing"
+    elif failure == "short_window":
+        session["events"][-1]["at"] = 17.1
+        expected = "goodbye_reply_window_received"
+    elif failure == "no_stop":
+        session["events"].pop()
+        expected = "goodbye_reply_window_received"
+    elif failure == "receiver_hangup":
+        session["events"].append({"type": "receiver_hangup"})
+        expected = "no_receiver_hangup"
+    elif failure == "forced_cleanup":
+        evidence["cleanup"]["forced"] = ["test-leg"]
+        expected = "no_forced_cleanup"
+    else:
+        evidence["debug"]["latency_events"] = [
+            {"stage": "tool_dispatched", "event_key": "record_call_outcome:tool_one"}
+        ]
+        expected = "tool_absent:record_call_outcome"
+    assert grade(SCENARIOS["no-outcome-tool"], evidence)[expected] is False

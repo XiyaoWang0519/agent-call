@@ -21,6 +21,15 @@
 
 Use four-space indentation, Python type hints, and `from __future__ import annotations`. Ruff targets Python 3.12 with a 100-character line length and enforces pycodestyle, Pyflakes, import sorting, pyupgrade, bugbear, and async rules. Use `snake_case` for modules, functions, variables, and tests; `PascalCase` for classes and Pydantic models; and descriptive async names for network or database operations.
 
+## Voice latency is a completion requirement
+
+Latency is a first-order product requirement for this voice agent, alongside factual correctness and call safety. Treat an awkward multi-second pause as an unresolved defect, even when the call eventually ends and automated tests pass.
+
+- Keep grounded acknowledgements and normal speech off unnecessary tool, database, and extra model round trips. Never invent an answer or acknowledge unheard speech to make latency look better.
+- Before changing a conversational path, establish a latency target and measure from the callee's actual speech end to the first audio they hear. Separate turn detection/transport delay, model time, tool handling, and playback; first text and generation completion are not audible response time.
+- Verify natural timing as well as factual answers, genuine interruptions, completed playback, post-goodbye follow-ups, and termination. Include clean and relevant noisy conditions; disclose incomplete scenarios and distinguish local transport simulation from real-phone evidence.
+- Do not call a voice change done while a known latency problem remains. Keep working on it, or clearly state the unresolved limitation. Do not shorten the post-goodbye reply window or cut off speech to conceal an earlier response delay.
+
 ## Testing Guidelines
 
 Tests use pytest, `pytest-asyncio` in auto mode, `respx`, and temporary SQLite databases. Name files `test_<area>.py` and tests `test_<behavior>`. Add regression coverage for state transitions, signed webhook handling, payload shapes, recovery, and teardown. CI enforces an 85% coverage floor on `app` via `pytest --cov=app`; new behavior should still exercise both success and failure paths.

@@ -29,6 +29,7 @@ from app.twilio_bridge import ParticipantInfo
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         agent_call_profile="live",
+        turn_detection_mode="semantic_vad",
         openai_api_key=SecretStr("sk-test"),
         openai_webhook_secret=SecretStr(
             "whsec_" + base64.b64encode(b"test webhook secret").decode()
@@ -162,6 +163,8 @@ class FakeRealtime:
         self.closed: list[str] = []
         self.close_all_calls = 0
         self.tool_results: list[tuple[str, str, dict]] = []
+        self.resumed_calls: list[str] = []
+        self.closing_checks: list[tuple[str, str]] = []
         self.tool_result_continuations: list[bool] = []
         self.tool_result_continuation_texts: list[str | None] = []
         self.tool_result_failures_remaining = 0
@@ -256,6 +259,14 @@ class FakeRealtime:
 
     async def close_all(self) -> None:
         self.close_all_calls += 1
+
+    async def check_spoken_closing(
+        self, call_id: str, response_id: str, *, request_id: str
+    ) -> None:
+        self.closing_checks.append((call_id, response_id))
+
+    async def notify_call_resumed(self, call_id: str) -> None:
+        self.resumed_calls.append(call_id)
 
     async def send_tool_result(
         self,
