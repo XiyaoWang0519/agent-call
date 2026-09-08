@@ -353,12 +353,11 @@ def test_blank_required_runtime_values_are_missing(settings):
         blank.require_runtime_configuration()
 
 
-def test_exa_api_key_is_required_when_search_tool_is_advertised(settings):
+def test_exa_api_key_is_optional_for_live_startup(settings):
     values = settings.model_dump()
     values["exa_api_key"] = None
     blank = Settings(**values)
-    with pytest.raises(RuntimeError, match="EXA_API_KEY"):
-        blank.require_runtime_configuration()
+    blank.require_runtime_configuration()
 
 
 @pytest.mark.parametrize(

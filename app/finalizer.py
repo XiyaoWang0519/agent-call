@@ -134,6 +134,8 @@ class Finalizer:
             "session_update_mismatch",
         }
         reason = call.get("termination_reason") or ""
+        # Legacy capture heuristic, not evidence that the approved objective was achieved
+        # or that every spoken/generated utterance was captured and heard on the phone.
         transcript_complete = any(turn.speaker != "system" for turn in transcript) and not any(
             reason.startswith(prefix) for prefix in fatal_reasons
         )
@@ -191,11 +193,25 @@ class Finalizer:
             await self._maybe_push(failure)
             return failure
 
+        outcome = extracted.outcome
+        if outcome == "completed":
+            assessments = extracted.objective_assessments
+            if any(item.status == "unmet" for item in assessments):
+                outcome = (
+                    "partially_completed"
+                    if any(item.status == "met" and item.evidence_turn_ids for item in assessments)
+                    else "failed"
+                )
+            elif not assessments or any(
+                item.status == "uncertain" or not item.evidence_turn_ids for item in assessments
+            ):
+                outcome = "unknown"
+
         result = StoredCallResult(
             call_id=call_id,
             call_status=call_status,
             finalization_status="succeeded",
-            outcome=extracted.outcome,
+            outcome=outcome,
             result_source="post_call_extractor",
             summary=extracted.summary,
             commitments=extracted.commitments,
@@ -268,6 +284,7 @@ class Finalizer:
                     parsed.commitments,
                     parsed.confirmation_numbers,
                     parsed.follow_ups,
+                    parsed.objective_assessments,
                 ):
                     for item in group:
                         canonical_ids = []

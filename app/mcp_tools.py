@@ -10,6 +10,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from app.call_state import CallService
+from app.mcp_oauth.constants import MCP_OAUTH_SCOPE
 from app.models import (
     AnswerCallQuestionRequest,
     ContextPacket,
@@ -30,9 +31,22 @@ CONTEXT_GUIDANCE = (
 )
 
 
-def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None:
+def register_tools(
+    mcp: FastMCP, get_service: Callable[[], CallService], *, oauth: bool = False
+) -> None:
+    auth_meta = (
+        {"securitySchemes": [{"type": "oauth2", "scopes": [MCP_OAUTH_SCOPE]}]} if oauth else None
+    )
+
     @mcp.tool(
         name="prepare_phone_call",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": False,
+            "idempotentHint": False,
+        },
+        meta=auth_meta,
         description=(
             "Validate and store a call plan without dialing. "
             + CONTEXT_GUIDANCE
@@ -58,6 +72,13 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
 
     @mcp.tool(
         name="start_phone_call",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
+            "idempotentHint": False,
+        },
+        meta=auth_meta,
         description=(
             "Start only a valid, unexpired prepared plan after explicit owner confirmation. "
             "Pass the confirmation text that was read back. Then IMMEDIATELY begin calling "
@@ -86,9 +107,21 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
 
     @mcp.tool(
         name="get_call_result",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": True,
+            "idempotentHint": False,
+        },
+        meta=auth_meta,
         description=(
             "Poll a call until state is completed, failed, timed_out, or transferred; terminal calls "
-            "return the stored deterministic result and raw-transcript availability. "
+            "return the stored result and raw-transcript availability. "
+            "May finish and persist a missing result using the extraction provider. "
+            "call_status describes telephony; finalization_status describes extraction; "
+            "transcript_complete is a capture heuristic. None of these establishes objective "
+            "completion. Report outcome together with the summary, including unanswered questions "
+            "or incomplete work; do not infer task success merely because the call ended. "
             + CONTEXT_GUIDANCE
         ),
     )
@@ -100,6 +133,13 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
 
     @mcp.tool(
         name="end_phone_call",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "openWorldHint": True,
+            "idempotentHint": True,
+        },
+        meta=auth_meta,
         description="End an active call at the owner's request. " + CONTEXT_GUIDANCE,
     )
     async def end_phone_call(call_id: str) -> dict[str, Any]:
@@ -108,6 +148,13 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
 
     @mcp.tool(
         name="get_phone_call",
+        annotations={
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "openWorldHint": False,
+            "idempotentHint": True,
+        },
+        meta=auth_meta,
         description="Return lightweight call status and timing fields. " + CONTEXT_GUIDANCE,
     )
     async def get_phone_call(call_id: str) -> dict[str, Any]:
@@ -120,6 +167,13 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
 
     @mcp.tool(
         name="wait_for_call_event",
+        annotations={
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "openWorldHint": False,
+            "idempotentHint": True,
+        },
+        meta=auth_meta,
         description=(
             "Long-poll for mid-call questions or terminal state after a sequence cursor. "
             "Returns immediately when events exist; on idle timeout returns an empty events list "
@@ -178,6 +232,13 @@ def register_tools(mcp: FastMCP, get_service: Callable[[], CallService]) -> None
 
     @mcp.tool(
         name="answer_call_question",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "openWorldHint": False,
+            "idempotentHint": False,
+        },
+        meta=auth_meta,
         description=(
             "Submit the final answer to one pending mid-call question from the voice agent — "
             "the callee is waiting live on the phone. Begin retrieval immediately, but prioritize "

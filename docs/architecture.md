@@ -8,16 +8,6 @@ added to the conversation. It runs behind playback, so speech does not wait for 
 model round trip. Only an exact completed `FINISHED` result can arm closing, and only for
 the latest uncut spoken response with no intervening callee speech. Other results leave
 the call connected. Classifier usage is counted without changing the active audio response.
-Pending owner questions, including answer delivery and timeout continuations, suppress
-new closing checks so those continuations can use the response channel. A question
-registered before a retry or decision also prevents that stale check from closing the call.
-
-Each classification attempt has a three-second deadline covering send and result receipt.
-A failed send, provider rejection, failed/incomplete response, malformed decision, or missing
-result gets one retry while the same uninterrupted spoken response is current. Request IDs
-correlate errors and decisions to attempts; late attempts still contribute usage but cannot
-override the current attempt. Call teardown cancels outstanding checks. Exhaustion leaves
-the call connected without asserting success or bypassing the normal liveness limits.
 
 Closing waits for SIP playback to finish, then leaves a three-second reply window. Callee
 speech cancels the pending close at frame arrival. A silent context update tells the voice
@@ -46,10 +36,10 @@ flowchart LR
     Twilio -.->|"signed callbacks"| Bridge
 ```
 
-- **MCP client → FastAPI/FastMCP bridge.** OpenClaw, Hermes Agent, or any Streamable HTTP MCP client calls `/mcp/` with `Authorization: Bearer <MCP_BEARER_TOKEN>` and `X-Agent-User-Id: <ALLOWED_AGENT_USER_ID>`. `app/main.py` assembles FastAPI, mounts FastMCP at `/mcp`, and registers HTTP routes. Routes call `CallService` methods; they never touch `service.db` directly. An optional second FastMCP mount at `/grok/mcp/` is created only when `GROK_MCP_OAUTH_ENABLED=true`. It exposes the same seven tools against the same `CallService` and is protected by a self-hosted OAuth 2.1 authorization server (PKCE S256, rotating refresh tokens). OAuth is disabled by default and is not a multi-tenant account system. Grok Bot setup is documented in [docs/grok-bot/README.md](grok-bot/README.md); Grok Bot is not Grok Build. Grok Voice is out of scope.
+- **MCP client → FastAPI/FastMCP bridge.** A header-capable Streamable HTTP MCP client calls `/mcp/` with `Authorization: Bearer <MCP_BEARER_TOKEN>` and `X-Agent-User-Id: <ALLOWED_AGENT_USER_ID>`. `app/main.py` assembles FastAPI, mounts FastMCP at `/mcp`, and registers HTTP routes. Routes call `CallService` methods; they never touch `service.db` directly. An optional second FastMCP mount at `/connect/mcp/` is created only when `MCP_OAUTH_ENABLED=true`. It exposes the same seven tools against the same `CallService` and is protected by a self-hosted OAuth 2.1 authorization server (PKCE S256, rotating refresh tokens). OAuth is disabled by default and is not a multi-tenant account system. ChatGPT and Claude web setup is documented in [Browser clients](browser-clients.md).
 - **OpenAI Realtime SIP sideband control.** Twilio dials `sip:<OPENAI_PROJECT_ID>@sip.api.openai.com`. OpenAI posts `realtime.call.incoming` to `/webhooks/openai`. The bridge accepts the SIP call and prewarms the session over a sideband WebSocket (`app/openai_realtime.py`) before the callee is rung.
 - **Twilio conference / callee leg.** `app/twilio_bridge.py` creates a conference, adds the OpenAI SIP participant first, then the callee with answering-machine detection. Status, conference, AMD, and DTMF announce callbacks are per-request signed URLs under `/webhooks/twilio`.
-- **State machine and SQLite persistence.** `CallService` in `app/call_state.py` owns the lifecycle. The `app/db/` package is a `Database` facade composed from per-concern mixins (engine, plans, deployment, calls, transfers, termination, telemetry, webhooks, transcripts, questions, oauth). Default local DB is `sqlite:///./agent_call.db`; production uses a Fly volume. Optional Grok OAuth stores hashed authorization codes and refresh tokens plus encrypted client records in the same SQLite file; it does not add Redis or Postgres. Public DCR is capped at 64 clients with unused-client eviction; `oauth_audit` is retained 90 days and capped at 2048 newest rows. Expired token rows are purged at startup and when a token pair is issued.
+- **State machine and SQLite persistence.** `CallService` in `app/call_state.py` owns the lifecycle. The `app/db/` package is a `Database` facade composed from per-concern mixins (engine, plans, deployment, calls, transfers, termination, telemetry, webhooks, transcripts, questions, oauth). Default local DB is `sqlite:///./agent_call.db`; production uses a Fly volume. Optional MCP OAuth stores hashed authorization codes and refresh tokens plus encrypted client records in the same SQLite file; it does not add Redis or Postgres. Public DCR is capped at 64 clients with unused-client eviction; `oauth_audit` is retained 90 days and capped at 2048 newest rows. Expired token rows are purged at startup and when a token pair is issued.
 
 ## Call state
 
@@ -60,9 +50,9 @@ prepared → prewarming → ready_to_activate → activating → active → term
 
 Terminal states: `completed`, `failed`, `timed_out`, `transferred`. Telephony state and extraction state are separate: a successful phone call whose extractor fails stays `call_status=completed` with `finalization_status=failed` and `outcome=unknown`, and still retains the raw transcript.
 
-Once the verified sideband is ready and the callee answers, the agent unmutes before enabling automatic responses, without waiting for asynchronous AMD. A greeting already committed during setup receives an immediate continuation. Otherwise the 1.5-second fallback requests an opening only if no speech or automatic response has arrived. The prompt adapts to greetings, questions, and menus without a separate automated-line mode. AMD continues in the background: human, unknown, and ambiguous `machine_end_other` results retain ordinary conversation; beep/silence results switch to the voicemail message. A result received before activation selects voicemail without enabling ordinary replies.
+Once the verified sideband is ready and the callee answers, automatic turn-taking is enabled without waiting for the asynchronous AMD result. The agent listens first: a 1.5-second fallback requests an opening only if no speech or automatic response has arrived. A completed turn heard before automatic responses were enabled can receive one continuation. The prompt adapts to greetings, questions, and menus without requiring a separate automated-line mode.
 
-Late voicemail detection suspends automatic responses and cancels any in-flight reply before requesting the voicemail message. It cannot retract ordinary audio already delivered to a recorder. This is the explicit tradeoff for avoiding a potentially lengthy AMD wait before conversation. Fax detection terminates the call. These callbacks remain active after conversational activation.
+Late voicemail detection suspends automatic responses and cancels any in-flight reply before requesting the voicemail message. Fax detection terminates the call. These callbacks remain active after conversational activation.
 
 ## Webhook verification and replay protection
 

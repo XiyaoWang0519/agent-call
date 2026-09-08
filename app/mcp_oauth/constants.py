@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-GROK_MCP_MOUNT_PATH = "/grok/mcp"
-GROK_MCP_PATH = "/grok/mcp/"
-GROK_OAUTH_SCOPE = "agent-call:use"
-GROK_OAUTH_SUBJECT = "agent-call-owner"
-GROK_OAUTH_CONSENT_PATH = "/grok/oauth/consent"
-GROK_OAUTH_REVOKE_ALL_PATH = "/internal/grok-oauth/revoke-all"
+OAUTH_MCP_MOUNT_PATH = "/connect/mcp"
+OAUTH_MCP_PATH = "/connect/mcp/"
+MCP_OAUTH_SCOPE = "agent-call:use"
+MCP_OAUTH_SUBJECT = "agent-call-owner"
+MCP_OAUTH_CONSENT_PATH = "/oauth/consent"
+MCP_OAUTH_REVOKE_ALL_PATH = "/internal/mcp-oauth/revoke-all"
 
 ACCESS_TOKEN_TTL_MIN_SECONDS = 60
 ACCESS_TOKEN_TTL_MAX_SECONDS = 3600
@@ -30,6 +30,7 @@ OAUTH_CLIENT_MAX_COUNT = 64
 OAUTH_CLIENT_UNUSED_RETENTION_SECONDS = 30 * 24 * 60 * 60
 OAUTH_TRANSACTION_MAX_COUNT = 64
 OAUTH_TRANSACTION_MAX_PER_CLIENT = 8
+# Legacy derivation labels are a storage format: keep existing ciphertext readable.
 OAUTH_STORAGE_KEY_SALT = "agent-call-grok-oauth-storage"
 OAUTH_AUDIT_MAX_COUNT = 2048
 OAUTH_AUDIT_RETENTION_SECONDS = 90 * 24 * 60 * 60

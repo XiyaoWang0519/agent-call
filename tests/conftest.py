@@ -53,9 +53,9 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
-GROK_OAUTH_OWNER_SECRET = "owner-secret-for-tests"
-_GROK_OAUTH_HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
-GROK_OAUTH_OWNER_SECRET_HASH = _GROK_OAUTH_HASHER.hash(GROK_OAUTH_OWNER_SECRET)
+MCP_OAUTH_OWNER_SECRET = "owner-secret-for-tests"
+_MCP_OAUTH_HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
+MCP_OAUTH_OWNER_SECRET_HASH = _MCP_OAUTH_HASHER.hash(MCP_OAUTH_OWNER_SECRET)
 
 
 @pytest.fixture
@@ -63,10 +63,10 @@ def oauth_settings(settings: Settings) -> Settings:
     values = settings.model_dump()
     values.update(
         {
-            "grok_mcp_oauth_enabled": True,
-            "grok_mcp_oauth_owner_secret_hash": SecretStr(GROK_OAUTH_OWNER_SECRET_HASH),
-            "grok_mcp_oauth_signing_key": SecretStr("s" * 64),
-            "grok_mcp_oauth_storage_encryption_key": SecretStr("e" * 64),
+            "mcp_oauth_enabled": True,
+            "mcp_oauth_owner_secret_hash": SecretStr(MCP_OAUTH_OWNER_SECRET_HASH),
+            "mcp_oauth_signing_key": SecretStr("s" * 64),
+            "mcp_oauth_storage_encryption_key": SecretStr("e" * 64),
         }
     )
     return Settings(**values)
@@ -260,9 +260,7 @@ class FakeRealtime:
     async def close_all(self) -> None:
         self.close_all_calls += 1
 
-    async def check_spoken_closing(
-        self, call_id: str, response_id: str, *, request_id: str
-    ) -> None:
+    async def check_spoken_closing(self, call_id: str, response_id: str) -> None:
         self.closing_checks.append((call_id, response_id))
 
     async def notify_call_resumed(self, call_id: str) -> None:

@@ -49,7 +49,7 @@ Troubleshooting: [troubleshooting.md](troubleshooting.md).
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - A voice-enabled Twilio account (E.164 caller ID, outbound SIP, Conference Participant AMD)
 - An OpenAI project with Realtime SIP access and a webhook signing secret
-- An Exa API key (in-call web search)
+- Optional: an Exa API key for in-call web search. Leave it blank to disable search.
 - A stable public HTTPS origin for webhooks
 
 You do **not** need those accounts for dummy boot or for lint/tests.
@@ -90,10 +90,13 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 ### Expose webhooks
 
-Webhooks need a public HTTPS origin. Start the server, then tunnel port 8000:
+Webhooks and browser connectors need a reachable public HTTPS origin for the shared
+local setup. See [local browser setup](local-browser-setup.md) for topology, tunnel
+limitations, and the unverified packaged-browser acceptance step. Start the server,
+then tunnel port 8000:
 
 ```bash
-ngrok http 8000            # or: cloudflared tunnel --url http://localhost:8000
+ngrok http 8000
 ```
 
 Set `PUBLIC_BASE_URL` to the exact HTTPS origin the tunnel prints — no trailing slash — and restart. This value is security-critical: Twilio signs the full public callback URL.
@@ -110,91 +113,55 @@ After the live-profile process is up and `PUBLIC_BASE_URL` is a reachable HTTPS 
 uv run agent-call doctor --live-ready
 ```
 
-`doctor --live-ready` reports missing, blank, or malformed values **without printing secrets or full E.164 numbers**. It also probes SQLite writability (without altering the real database), DNS/TLS plus `/healthz` and `/webhooks/openai` on `PUBLIC_BASE_URL`, and non-billable Twilio/OpenAI metadata. Exa search and the OpenAI webhook signing secret stay **UNVERIFIED** because there is no side-effect-free check; the command then exits 1 and does not claim complete live readiness. It fails if `AGENT_CALL_PROFILE=evaluation`.
+`doctor --live-ready` reports missing, blank, or malformed values **without printing secrets or full E.164 numbers**. It also probes SQLite writability (without altering the real database), DNS/TLS plus `/healthz` and `/webhooks/openai` on `PUBLIC_BASE_URL`, and non-billable Twilio/OpenAI metadata. A configured Exa key and the OpenAI webhook signing secret stay **UNVERIFIED** because there is no side-effect-free check (missing Exa is reported as optional/disabled); the command then exits 1 and does not claim complete live readiness. It fails if `AGENT_CALL_PROFILE=evaluation`.
 
-Then run a prepare-only MCP client call (or `uv run agent-call smoke-prepare` against that process using your live MCP bearer). Do not invoke `start_phone_call` until a separately authorized canary.
+Then use the browser connector to prepare a plan with your actual configured owner and target. `smoke-prepare` uses evaluation-owner fixtures and is only a dummy-instance check. Do not invoke `start_phone_call` until a separately authorized canary.
 
-### Point an agent at it
+### Connect ChatGPT or Claude web
 
-**OpenClaw**
+Follow [browser-clients.md](browser-clients.md). Both clients use the same OAuth
+endpoint, `https://YOUR_HOST/connect/mcp/`. Their account settings and approval
+interfaces differ. Verify the real browser workflow before claiming support.
 
-```bash
-openclaw mcp add agent-call \
-  --url https://YOUR_HOST/mcp/ \
-  --transport streamable-http \
-  --header "Authorization: Bearer <MCP_BEARER_TOKEN>" \
-  --header "X-Agent-User-Id: <ALLOWED_AGENT_USER_ID>"
-openclaw mcp probe agent-call
-```
+For advanced clients that accept custom HTTP headers, the existing `/mcp/`
+endpoint remains available with `Authorization: Bearer <MCP_BEARER_TOKEN>` and
+`X-Agent-User-Id: <ALLOWED_AGENT_USER_ID>`. Other harnesses are outside the first
+release's supported-client scope.
 
-Optional reverse channel (wake on mid-call questions and post-call summaries): enable hooks in `openclaw.json`, then set:
-
-```text
-AGENT_PUSH_ENABLED=true
-AGENT_WEBHOOK_URL=https://YOUR_GATEWAY/hooks/agent
-AGENT_WEBHOOK_TOKEN=<hooks.token>
-```
-
-**Hermes Agent** (`~/.hermes/config.yaml`)
-
-```yaml
-mcp_servers:
-  agent-call:
-    url: "https://YOUR_HOST/mcp/"
-    headers:
-      Authorization: "Bearer <MCP_BEARER_TOKEN>"
-      X-Agent-User-Id: "<ALLOWED_AGENT_USER_ID>"
-```
-
-Hermes has no inbound webhook today — leave `AGENT_PUSH_ENABLED=false` and rely on `wait_for_call_event` polling (fully supported; push is best-effort and non-canonical).
-
-**Grok Bot** (private custom MCP connector, not Grok Build): see [docs/grok-bot/README.md](grok-bot/README.md). OpenClaw and Hermes keep using `/mcp/` with both headers. Grok Bot should use the optional OAuth endpoint `/grok/mcp/` so the connector UI only needs Name and Server URL. OAuth is **off by default** and is a self-hosted, single-owner authorization flow — not a managed multi-tenant product. Leave `AGENT_PUSH_ENABLED=false` and poll `wait_for_call_event`.
-
-Manual MCP client config:
-
-```text
-URL:             https://YOUR_HOST/mcp/
-Authorization:   Bearer MCP_BEARER_TOKEN
-X-Agent-User-Id: ALLOWED_AGENT_USER_ID
-Transport:       Streamable HTTP
-```
-
-Both the bearer token and `X-Agent-User-Id` are required on every MCP request.
-
-## Optional Grok OAuth (self-hosted, single-owner)
+## Browser OAuth (self-hosted, single-owner)
 
 This is **not** the managed multi-tenant design. Each operator owns their
 deployment, domain, database, secrets, OAuth authorization, Twilio account, and
-OpenAI account. Operators who do not use Grok Bot leave OAuth disabled and keep
+OpenAI account. Operators who do not use browser connectors leave OAuth disabled and keep
 the dual-header `/mcp/` setup.
 
-**Implemented locally; pending live Grok OAuth verification.**
+**Browser verification is tracked in [browser-clients.md](browser-clients.md).**
 
 1. Generate a dedicated owner secret and store the plaintext only in a password
    manager. Hash it; the server stores only the Argon2id hash:
 
    ```bash
-   uv run python scripts/hash_grok_oauth_owner_secret.py
+   uv run python scripts/hash_mcp_oauth_owner_secret.py
    ```
 
 2. Generate signing and storage keys (`openssl rand -hex 32` for each).
 3. Set:
 
    ```text
-   GROK_MCP_OAUTH_ENABLED=true
-   GROK_MCP_OAUTH_OWNER_SECRET_HASH=<argon2id hash>
-   GROK_MCP_OAUTH_SIGNING_KEY=<32+ character secret>
-   GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY=<32+ character secret>
-   GROK_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
-   GROK_MCP_OAUTH_REFRESH_TOKEN_TTL_DAYS=90
-   GROK_MCP_OAUTH_AUTH_CODE_TTL_SECONDS=300
+   MCP_OAUTH_ENABLED=true
+   MCP_OAUTH_OWNER_SECRET_HASH=<argon2id hash>
+   MCP_OAUTH_SIGNING_KEY=<32+ character secret>
+   MCP_OAUTH_STORAGE_ENCRYPTION_KEY=<32+ character secret>
+   MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
+   MCP_OAUTH_REFRESH_TOKEN_TTL_DAYS=90
+   MCP_OAUTH_AUTH_CODE_TTL_SECONDS=300
    ```
 
 4. Confirm no active calls, then deploy only after explicit approval.
-5. In Grok, add a custom connector using **only Name and Server URL**:
-   `https://YOUR_HOST/grok/mcp/`
+5. In ChatGPT or Claude, add a custom connector using **only Name and Server URL**:
+   `https://YOUR_HOST/connect/mcp/`
 6. Complete browser authorization on this Agent Call instance. The owner secret
-   is entered on Agent Call's page; it never passes through Grok chat.
+   is entered on Agent Call's page; it never passes through chat.
 7. Verify with `tools/list`, then `prepare_phone_call` only. Do not call
    `start_phone_call` until you intend to place a billable call.
 
@@ -202,15 +169,15 @@ Exact URLs when OAuth is enabled (`PUBLIC_BASE_URL=https://YOUR_HOST`):
 
 | Purpose | URL |
 | --- | --- |
-| Grok MCP (Streamable HTTP) | `https://YOUR_HOST/grok/mcp/` |
-| Protected resource metadata | `https://YOUR_HOST/.well-known/oauth-protected-resource/grok/mcp/` |
+| Browser MCP (Streamable HTTP) | `https://YOUR_HOST/connect/mcp/` |
+| Protected resource metadata | `https://YOUR_HOST/.well-known/oauth-protected-resource/connect/mcp/` |
 | Authorization server metadata | `https://YOUR_HOST/.well-known/oauth-authorization-server` |
 | Authorize | `https://YOUR_HOST/authorize` |
-| Owner consent | `https://YOUR_HOST/grok/oauth/consent` |
+| Owner consent | `https://YOUR_HOST/oauth/consent` |
 | Token | `https://YOUR_HOST/token` |
 | Client registration | `https://YOUR_HOST/register` |
 | Token revocation | `https://YOUR_HOST/revoke` |
-| Revoke all Grok families | `POST https://YOUR_HOST/internal/grok-oauth/revoke-all` with `Authorization: Bearer $DEBUG_API_TOKEN` |
+| Revoke all OAuth families | `POST https://YOUR_HOST/internal/mcp-oauth/revoke-all` with `Authorization: Bearer $DEBUG_API_TOKEN` |
 | Legacy MCP (unchanged) | `https://YOUR_HOST/mcp/` |
 
 Access tokens last **1 hour**. Refresh tokens last up to **90 days** and rotate
@@ -220,7 +187,7 @@ expires, authorization is revoked, refresh-token reuse is detected, the
 connector is removed, the OAuth signing key or owner secret is rotated, or
 persistent OAuth state is cleared.
 
-Public `/register` (dynamic client registration) stays compatible with Grok's
+Public `/register` (dynamic client registration) stays compatible with the browser
 connector UI: there is no extra callback-URI allowlist. To keep SQLite bounded,
 the host stores at most **64** OAuth clients. Unused clients older than **30
 days** are evicted first; if the table is still full, the oldest unused clients
@@ -239,15 +206,15 @@ a token pair is issued; valid durable refresh families are left untouched.
 
 Changing `PUBLIC_BASE_URL` (including a free-tier tunnel restart) does not
 re-derive the storage encryption key. Existing OAuth ciphertext stays readable;
-the operator still removes the old Grok connector and adds the new URL.
-Rotating `GROK_MCP_OAUTH_OWNER_SECRET_HASH` or `GROK_MCP_OAUTH_SIGNING_KEY`
-revokes existing Grok families on the next boot. Rotating
-`GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY` fails closed until the OAuth tables are
+the operator still removes the old browser connector and adds the new URL.
+Rotating `MCP_OAUTH_OWNER_SECRET_HASH` or `MCP_OAUTH_SIGNING_KEY`
+revokes existing OAuth families on the next boot. Rotating
+`MCP_OAUTH_STORAGE_ENCRYPTION_KEY` fails closed until the OAuth tables are
 intentionally cleared. Do not change these secrets while a call is active.
 
-Rollback: if a Grok OAuth deploy misbehaves, set `GROK_MCP_OAUTH_ENABLED=false`
+Rollback: if a browser OAuth deploy misbehaves, set `MCP_OAUTH_ENABLED=false`
 (or roll back the previous image) after the deployment lease is acquired. Legacy
-`/mcp/` clients are unaffected. Grok Voice remains out of scope. Real calls
+`/mcp/` clients are unaffected. Chat voice-mode integration is not claimed. Real calls
 remain billable.
 
 ## Deploying (your own Fly app)
@@ -316,7 +283,7 @@ Redeploying a prior image restores only the application image without a full reb
 
 ## Live SIP canary
 
-See the [README](../README.md#live-sip-canary). Those commands place a real billable call. Contributors should not run them casually; they are for the operator of a deployment that already has real credentials and a human on `OWNER_PHONE_E164`.
+See the [manual SIP canary guide](live-sip-canary.md). Those commands place a real billable call. Contributors should not run them casually; they are for the operator of a deployment that already has real credentials and a human on `OWNER_PHONE_E164`.
 
 ## Tuning knobs (timeouts, VAD, search)
 
@@ -343,3 +310,13 @@ Live-schema deviations from the original contract are intentional:
 ## Result semantics
 
 Telephony state and extraction state remain separate. A successful phone call whose extractor fails stays `call_status=completed`, gets `finalization_status=failed`, `outcome=unknown`, retains its raw transcript, and tells the owner to review it. The service saves a telephony-only result and transcript transactionally before making the external Responses API extraction request. Only transient connection, timeout, or rate-limit failures receive one retry.
+
+## Migration from the earlier connector prototype
+
+The first release targets ChatGPT and Claude. The old `/grok/mcp/` endpoint and
+`GROK_MCP_OAUTH_*` settings are removed. Configure `MCP_OAUTH_*` instead, and
+reconnect each client at `/connect/mcp/`. If migrating an existing OAuth database,
+retain the owner hash, signing key, and storage key values: key derivation labels
+remain unchanged to keep stored ciphertext readable. Old access tokens are bound
+to the old resource URL and are rejected at the new endpoint; reconnect rather
+than reusing them. Never clear call or transcript tables to change a connector.

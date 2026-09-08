@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.smoke_prepare import EXPECTED_TOOLS, parse_mcp_payload, tool_payload
 
-GROK_MCP_HEADERS = {
+OAUTH_MCP_HEADERS = {
     "Authorization": "Bearer mcp-test",
     "X-Agent-User-Id": "agent-user-1",
     "Accept": "application/json, text/event-stream",
@@ -24,7 +24,7 @@ def _parse_mcp_payload(response) -> dict[str, Any]:
 
 
 def _mcp_session_headers(response) -> dict[str, str]:
-    headers = dict(GROK_MCP_HEADERS)
+    headers = dict(OAUTH_MCP_HEADERS)
     session_id = response.headers.get("mcp-session-id")
     if session_id:
         headers["mcp-session-id"] = session_id
@@ -39,11 +39,11 @@ def _prepare_arguments() -> dict[str, Any]:
                 "timezone": "America/Los_Angeles",
                 "callback_number": "+14155550101",
             },
-            "target": {"name": "Grok Bot Target", "phone": "+14155550100"},
+            "target": {"name": "MCP client Target", "phone": "+14155550100"},
             "objective": "Ask the callee to say nonce AGENT-4821 and acknowledge it.",
             "escalation": {"mode": "end_call", "owner_phone": "+14155550101"},
         },
-        "authority_basis": "Owner requested this Grok Bot connection test",
+        "authority_basis": "Owner requested this MCP client connection test",
         "requested_by_owner": True,
     }
 
@@ -57,7 +57,7 @@ def _tool_payload(response) -> dict[str, Any]:
 
 
 @respx.mock
-def test_grok_compatible_mcp_client_prepares_without_provider_calls(settings):
+def test_header_compatible_mcp_client_prepares_without_provider_calls(settings):
     app = create_app(settings)
     with TestClient(app) as client:
         initialize = client.post(
@@ -69,10 +69,10 @@ def test_grok_compatible_mcp_client_prepares_without_provider_calls(settings):
                 "params": {
                     "protocolVersion": "2025-03-26",
                     "capabilities": {},
-                    "clientInfo": {"name": "grok-bot-compatible", "version": "0"},
+                    "clientInfo": {"name": "mcp-client-compatible", "version": "0"},
                 },
             },
-            headers=GROK_MCP_HEADERS,
+            headers=OAUTH_MCP_HEADERS,
         )
         assert initialize.status_code == 200
         init_payload = _parse_mcp_payload(initialize)
@@ -118,7 +118,7 @@ def test_grok_compatible_mcp_client_prepares_without_provider_calls(settings):
 
 
 @respx.mock
-def test_grok_compatible_mcp_client_rejects_either_missing_credential(settings):
+def test_header_compatible_mcp_client_rejects_either_missing_credential(settings):
     app = create_app(settings)
     payload = {"jsonrpc": "2.0", "id": 9, "method": "tools/list"}
     with TestClient(app) as client:

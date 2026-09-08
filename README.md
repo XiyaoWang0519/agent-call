@@ -4,228 +4,113 @@
 [![Secret scan](https://github.com/XiyaoWang0519/agent-call/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/XiyaoWang0519/agent-call/actions/workflows/secret-scan.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Status: early-stage v0.x](https://img.shields.io/badge/status-early--stage%20v0.x-yellow.svg)](#project-status)
 
-Agent Call is a **self-hosted, single-owner MCP bridge** that connects an AI agent to outbound phone calls through [OpenAI Realtime SIP](https://developers.openai.com/api/docs/guides/realtime-sip) and [Twilio](https://www.twilio.com).
+Agent Call lets an AI assistant make phone calls on your behalf. Give it a task, review the call plan, and explicitly confirm before it dials. You can follow the call, provide answers, stop it, and retrieve the result and transcript.
 
-An MCP client such as OpenClaw, Hermes Agent, or a private Grok Bot custom MCP connector prepares, confirms, starts, monitors, and ends calls. Twilio places an OpenAI SIP voice agent into a private conference, the service prewarms `gpt-realtime-2.1` over a sideband WebSocket, and only then rings the callee. SQLite stores plans, call state, ordered transcripts, and deterministic final results.
+Developed with Codex, Agent Call uses OpenAI Realtime SIP (`gpt-realtime-2.1`) for the phone conversation and Twilio to reach the recipient. You run the service yourself, using your own OpenAI and Twilio accounts.
 
-## Two products
+**Works with ChatGPT Work and Claude web, verified with real question-and-answer calls. It does not work in regular ChatGPT mode.** See [client setup, test results, and verification limits](docs/browser-clients.md).
 
-| Edition | Status | What you run |
+## What you need
+
+| Requirement | Try locally without calls | Make real calls |
 | --- | --- | --- |
-| **Agent Call Self-Hosted** | This public MIT repository | Your process, your SQLite file, your Twilio and OpenAI accounts. Complete and useful on its own. |
-| **Agent Call Managed** | Forthcoming private service | A separately operated product. It is **not** configured from this README and is not mixed into the self-host setup. |
+| Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/) or pip | Required | Required for local installation |
+| OpenAI API project with Realtime SIP access | No | API key, project ID, and webhook signing secret |
+| Twilio account and voice-capable caller number | No | Account SID, auth token, outbound SIP and conference support |
+| Your phone number | No | Owner callback number, in international E.164 format |
+| Public HTTPS address | No | A tunnel to your computer, or a hosted instance; used by webhooks and browser clients |
+| ChatGPT Work or Claude web access with custom connectors | No | Required to use that chat interface; availability depends on account/workspace settings |
 
-The public edition does not phone home, does not include a remote license check, and does not require a managed account.
+**Optional:** an [Exa](https://exa.ai) key enables in-call web search. Without it, the service runs with search disabled. Docker Compose is an alternative for local evaluation; Fly.io is an optional hosting provider. SQLite is included—no separate database service is needed. A managed Agent Call account is not required.
 
-## Project status
+OpenAI API usage and Twilio calls are billed through your own accounts, separately from any chat subscription.
 
-This is an **early-stage / v0.x self-hosted reference implementation**. Package metadata currently reports version `0.1.0`, but there is **no tagged GitHub release** yet. The project is intended for a single operator running their own instance. It is not a hosted product and not a multi-tenant platform.
+## 1. Install and try it locally
 
-## Who it is for
-
-- Operators who want **their own** agent to place outbound calls on their behalf
-- Contributors evaluating the architecture, safety rails, and test suite without spending money
-- Maintainers of a single-owner deployment who can accept SQLite and one-instance constraints
-
-## What it does
-
-- Validate a call plan against destination policy and persist it without dialing
-- Require explicit confirmation before any callee is rung
-- Prewarm the OpenAI SIP agent, then dial the callee into a Twilio conference with answering-machine detection
-- Expose seven MCP tools for prepare / start / monitor / snapshot / mid-call answers / end / final result
-- Keep `wait_for_call_event` polling as the canonical live-call loop; optional agent webhook push is best-effort
-- Persist transcripts and a deterministic final result even when post-call extraction fails
-
-## Non-goals and limitations
-
-- **Single-owner architecture.** One configured owner phone, one allowed agent user id, one MCP bearer. This is not a general multi-tenant calling platform.
-- **SQLite and one instance.** Call state is volume-local. A second Fly Machine (or a second process sharing the same public URL) will not share state correctly.
-- **Real OpenAI and Twilio costs.** Live calls bill Realtime SIP audio plus Twilio voice. Pytest does not place calls; the SIP canary and opt-in live phone harness do.
-- **You own compliance.** Consent, recording, robocall, disclosure, and retention rules are jurisdiction-specific. The owner remains responsible. Transcripts are retained; apply retention independently of extraction success or failure.
-- **Not a drop-in hosted service.** Forks must provision their own Twilio, OpenAI, Exa, and compute accounts. The committed `fly.toml` is a template (`YOUR_FLY_APP_NAME`); it does not deploy to a maintainer app.
-
-## Safety properties
-
-- The legacy MCP endpoint (`/mcp/`) requires its bearer token **and** a matching `X-Agent-User-Id` on every request. Optional Grok OAuth on `/grok/mcp/` is disabled by default and does not replace that gate.
-- Every OpenAI and Twilio webhook is signature-verified; OpenAI delivery IDs are replay-protected.
-- A call cannot start without an unexpired prepared plan **and** explicit confirmation text.
-- Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
-- The voice model may not share or request passwords, auth codes, payment credentials, or government identifiers. It chooses how to open from the approved call context; the bridge does not impose identity, disclosure, or recipient-confirmation wording.
-- The agent can press automated phone-menu (IVR) keys via a signed announce webhook, but is instructed never to enter payment, authentication, or identity digits that way.
-- The in-call model decides when the conversation is done and invokes its private `end_call` function; the bridge asks for one final spoken goodbye, waits for it, then tears down OpenAI and Twilio.
-- Evaluation/dummy profile: `prepare_phone_call` still persists a plan; `start_phone_call` returns `live_calls_disabled` before any OpenAI or Twilio client request.
-
-> [!WARNING]
-> Do not deploy or restart while a call is active. Recovery stops stranded billable media and finalizes missing results, but a process restart necessarily ends the live call.
-
-## Golden path: evaluate without credentials
-
-Lint, type-check, test, and boot a dummy instance with **no OpenAI key, Twilio account, phone number, or paid API usage**. External services are mocked in `tests/conftest.py`; tests use a temporary SQLite database. **No call is placed.**
-
-Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/) (CI uses uv `0.9.27` and Python 3.13).
+The `0.1.0` wheel and source distribution are attached to the [GitHub release](https://github.com/XiyaoWang0519/agent-call/releases/tag/v0.1.0). They are not currently published to PyPI. Download an artifact from that release, or build from this checkout using the [package release guide](docs/package-release.md):
 
 ```bash
-uv sync --all-groups --frozen
-uv run ruff format --check app tests scripts
-uv run ruff check app tests scripts
-uv run mypy app
-uv run pytest -q --cov=app
-uv run agent-call doctor --dummy
+uv tool install /absolute/path/to/agent_call-0.1.0-py3-none-any.whl
+mkdir agent-call-home
+cd agent-call-home
+agent-call doctor --dummy
+agent-call serve --profile evaluation --host 127.0.0.1 --port 8000
 ```
 
-### Dummy boot (source)
+Replace the example wheel path with its actual location. If the shell cannot find `agent-call`, run `uv tool update-shell` and open a new terminal. A [pip virtual environment alternative](docs/package-release.md#install-with-pip) is available.
 
-The evaluation listener binds loopback unless you pass `--unsafe-bind`. Core credentials in `.env.local` or the process environment plus bare `agent-call serve` do not silently go live; pass `--profile evaluation` (dummy) or `--profile live` (this will place billable calls).
-
-```bash
-uv run agent-call serve --profile evaluation --host 127.0.0.1 --port 8000
-```
-
-In another terminal:
+Your current directory is the configuration and data directory. Always run setup, doctor, and serve from the same `agent-call-home` directory. No API keys or `.env.local` file are needed for evaluation. Leave the server running. In another terminal, change to that same directory and run:
 
 ```bash
 curl -fsS http://127.0.0.1:8000/healthz
-uv run agent-call doctor --prepare-only
-uv run agent-call smoke-prepare
+agent-call smoke-prepare
 ```
 
-`smoke-prepare` initializes MCP, lists exactly seven tools, prepares a plan, and never invokes `start_phone_call`. Starting a confirmed plan in this profile returns `live_calls_disabled`.
+A successful smoke check prints `OK prepare-only smoke`: it connects, lists the seven tools, and prepares a plan. **It does not make a call.** Evaluation mode blocks starting calls with `live_calls_disabled`.
 
-`uv run python -m app` is equivalent to `uv run agent-call`.
+Contributing from source? Clone this repository, run `uv sync --all-groups --frozen`, and prefix the commands above with `uv run`. For Docker evaluation, run `docker compose up --build` from the checkout and use the same health and smoke checks (`uv run agent-call smoke-prepare`). Docker binds to localhost and keeps SQLite in a named volume. See [troubleshooting](docs/troubleshooting.md) for errors.
 
-### Dummy boot (Compose)
+## 2. Start with automatic local setup
+
+Stop the evaluation server with Ctrl-C, then run:
 
 ```bash
-docker compose up --build
+agent-call start
 ```
 
-Compose publishes `127.0.0.1:8000` only, uses a named volume for SQLite, runs as the image's non-root user after the entrypoint, and sets `AGENT_CALL_PROFILE=evaluation`. No provider credentials are passed into the image.
+On first launch, this command downloads and verifies its own pinned Cloudflare tunnel helper, obtains a temporary public HTTPS address without an extra tunnel account, and guides you through configuration. You do not need to install Docker, Git, ngrok, or cloudflared separately. Internet access is required for package dependencies, the helper download, and service connections.
 
-Then `uv run agent-call smoke-prepare` against `http://127.0.0.1:8000`.
+Enter your OpenAI API key, project ID and webhook signing secret; Twilio account SID, auth token and voice number; your owner callback number, name and timezone; and a dedicated browser login password. Exa is optional. The wizard displays the exact OpenAI webhook URL to configure for `realtime.call.incoming`. It generates the service tokens and OAuth keys and stores only a hash of the owner login password.
 
-If you already have a running dummy server, `scripts/live_smoke.sh` is a broader Grok-compatible handshake (including optional OAuth) that still never calls `start_phone_call`.
+Configuration and SQLite data live in `~/.agent-call`, independent of the current working directory. `--directory /path/to/private-folder` selects a separate instance. Existing configuration and authentication keys are reused. The command starts both the service and tunnel and displays the browser connector URL. Keep that terminal open and the computer awake through calls and finalization. Ctrl-C waits for idle calls before stopping.
 
-## How a call happens
+The temporary address can change on each start. The launcher updates its own `PUBLIC_BASE_URL`, but you must update the OpenAI project webhook and recreate browser connectors when the address changes. This account-free option is for local trials; use a stable HTTPS origin or a [hosted instance](docs/self-hosting.md#deploying-your-own-fly-app) for continuous use.
 
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant B as Bridge
-    participant O as OpenAI SIP agent
-    participant T as Twilio
-    participant C as Callee
+To try the same launcher with dialing disabled, pass `--profile evaluation`; setup still collects configuration, but no calls can start. Live mode is the default for `start`, and every call still requires a reviewed plan and explicit confirmation. Provider accounts, webhook setup and browser authorization cannot be supplied by pip itself.
 
-    A->>B: prepare_phone_call (plan + policy checks)
-    A->>B: start_phone_call (explicit confirmation)
-    B->>T: create conference, dial OpenAI SIP leg
-    O-->>B: realtime.call.incoming webhook
-    B->>O: accept + prewarm over sideband WebSocket
-    B->>T: now dial the callee (with AMD)
-    T->>C: ring
-    O<<->>C: conversation (transcribed live)
-    O->>B: end_call → one spoken goodbye → teardown
-    A->>B: wait_for_call_event → get_call_result
+For a manually managed HTTPS origin, the separate `agent-call setup` and `agent-call serve` commands remain available; they use configuration in the current directory. See [local browser setup](docs/local-browser-setup.md) and [advanced self-hosting](docs/self-hosting.md#configure). The default destination policy permits `+1` numbers.
+
+## 3. Connect ChatGPT Work or Claude web
+
+`agent-call start` enables OAuth for browser clients during first-run setup. Use this server URL in your chat client's custom connector settings:
+
+```text
+https://YOUR_HOST/connect/mcp/
 ```
 
-The callee's phone never rings until the AI is already on the line, warmed up, and ready to speak.
+- **ChatGPT Work:** enable developer mode if your account/workspace permits it, create a custom app or plugin, and select OAuth. Attach the connector in Work; regular ChatGPT Chat could not prepare calls in our test.
+- **Claude web:** add a custom connector with a name and the remote MCP server URL.
 
-See [docs/architecture.md](docs/architecture.md) for components, state, persistence, and webhook verification.
+Complete authorization on your own Agent Call page using the owner login password you chose during setup. For an existing instance, follow the [manual browser OAuth configuration](docs/browser-clients.md). That guide also records UI steps, account restrictions, and exactly which checks have passed. Successful local tests do not establish browser compatibility.
 
-## MCP tools
+For a client that can send custom HTTP headers, the separate `/mcp/` endpoint requires both `Authorization: Bearer <MCP_BEARER_TOKEN>` and `X-Agent-User-Id: <ALLOWED_AGENT_USER_ID>` on every request. See [self-hosting](docs/self-hosting.md) for details.
 
-The server exposes exactly seven MCP tools:
+## 4. Prepare your first call
 
-| Tool | What it does |
-| --- | --- |
-| `prepare_phone_call` | Validate destination policy, persist a plan |
-| `start_phone_call` | Explicit confirmation → dial |
-| `wait_for_call_event` | Canonical live-call monitoring loop |
-| `get_phone_call` | Snapshot of call state |
-| `answer_call_question` | Feed an answer to the live agent |
-| `end_phone_call` | Manual stop button |
-| `get_call_result` | Deterministic final result + transcript |
+Tell your connected assistant the configured owner name, callback number, and timezone. Then ask it to prepare a call with the recipient's number, your objective, and the information it is allowed to share. For example:
 
-During a live call, `wait_for_call_event` is the canonical monitoring loop; once it reports a terminal state, call `get_call_result`. Agent push is optional and non-canonical — a push failure is logged and never changes call state.
+> Prepare a call to the repair shop at [phone number] to ask whether they can fix my bicycle this week. Only ask about availability; do not book anything. Show me the plan before dialing.
 
-## Golden path: local live (prepare-only first)
+Review the recipient and plan before explicitly confirming. Preparation never dials; starting a confirmed call in the live profile can incur OpenAI and Twilio charges. Afterward, ask for the result and transcript.
 
-Full environment, tunnel, webhook, and agent-client instructions: [docs/self-hosting.md](docs/self-hosting.md).
+For deployment acceptance, follow the [manual phone check](docs/live-sip-canary.md), which requires a person answering the owner's phone. Automated testing against dedicated test numbers has a separate [live-phone runbook](docs/live-phone-runbook.md).
 
-```bash
-test -e .env.local || cp .env.example .env.local
-# Fill live values, boot the live-profile server, then expose a public HTTPS origin.
-uv run agent-call doctor --live-ready
-```
+## Project status and limits
 
-Run `doctor --live-ready` only after the live server and HTTPS tunnel or deployment are available. It reports missing or invalid prerequisites **without printing secret values or full phone numbers**, then probes SQLite writability and public-origin health. Exa and the webhook signing secret stay unverified. Then run a prepare-only MCP smoke against the live-profile process. Do not call `start_phone_call` until you intend to ring a real phone.
+This is an **early-stage, v0.x, single-owner project** under the MIT license. Run one service instance with persistent SQLite storage. Do not deploy or restart during an active call. You are responsible for consent, disclosure, and transcript retention for your use case.
 
-> [!CAUTION]
-> Any command that reaches a configured Twilio/OpenAI environment can place a **real billable phone call**. Do not run the live SIP canary, point webhooks at a shared production host, or deploy with real secrets until you intend to spend money and ring a real phone.
+This public self-hosted edition runs on your accounts and infrastructure, without a managed account, remote license check, or phone-home requirement. A separate managed service is forthcoming.
 
-## Golden path: supported web host
+## Learn more
 
-Create **your** Fly app from the template `fly.toml` (`app = 'YOUR_FLY_APP_NAME'`). Replace that placeholder, set secrets, and deploy with `--ha=false`. Details: [docs/self-hosting.md](docs/self-hosting.md#deploying-your-own-fly-app).
+- [Self-hosting](docs/self-hosting.md): configuration, tunnels, deployment, rollback, and tuning
+- [Browser clients](docs/browser-clients.md): ChatGPT Work and Claude web setup and verification status
+- [Technical reference](docs/reference.md): call sequence, MCP tools, safety properties, and components
+- [Architecture](docs/architecture.md): state machine, persistence, webhooks, and finalization
+- [Package release](docs/package-release.md): build, install, verify, and prepare a release
+- [Contributing](CONTRIBUTING.md): credential-free tests, lint, and development workflow
+- [Implementation records](docs/implementation/) and [live testing handoff](docs/live-phone-handoff.md): deeper contributor and operator notes
+- [Support](SUPPORT.md) · [Security](SECURITY.md) · [Code of conduct](CODE_OF_CONDUCT.md) · [Maintainers](MAINTAINERS.md) · [Changelog](CHANGELOG.md) · [License](LICENSE)
 
-Forks must not copy a maintainer overlay. The user template does not name a pre-existing production app.
-
-## Live SIP canary
-
-For unattended real calls to dedicated automated callee and owner numbers, use the
-[automated live-phone harness](docs/live-phone-runbook.md). It records received audio,
-tests conversation and tools, and reports independent audio and provider-cleanup evidence.
-The manual canary below still requires a person with a phone.
-
-> [!CAUTION]
-> The following commands place a **real billable call** to `OWNER_PHONE_E164`. They need real credentials, a public HTTPS URL, and a human with a phone. Do not run them in CI, on a fork against someone else's app, or casually while browsing the repo.
-
-Before trusting a deployment, make it prove itself with a real call:
-
-```bash
-uv run python scripts/run_sip_canary.py --mode full
-```
-
-Answer the phone, say the printed nonce when asked, and talk over the assistant once. Then run the second variant to prove the deterministic finalizer does not depend on `record_call_outcome`:
-
-```bash
-uv run python scripts/run_sip_canary.py --mode no-outcome-tool
-```
-
-Both exit nonzero if any gate fails. The debug evidence endpoint they use requires `DEBUG_API_TOKEN`.
-
-> [!NOTE]
-> No mini realtime model can be selected by configuration in v1. Do not relax the `realtime_model` literal or the `MINI_MODELS_ENABLED=false` gate until that exact model passes both canaries, including SIP tool calling.
-
-## Documentation
-
-For future agents and local sessions, start with the [live phone testing handoff](docs/live-phone-handoff.md).
-
-| Doc | Contents |
-| --- | --- |
-| [docs/architecture.md](docs/architecture.md) | Components, state machine, SQLite, webhooks, confirmation, finalization |
-| [docs/self-hosting.md](docs/self-hosting.md) | Local and web golden paths, tunnels, Fly/Render, rollback, tuning |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Dummy boot, doctor, MCP auth, `live_calls_disabled` |
-| [docs/grok-bot/README.md](docs/grok-bot/README.md) | Private Grok Bot custom MCP connector, optional OAuth, copy-paste skill, Dev Phone |
-| [docs/implementation/](docs/implementation/) | Builder operating record (Phase 1; ADR-001) |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Credential-free setup, lint/test commands, PR expectations |
-| [SECURITY.md](SECURITY.md) | Vulnerability reporting |
-| [SUPPORT.md](SUPPORT.md) | Questions and bug reports |
-| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standard |
-| [MAINTAINERS.md](MAINTAINERS.md) | Maintainer |
-| [CHANGELOG.md](CHANGELOG.md) | Unreleased changes |
-| [LICENSE](LICENSE) | MIT |
-
-Maintainer-only production overlay notes live in [docs/maintainer-deploy.md](docs/maintainer-deploy.md). Public users and forks can ignore that file.
-
-## Built with
-
-| Piece | Job |
-| --- | --- |
-| OpenClaw / Hermes Agent / Grok Bot | MCP client, call intent, optional OpenClaw webhook wake |
-| [OpenAI Realtime SIP](https://developers.openai.com/api/docs/guides/realtime-sip) | Voice agent, accept, sideband control |
-| [Twilio](https://www.twilio.com) | Conference, callee dial, answering-machine detection |
-| [Exa](https://exa.ai) | In-call public-web search |
-| [FastAPI](https://fastapi.tiangolo.com) + FastMCP | HTTP surface and MCP tools |
-| [Fly.io](https://fly.io) | Optional one-instance web host, volume-backed SQLite |
-| [Astral](https://astral.sh) uv / Ruff | Package lock and lint |
+Maintainer deployment details are in [maintainer-deploy.md](docs/maintainer-deploy.md).

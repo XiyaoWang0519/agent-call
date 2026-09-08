@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Hash a Grok OAuth owner secret with Argon2id.
+"""Hash a MCP OAuth owner secret with Argon2id.
 
 The plaintext secret is never accepted as a command-line argument and is never
 written to disk. Store the original secret in a password manager. Configure
-only the printed hash as GROK_MCP_OAUTH_OWNER_SECRET_HASH.
+only the printed hash as MCP_OAUTH_OWNER_SECRET_HASH.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import getpass
 import sys
 from pathlib import Path
 
-# `uv run python scripts/hash_grok_oauth_owner_secret.py` puts `scripts/` on
+# `uv run python scripts/hash_mcp_oauth_owner_secret.py` puts `scripts/` on
 # sys.path[0], not the repo root. Always load the local `app` package.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -20,8 +20,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from argon2 import PasswordHasher  # noqa: E402
 
-from app.grok_oauth.constants import OWNER_SECRET_MIN_LENGTH  # noqa: E402
-from app.grok_oauth.crypto import hash_owner_secret, is_argon2id_hash  # noqa: E402
+from app.mcp_oauth.constants import OWNER_SECRET_MIN_LENGTH  # noqa: E402
+from app.mcp_oauth.crypto import hash_owner_secret, is_argon2id_hash  # noqa: E402
 
 
 def main() -> int:
@@ -47,7 +47,7 @@ def main() -> int:
     PasswordHasher().verify(hashed, first)
     print(hashed)
     print()
-    print("Set GROK_MCP_OAUTH_OWNER_SECRET_HASH to the hash above.")
+    print("Set MCP_OAUTH_OWNER_SECRET_HASH to the hash above.")
     print("Do not store the plaintext secret on the server.")
     return 0
 

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+from pydantic import SecretStr
+
 from app.openai_realtime import RealtimeBridge
 
 
@@ -186,6 +189,20 @@ def test_activation_echo_must_preserve_configured_semantic_vad(settings):
     assert bridge.activation_update_confirmed(event)
     event["session"]["audio"]["input"]["turn_detection"]["eagerness"] = "high"
     assert not bridge.activation_update_confirmed(event)
+
+
+@pytest.mark.parametrize("key", [None, SecretStr(""), SecretStr("  ")])
+def test_no_exa_omits_search_tool_and_search_instructions(settings, packet, key):
+    settings.exa_api_key = key
+    settings.ask_agent_enabled = True
+    bridge = RealtimeBridge(
+        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
+    )
+    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
+    assert "search_web" not in {tool["name"] for tool in payload["tools"]}
+    assert "search_web" not in payload["instructions"]
+    assert "Web search is unavailable" in payload["instructions"]
+    assert "ask_agent" in {tool["name"] for tool in payload["tools"]}
 
 
 def test_default_server_vad_payload_preserves_latency_settings(packet):

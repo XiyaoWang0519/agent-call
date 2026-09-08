@@ -3,8 +3,8 @@ from __future__ import annotations
 import respx
 from fastapi.testclient import TestClient
 
-from app.grok_oauth.constants import GROK_MCP_PATH
 from app.main import create_app
+from app.mcp_oauth.constants import OAUTH_MCP_PATH
 from app.smoke_prepare import EXPECTED_TOOLS
 from tests.oauth_helpers import (
     complete_owner_login,
@@ -12,7 +12,7 @@ from tests.oauth_helpers import (
     parse_mcp_payload,
     register_test_client,
 )
-from tests.test_grok_bot_mcp import _prepare_arguments, _tool_payload
+from tests.test_mcp_client import _prepare_arguments, _tool_payload
 
 
 @respx.mock
@@ -23,7 +23,7 @@ def test_oauth_mcp_lists_seven_tools_and_prepares_without_provider_calls(oauth_s
         tokens = complete_owner_login(client, registered=registered, settings=oauth_settings)
         headers = mcp_headers(tokens["access_token"])
         initialize = client.post(
-            GROK_MCP_PATH,
+            OAUTH_MCP_PATH,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -31,7 +31,7 @@ def test_oauth_mcp_lists_seven_tools_and_prepares_without_provider_calls(oauth_s
                 "params": {
                     "protocolVersion": "2025-03-26",
                     "capabilities": {},
-                    "clientInfo": {"name": "grok-bot-oauth", "version": "0"},
+                    "clientInfo": {"name": "mcp-client-oauth", "version": "0"},
                 },
             },
             headers=headers,
@@ -43,21 +43,31 @@ def test_oauth_mcp_lists_seven_tools_and_prepares_without_provider_calls(oauth_s
             tokens["access_token"], initialize.headers.get("mcp-session-id")
         )
         client.post(
-            GROK_MCP_PATH,
+            OAUTH_MCP_PATH,
             json={"jsonrpc": "2.0", "method": "notifications/initialized"},
             headers=session_headers,
         )
         listed = client.post(
-            GROK_MCP_PATH,
+            OAUTH_MCP_PATH,
             json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             headers=session_headers,
         )
         assert listed.status_code == 200, listed.text
         tools = parse_mcp_payload(listed)["result"]["tools"]
         assert {tool["name"] for tool in tools} == EXPECTED_TOOLS
+        by_name = {tool["name"]: tool for tool in tools}
+        assert by_name["start_phone_call"]["annotations"]["readOnlyHint"] is False
+        assert by_name["start_phone_call"]["annotations"]["openWorldHint"] is True
+        assert by_name["get_phone_call"]["annotations"]["readOnlyHint"] is True
+        # Result retrieval may persist a missing extraction, so must not claim read-only.
+        assert by_name["get_call_result"]["annotations"]["readOnlyHint"] is False
+        for tool in tools:
+            assert tool["_meta"]["securitySchemes"] == [
+                {"type": "oauth2", "scopes": ["agent-call:use"]}
+            ]
 
         prepared = client.post(
-            GROK_MCP_PATH,
+            OAUTH_MCP_PATH,
             json={
                 "jsonrpc": "2.0",
                 "id": 3,

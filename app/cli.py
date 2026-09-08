@@ -18,6 +18,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("setup", help="create private local configuration with guided prompts")
+
+    start = sub.add_parser("start", help="guided local setup, automatic HTTPS tunnel, and server")
+    start.add_argument(
+        "--profile",
+        choices=("live", "evaluation"),
+        default="live",
+        help="live (default) enables explicitly confirmed calls; evaluation cannot dial",
+    )
+    start.add_argument(
+        "--directory", default=None, help="private config directory (default: ~/.agent-call)"
+    )
+    start.add_argument("--port", type=int, default=8000, help="local loopback port")
+
     serve = sub.add_parser(
         "serve",
         help="boot the HTTP/MCP app",
@@ -61,6 +75,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     smoke.add_argument("--mcp-path", default="/mcp/")
 
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.command == "start":
+        from pathlib import Path
+
+        from app.local_start import run_local
+
+        directory = (
+            Path(args.directory).expanduser() if args.directory else Path.home() / ".agent-call"
+        )
+        return run_local(directory=directory, port=args.port, profile=args.profile)
+    if args.command == "setup":
+        from app.setup import run_setup
+
+        return run_setup()
     if args.command == "serve":
         return _serve(args)
     if args.command == "doctor":

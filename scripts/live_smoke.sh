@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local live smoke test: boot the app with dummy credentials and a temp SQLite DB,
-# then drive /healthz and the MCP endpoint as a Grok-compatible Streamable HTTP
+# then drive /healthz and the MCP endpoint as a MCP-compatible Streamable HTTP
 # client (initialize, exact tools/list, prepare_phone_call, either-credential
 # auth rejection). When OAuth is disabled, discovery must fail closed. A second
 # local process then boots the OAuth-enabled path and checks discovery, DCR,
@@ -123,7 +123,7 @@ PREPARE='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"prepare
     "target":{"name":"Smoke Target","phone":"+15550000002"},
     "objective":"Smoke test objective",
     "escalation":{"mode":"end_call","owner_phone":"+15550000001"}},
-  "authority_basis":"Owner requested this local Grok-compatible smoke test",
+  "authority_basis":"Owner requested this local MCP-compatible smoke test",
   "requested_by_owner":true}}}'
 PREP_RESP="$(mcp_call "$(echo "$PREPARE" | tr -d '\n')" "$SESSION")" || { echo "FAIL: prepare_phone_call (transport)"; cat "$WORKDIR/server.log"; exit 1; }
 printf '%s' "$PREP_RESP" >"$WORKDIR/prepare.json"
@@ -134,7 +134,7 @@ STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$MCP_URL" -H "Content-
 [ "$STATUS" = "401" ] || [ "$STATUS" = "403" ] || { echo "FAIL: unauthenticated MCP got $STATUS"; exit 1; }
 echo "OK auth rejection ($STATUS)"
 
-# Either required credential missing must fail (Grok-compatible client auth).
+# Either required credential missing must fail (MCP-compatible client auth).
 MISSING_BEARER="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$MCP_URL" \
   -H "Content-Type: application/json" -H "X-Agent-User-Id: smoke-user" \
   -d '{"jsonrpc":"2.0","id":10,"method":"tools/list"}')" || { echo "FAIL: missing bearer (transport)"; cat "$WORKDIR/server.log"; exit 1; }
@@ -147,14 +147,14 @@ MISSING_USER="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$MCP_URL" \
 [ "$MISSING_USER" = "401" ] || [ "$MISSING_USER" = "403" ] || { echo "FAIL: missing user id MCP got $MISSING_USER"; exit 1; }
 echo "OK missing X-Agent-User-Id rejection ($MISSING_USER)"
 
-# OAuth is disabled by default: the Grok endpoint and discovery must fail closed.
-GROK_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/grok/mcp/" \
+# OAuth is disabled by default: the MCP endpoint and discovery must fail closed.
+OAUTH_STATUS="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/connect/mcp/" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":12,"method":"tools/list"}')" || true
-[ "$GROK_STATUS" = "404" ] || [ "$GROK_STATUS" = "405" ] || {
-  echo "FAIL: disabled Grok MCP got $GROK_STATUS"; exit 1
+[ "$OAUTH_STATUS" = "404" ] || [ "$OAUTH_STATUS" = "405" ] || {
+  echo "FAIL: disabled OAuth MCP got $OAUTH_STATUS"; exit 1
 }
-echo "OK disabled Grok MCP closed ($GROK_STATUS)"
+echo "OK disabled OAuth MCP closed ($OAUTH_STATUS)"
 DISCOVERY_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
   "http://127.0.0.1:$PORT/.well-known/oauth-authorization-server")" || true
 [ "$DISCOVERY_STATUS" = "404" ] || {
@@ -165,11 +165,11 @@ echo "OK OAuth discovery absent while disabled ($DISCOVERY_STATUS)"
 # --- OAuth-enabled local path (no provider, tunnel, or phone call) ---
 OAUTH_PORT=$((PORT + 1))
 OAUTH_SECRET="smoke-oauth-owner-secret"
-OAUTH_HASH="$(uv run python -c "from app.grok_oauth.crypto import hash_owner_secret; print(hash_owner_secret('$OAUTH_SECRET'))")"
-export GROK_MCP_OAUTH_ENABLED="true"
-export GROK_MCP_OAUTH_OWNER_SECRET_HASH="$OAUTH_HASH"
-export GROK_MCP_OAUTH_SIGNING_KEY="$(printf 's%.0s' {1..64})"
-export GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY="$(printf 'e%.0s' {1..64})"
+OAUTH_HASH="$(uv run python -c "from app.mcp_oauth.crypto import hash_owner_secret; print(hash_owner_secret('$OAUTH_SECRET'))")"
+export MCP_OAUTH_ENABLED="true"
+export MCP_OAUTH_OWNER_SECRET_HASH="$OAUTH_HASH"
+export MCP_OAUTH_SIGNING_KEY="$(printf 's%.0s' {1..64})"
+export MCP_OAUTH_STORAGE_ENCRYPTION_KEY="$(printf 'e%.0s' {1..64})"
 export DATABASE_URL="sqlite:///$WORKDIR/oauth.db"
 
 uv run uvicorn app.main:app --host 127.0.0.1 --port "$OAUTH_PORT" >"$WORKDIR/oauth-server.log" 2>&1 &
@@ -191,7 +191,7 @@ import base64, hashlib, json, os, re, secrets, sys, urllib.error, urllib.parse, 
 
 port, owner_secret = sys.argv[1], sys.argv[2]
 base = f"http://127.0.0.1:{port}"
-resource = "https://smoke.example.com/grok/mcp/"
+resource = "https://smoke.example.com/connect/mcp/"
 expected_tools = {
     "prepare_phone_call",
     "start_phone_call",
@@ -236,7 +236,7 @@ reg_status, _, reg_body = request(
     f"{base}/register",
     data=json.dumps(
         {
-            "redirect_uris": ["https://grok.example/callback"],
+            "redirect_uris": ["https://client.example/callback"],
             "client_name": "Smoke Connector",
             "token_endpoint_auth_method": "client_secret_post",
             "grant_types": ["authorization_code", "refresh_token"],
@@ -259,7 +259,7 @@ query = urllib.parse.urlencode(
     {
         "response_type": "code",
         "client_id": registered["client_id"],
-        "redirect_uri": "https://grok.example/callback",
+        "redirect_uri": "https://client.example/callback",
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "scope": "agent-call:use",
@@ -271,7 +271,7 @@ auth_status, auth_headers, auth_body = request("GET", f"{base}/authorize?{query}
 if auth_status != 302:
     raise SystemExit(f"authorize status {auth_status}: {auth_body[:300]!r}")
 consent_path = auth_headers.get("Location") or auth_headers.get("location")
-if not consent_path or "/grok/oauth/consent" not in consent_path:
+if not consent_path or "/oauth/consent" not in consent_path:
     raise SystemExit(f"authorize did not redirect to consent: {consent_path}")
 print("OK /authorize")
 
@@ -287,7 +287,7 @@ if "Unverified client" not in page:
     raise SystemExit("consent page missing unverified warning")
 if registered["client_id"] not in page:
     raise SystemExit("consent page missing exact client_id")
-if "https://grok.example/callback" not in page:
+if "https://client.example/callback" not in page:
     raise SystemExit("consent page missing exact redirect URI")
 csrf = re.search(r'name="csrf_token" value="([^"]+)"', page)
 tx = re.search(r'name="tx" value="([^"]+)"', page)
@@ -305,7 +305,7 @@ form = urllib.parse.urlencode(
 ).encode()
 approve_status, approve_headers, approve_body = request(
     "POST",
-    f"{base}/grok/oauth/consent",
+    f"{base}/oauth/consent",
     data=form,
     headers={"Content-Type": "application/x-www-form-urlencoded"},
 )
@@ -323,7 +323,7 @@ token_status, _, token_body = request(
         {
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": "https://grok.example/callback",
+            "redirect_uri": "https://client.example/callback",
             "client_id": registered["client_id"],
             "client_secret": registered["client_secret"],
             "code_verifier": verifier,
@@ -369,7 +369,7 @@ oauth_headers = {
     "Content-Type": "application/json",
 }
 init_payload, init_headers = mcp_json(
-    "/grok/mcp/",
+    "/connect/mcp/",
     {
         "jsonrpc": "2.0",
         "id": 1,
@@ -387,7 +387,7 @@ if "serverInfo" not in init_payload.get("result", {}):
 session = init_headers.get("mcp-session-id") or init_headers.get("Mcp-Session-Id")
 if session:
     oauth_headers = {**oauth_headers, "mcp-session-id": session}
-listed, _ = mcp_json("/grok/mcp/", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, oauth_headers)
+listed, _ = mcp_json("/connect/mcp/", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, oauth_headers)
 names = {tool["name"] for tool in listed["result"]["tools"]}
 if names != expected_tools:
     raise SystemExit(f"OAuth tools/list expected {sorted(expected_tools)}, got {sorted(names)}")

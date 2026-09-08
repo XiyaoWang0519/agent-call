@@ -3,11 +3,10 @@
 Notable changes to this project are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-This repository has **no tagged GitHub release** yet. Package metadata in
-`pyproject.toml` currently reports `0.1.0` as a development version, not as a
-published release.
+The first tagged GitHub release is `0.1.0`. The wheel and source distribution
+are attached to that release; PyPI publication is not configured.
 
-## Unreleased
+## [0.1.0] - 2026-09-07
 
 ### Fixed
 
@@ -18,6 +17,15 @@ published release.
   SQLite files, and journal files under otherwise allowed source directories.
 
 ### Added
+
+- `agent-call start`: automatic verified tunnel helper, temporary HTTPS address,
+  guided first-run configuration and local service in one foreground command.
+
+- Interactive `agent-call setup` for local uv/pip installations: private configuration,
+  generated service tokens, browser OAuth, and optional Exa search.
+- Wheel/source release artifacts with an explicit source archive allowlist and
+  isolated installation instructions; version 0.1.0 is distributed through the
+  GitHub release and is not published to PyPI.
 
 - Evaluation/dummy profile (`AGENT_CALL_PROFILE=evaluation`) that boots without
   real provider credentials, serves `/healthz`, allows MCP prepare, and returns
