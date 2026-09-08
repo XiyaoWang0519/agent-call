@@ -8,7 +8,7 @@ from mcp.server.auth.provider import RegistrationError
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
 
-from app.grok_oauth.constants import (
+from app.mcp_oauth.constants import (
     OAUTH_CLIENT_CONTACT_MAX_COUNT,
     OAUTH_CLIENT_CONTACT_MAX_LENGTH,
     OAUTH_CLIENT_GRANT_TYPE_MAX_COUNT,

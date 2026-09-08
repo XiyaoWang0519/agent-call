@@ -269,27 +269,27 @@ def test_doctor_dummy_rejects_malformed_dotenv(tmp_path: Path):
 
 
 def test_doctor_live_ready_reports_missing_oauth_names():
-    env = _live_env(GROK_MCP_OAUTH_ENABLED="true")
+    env = _live_env(MCP_OAUTH_ENABLED="true")
     report = _doctor(DoctorMode.LIVE_READY, env)
     assert not report.ok
     names = {check.name for check in report.checks if not check.ok}
-    assert "GROK_MCP_OAUTH_OWNER_SECRET_HASH" in names
-    assert "GROK_MCP_OAUTH_SIGNING_KEY" in names
-    assert "GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY" in names
+    assert "MCP_OAUTH_OWNER_SECRET_HASH" in names
+    assert "MCP_OAUTH_SIGNING_KEY" in names
+    assert "MCP_OAUTH_STORAGE_ENCRYPTION_KEY" in names
     _assert_no_secrets(report.format())
 
 
 def test_doctor_live_ready_names_oauth_hash_failure():
     env = _live_env(
-        GROK_MCP_OAUTH_ENABLED="true",
-        GROK_MCP_OAUTH_OWNER_SECRET_HASH="not-an-argon2-hash",
-        GROK_MCP_OAUTH_SIGNING_KEY="s" * 64,
-        GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY="e" * 64,
+        MCP_OAUTH_ENABLED="true",
+        MCP_OAUTH_OWNER_SECRET_HASH="not-an-argon2-hash",
+        MCP_OAUTH_SIGNING_KEY="s" * 64,
+        MCP_OAUTH_STORAGE_ENCRYPTION_KEY="e" * 64,
     )
     report = _doctor(DoctorMode.LIVE_READY, env)
     assert not report.ok
     failed = [check for check in report.checks if not check.ok]
-    assert any(check.name == "GROK_MCP_OAUTH_OWNER_SECRET_HASH" for check in failed)
+    assert any(check.name == "MCP_OAUTH_OWNER_SECRET_HASH" for check in failed)
     assert "not-an-argon2-hash" not in report.format()
     _assert_no_secrets(report.format())
 
@@ -659,3 +659,18 @@ def test_probe_public_origin_connect_error_is_value_free():
     assert result.detail == "origin unreachable"
     assert "invalid" not in result.detail
     assert "https://" not in result.detail
+
+
+def test_doctor_live_without_exa_reports_search_disabled(tmp_path):
+    env = _live_env(DATABASE_URL=f"sqlite:///{tmp_path / 'no-exa.db'}")
+    del env["EXA_API_KEY"]
+    report = run_doctor(
+        DoctorMode.LIVE_READY,
+        environ=env,
+        env_files=(),
+        probes=_offline_network_probes(origin_status=CheckStatus.PASS),
+    )
+    check = next(check for check in report.checks if check.name == "EXA_API_KEY")
+    assert check.status is CheckStatus.PASS
+    assert "disabled" in check.detail
+    assert report.ok

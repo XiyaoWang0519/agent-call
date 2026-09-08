@@ -9,10 +9,10 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
-from app.grok_oauth.constants import GROK_OAUTH_SCOPE
-from app.grok_oauth.provider import grok_mcp_resource
+from app.mcp_oauth.constants import MCP_OAUTH_SCOPE
+from app.mcp_oauth.provider import oauth_mcp_resource
 from app.smoke_prepare import parse_mcp_payload as parse_mcp_body
-from tests.conftest import GROK_OAUTH_OWNER_SECRET
+from tests.conftest import MCP_OAUTH_OWNER_SECRET
 
 CSRF_RE = re.compile(r'name="csrf_token" value="([^"]+)"')
 TX_RE = re.compile(r'name="tx" value="([^"]+)"')
@@ -36,9 +36,9 @@ def parse_mcp_payload(response) -> dict[str, Any]:
 def register_test_client(
     client: TestClient,
     *,
-    redirect_uri: str = "https://grok.example/callback",
-    client_name: str = "Grok Test Connector",
-    scope: str = GROK_OAUTH_SCOPE,
+    redirect_uri: str = "https://client.example/callback",
+    client_name: str = "Test Connector",
+    scope: str = MCP_OAUTH_SCOPE,
 ) -> dict[str, Any]:
     response = client.post(
         "/register",
@@ -63,7 +63,7 @@ def start_authorization(
     challenge: str,
     resource: str,
     state: str = "state-1",
-    scope: str = GROK_OAUTH_SCOPE,
+    scope: str = MCP_OAUTH_SCOPE,
     extra: dict[str, str] | None = None,
 ):
     params = {
@@ -86,7 +86,7 @@ def submit_consent(
     *,
     html: str,
     action: str = "approve",
-    owner_secret: str = GROK_OAUTH_OWNER_SECRET,
+    owner_secret: str = MCP_OAUTH_OWNER_SECRET,
     csrf_token: str | None = None,
     tx: str | None = None,
     headers: dict[str, str] | None = None,
@@ -94,7 +94,7 @@ def submit_consent(
     csrf = csrf_token or (CSRF_RE.search(html).group(1) if CSRF_RE.search(html) else "")
     transaction_id = tx or (TX_RE.search(html).group(1) if TX_RE.search(html) else "")
     return client.post(
-        "/grok/oauth/consent",
+        "/oauth/consent",
         data={
             "tx": transaction_id,
             "csrf_token": csrf,
@@ -113,12 +113,12 @@ def complete_owner_login(
     settings,
     verifier: str | None = None,
     challenge: str | None = None,
-    redirect_uri: str = "https://grok.example/callback",
+    redirect_uri: str = "https://client.example/callback",
     resource: str | None = None,
 ) -> dict[str, Any]:
     if verifier is None or challenge is None:
         verifier, challenge = pkce_pair()
-    resource = resource or grok_mcp_resource(settings.public_base_url or "")
+    resource = resource or oauth_mcp_resource(settings.public_base_url or "")
     authorize = start_authorization(
         client,
         client_id=registered["client_id"],

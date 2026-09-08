@@ -235,7 +235,7 @@ def _check_live_ready(
         return
     report.add("profile", True, "live")
     required_names = CORE_RUNTIME_ENV_NAMES
-    if _flag_enabled(merged, "GROK_MCP_OAUTH_ENABLED"):
+    if _flag_enabled(merged, "MCP_OAUTH_ENABLED"):
         required_names = CORE_RUNTIME_ENV_NAMES + OAUTH_RUNTIME_ENV_NAMES
     values: dict[str, str] = {}
     for name in required_names:
@@ -293,9 +293,12 @@ def _check_live_ready(
     openai_key = Settings.reveal(settings.openai_api_key)
     openai_probe = probes.openai or probe_openai
     _record_probe(report, "OPENAI_API", openai_probe(openai_key))
-    exa_key = Settings.reveal(settings.exa_api_key)
-    exa_probe = probes.exa or probe_exa_unverified
-    _record_probe(report, "EXA_API_KEY", exa_probe(exa_key))
+    exa_key = settings.exa_api_key.get_secret_value() if settings.exa_api_key else ""
+    if exa_key.strip():
+        exa_probe = probes.exa or probe_exa_unverified
+        _record_probe(report, "EXA_API_KEY", exa_probe(exa_key))
+    else:
+        report.add("EXA_API_KEY", True, "optional; web search disabled")
     webhook = Settings.reveal(settings.openai_webhook_secret)
     webhook_probe = probes.openai_webhook or probe_openai_webhook_unverified
     _record_probe(report, "OPENAI_WEBHOOK_SECRET", webhook_probe(webhook))

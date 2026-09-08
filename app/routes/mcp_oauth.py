@@ -4,24 +4,24 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
 from mcp.server.auth.provider import AuthorizeError
 
-from app.grok_oauth.consent import (
-    CONSENT_SECURITY_HEADERS,
+from app.mcp_oauth.consent import (
     consent_error_page,
     consent_form,
+    consent_security_headers,
     denied_redirect,
     render_consent,
     secure_html,
 )
-from app.grok_oauth.constants import GROK_OAUTH_CONSENT_PATH, GROK_OAUTH_REVOKE_ALL_PATH
-from app.grok_oauth.provider import GENERIC_FAILURE, GrokOAuthProvider, client_limiter_key
+from app.mcp_oauth.constants import MCP_OAUTH_CONSENT_PATH, MCP_OAUTH_REVOKE_ALL_PATH
+from app.mcp_oauth.provider import GENERIC_FAILURE, MCPOAuthProvider, client_limiter_key
 from app.security import require_debug_token
 
-router = APIRouter(tags=["grok-oauth"])
+router = APIRouter(tags=["mcp-oauth"])
 
 
-def _provider(request: Request) -> GrokOAuthProvider:
-    provider = getattr(request.app.state, "grok_oauth", None)
-    if not isinstance(provider, GrokOAuthProvider):
+def _provider(request: Request) -> MCPOAuthProvider:
+    provider = getattr(request.app.state, "mcp_oauth", None)
+    if not isinstance(provider, MCPOAuthProvider):
         raise HTTPException(status_code=404, detail="not found")
     return provider
 
@@ -32,14 +32,14 @@ def _client_key(request: Request) -> str:
     return client_limiter_key(host, forwarded)
 
 
-@router.get(GROK_OAUTH_CONSENT_PATH, include_in_schema=False)
-async def grok_oauth_consent(request: Request) -> Response:
+@router.get(MCP_OAUTH_CONSENT_PATH, include_in_schema=False)
+async def mcp_oauth_consent(request: Request) -> Response:
     provider = _provider(request)
     return await render_consent(provider, request.query_params.get("tx"))
 
 
-@router.post(GROK_OAUTH_CONSENT_PATH, include_in_schema=False)
-async def grok_oauth_consent_submit(request: Request) -> Response:
+@router.post(MCP_OAUTH_CONSENT_PATH, include_in_schema=False)
+async def mcp_oauth_consent_submit(request: Request) -> Response:
     provider = _provider(request)
     key = _client_key(request)
     if provider.is_rate_limited(key):
@@ -65,6 +65,7 @@ async def grok_oauth_consent_submit(request: Request) -> Response:
         return secure_html(
             consent_form(transaction=transaction, error=GENERIC_FAILURE),
             status_code=401,
+            redirect_uri=str(transaction["redirect_uri"]),
         )
 
     try:
@@ -76,12 +77,12 @@ async def grok_oauth_consent_submit(request: Request) -> Response:
     return RedirectResponse(
         redirect_to,
         status_code=302,
-        headers={**CONSENT_SECURITY_HEADERS, "Cache-Control": "no-store"},
+        headers=consent_security_headers(str(transaction["redirect_uri"])),
     )
 
 
-@router.post(GROK_OAUTH_REVOKE_ALL_PATH, include_in_schema=False)
-async def grok_oauth_revoke_all(
+@router.post(MCP_OAUTH_REVOKE_ALL_PATH, include_in_schema=False)
+async def mcp_oauth_revoke_all(
     request: Request, _: None = Depends(require_debug_token)
 ) -> dict[str, int]:
     provider = _provider(request)

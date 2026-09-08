@@ -158,3 +158,18 @@ async def test_exa_search_ignores_malformed_optional_cost_metadata(settings):
         result = await ExaSearchClient(settings, http_client=http_client).search("a query")
 
     assert result.cost_dollars is None
+
+
+async def test_missing_exa_key_fails_without_network(settings):
+    settings.exa_api_key = None
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"results": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = ExaSearchClient(settings, http_client=http_client)
+        with pytest.raises(ExaSearchError, match="web_search_disabled"):
+            await client.search("test query")
+    assert requests == []

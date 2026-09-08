@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
 from mcp.server.auth.provider import construct_redirect_uri
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
-from app.grok_oauth.constants import GROK_OAUTH_CONSENT_PATH, GROK_OAUTH_SCOPE
-from app.grok_oauth.provider import GENERIC_FAILURE, GrokOAuthProvider
+from app.mcp_oauth.constants import MCP_OAUTH_CONSENT_PATH, MCP_OAUTH_SCOPE
+from app.mcp_oauth.provider import GENERIC_FAILURE, MCPOAuthProvider
 
 CONSENT_SECURITY_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate",
@@ -24,8 +25,25 @@ CONSENT_SECURITY_HEADERS = {
 }
 
 
-def secure_html(content: str, status_code: int = 200) -> HTMLResponse:
-    return HTMLResponse(content=content, status_code=status_code, headers=CONSENT_SECURITY_HEADERS)
+def consent_security_headers(redirect_uri: str | None = None) -> dict[str, str]:
+    headers = dict(CONSENT_SECURITY_HEADERS)
+    if redirect_uri:
+        origin = redirect_origin(redirect_uri)
+        # Chrome applies form-action to the POST's redirect as well. Permit only
+        # this transaction's registered callback origin, never arbitrary sources.
+        if re.fullmatch(r"https?://[a-zA-Z0-9.\-\[\]:]+", origin):
+            headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+                "form-action 'self';", f"form-action 'self' {origin};"
+            )
+    return headers
+
+
+def secure_html(
+    content: str, status_code: int = 200, *, redirect_uri: str | None = None
+) -> HTMLResponse:
+    return HTMLResponse(
+        content=content, status_code=status_code, headers=consent_security_headers(redirect_uri)
+    )
 
 
 def _page(*, title: str, body: str) -> str:
@@ -106,12 +124,12 @@ def redirect_origin(redirect_uri: str) -> str:
 
 
 def consent_form(*, transaction: dict[str, Any], error: str | None = None) -> str:
-    client_name = str(transaction.get("client_name") or "Grok connector")
+    client_name = str(transaction.get("client_name") or "MCP connector")
     client_id = str(transaction.get("client_id") or "")
     redirect_uri = str(transaction.get("redirect_uri") or "")
     origin = redirect_origin(redirect_uri)
     resource = str(transaction.get("resource") or "")
-    scopes = " ".join(transaction.get("scopes") or [GROK_OAUTH_SCOPE])
+    scopes = " ".join(transaction.get("scopes") or [MCP_OAUTH_SCOPE])
     csrf = str(transaction.get("csrf_token") or "")
     tx = str(transaction.get("transaction_id") or "")
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
@@ -134,7 +152,7 @@ def consent_form(*, transaction: dict[str, Any], error: str | None = None) -> st
       <dt>Resource</dt><dd>{html.escape(resource)}</dd>
       <dt>Scope</dt><dd>{html.escape(scopes)}</dd>
     </dl>
-    <form method="post" action="{html.escape(GROK_OAUTH_CONSENT_PATH)}" autocomplete="off">
+    <form method="post" action="{html.escape(MCP_OAUTH_CONSENT_PATH)}" autocomplete="off">
       <input type="hidden" name="tx" value="{html.escape(tx)}">
       <input type="hidden" name="csrf_token" value="{html.escape(csrf)}">
       <label for="owner_secret">Owner authorization secret</label>
@@ -165,10 +183,12 @@ def denied_redirect(transaction: dict[str, Any]) -> Response:
     return RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store"})
 
 
-async def render_consent(provider: GrokOAuthProvider, transaction_id: str | None) -> Response:
+async def render_consent(provider: MCPOAuthProvider, transaction_id: str | None) -> Response:
     if not transaction_id:
         return secure_html(consent_error_page(GENERIC_FAILURE), status_code=400)
     transaction = await provider.load_transaction(transaction_id)
     if transaction is None:
         return secure_html(consent_error_page(GENERIC_FAILURE), status_code=400)
-    return secure_html(consent_form(transaction=transaction))
+    return secure_html(
+        consent_form(transaction=transaction), redirect_uri=str(transaction["redirect_uri"])
+    )

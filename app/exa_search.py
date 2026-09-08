@@ -140,7 +140,7 @@ class ExaSearchClient:
         *,
         http_client: httpx.AsyncClient | None = None,
     ):
-        self._api_key = Settings.reveal(settings.exa_api_key)
+        self._api_key = settings.exa_api_key.get_secret_value() if settings.exa_api_key else ""
         self._timeout_seconds = settings.exa_search_timeout_seconds
         self._owns_http_client = http_client is None
         self._http_client = http_client or httpx.AsyncClient(
@@ -161,6 +161,8 @@ class ExaSearchClient:
             await self._http_client.aclose()
 
     async def search(self, query: str) -> ExaSearchResult:
+        if not self._api_key.strip():
+            raise ExaSearchError("web_search_disabled")
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 response = await self._http_client.post(

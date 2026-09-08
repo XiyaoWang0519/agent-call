@@ -7,12 +7,12 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
-from app.grok_oauth.consent import consent_form
-from app.grok_oauth.constants import FAILED_ATTEMPT_LIMIT, GROK_OAUTH_CONSENT_PATH
-from app.grok_oauth.crypto import verify_owner_secret
-from app.grok_oauth.provider import grok_mcp_resource
 from app.main import create_app
-from tests.conftest import GROK_OAUTH_OWNER_SECRET, GROK_OAUTH_OWNER_SECRET_HASH
+from app.mcp_oauth.consent import consent_form, consent_security_headers
+from app.mcp_oauth.constants import FAILED_ATTEMPT_LIMIT, MCP_OAUTH_CONSENT_PATH
+from app.mcp_oauth.crypto import verify_owner_secret
+from app.mcp_oauth.provider import oauth_mcp_resource
+from tests.conftest import MCP_OAUTH_OWNER_SECRET, MCP_OAUTH_OWNER_SECRET_HASH
 from tests.oauth_helpers import (
     CSRF_RE,
     TX_RE,
@@ -35,9 +35,9 @@ def _begin_consent(client: TestClient, oauth_settings):
     authorize = start_authorization(
         client,
         client_id=registered["client_id"],
-        redirect_uri="https://grok.example/callback",
+        redirect_uri="https://client.example/callback",
         challenge=challenge,
-        resource=grok_mcp_resource(oauth_settings.public_base_url or ""),
+        resource=oauth_mcp_resource(oauth_settings.public_base_url or ""),
     )
     page = client.get(authorize.headers["location"])
     return registered, page
@@ -45,7 +45,7 @@ def _begin_consent(client: TestClient, oauth_settings):
 
 def test_correct_owner_secret_succeeds_and_argon2id_is_used(oauth_settings):
     assert verify_owner_secret(
-        secret=GROK_OAUTH_OWNER_SECRET, secret_hash=GROK_OAUTH_OWNER_SECRET_HASH
+        secret=MCP_OAUTH_OWNER_SECRET, secret_hash=MCP_OAUTH_OWNER_SECRET_HASH
     )
     app = create_app(oauth_settings)
     with TestClient(app) as client:
@@ -54,21 +54,28 @@ def test_correct_owner_secret_succeeds_and_argon2id_is_used(oauth_settings):
         details = _consent_details(page.text)
         assert "Unverified client" in page.text
         assert "not verified" in page.text
-        assert details["Displayed name"] == "Grok Test Connector"
+        assert details["Displayed name"] == "Test Connector"
         assert details["Client ID"] == registered["client_id"]
-        assert details["Redirect URI"] == "https://grok.example/callback"
-        assert details["Redirect origin"] == "https://grok.example"
+        assert details["Redirect URI"] == "https://client.example/callback"
+        assert details["Redirect origin"] == "https://client.example"
         assert details["Scope"] == "agent-call:use"
-        assert details["Resource"] == grok_mcp_resource(oauth_settings.public_base_url or "")
+        assert details["Resource"] == oauth_mcp_resource(oauth_settings.public_base_url or "")
         assert page.headers["cache-control"].startswith("no-store")
         assert page.headers["referrer-policy"] == "no-referrer"
         assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
-        assert GROK_OAUTH_OWNER_SECRET not in page.text
+        assert (
+            "form-action 'self' https://client.example;" in page.headers["content-security-policy"]
+        )
+        assert MCP_OAUTH_OWNER_SECRET not in page.text
         approved = submit_consent(client, html=page.text)
         assert approved.status_code == 302
+        assert (
+            "form-action 'self' https://client.example;"
+            in approved.headers["content-security-policy"]
+        )
         location = approved.headers["location"]
         assert "code=" in location
-        assert GROK_OAUTH_OWNER_SECRET not in location
+        assert MCP_OAUTH_OWNER_SECRET not in location
         assert "set-cookie" not in {key.lower() for key in approved.headers}
 
 
@@ -106,9 +113,9 @@ def test_csrf_expired_and_reused_transactions_are_rejected(oauth_settings):
         authorize = start_authorization(
             client,
             client_id=registered["client_id"],
-            redirect_uri="https://grok.example/callback",
+            redirect_uri="https://client.example/callback",
             challenge=challenge,
-            resource=grok_mcp_resource(oauth_settings.public_base_url or ""),
+            resource=oauth_mcp_resource(oauth_settings.public_base_url or ""),
         )
         expired_page = client.get(authorize.headers["location"])
         tx_id = TX_RE.search(expired_page.text)
@@ -138,7 +145,7 @@ def test_rate_limiting_and_request_body_size(oauth_settings):
         assert blocked.status_code == 429
 
         huge = client.post(
-            GROK_OAUTH_CONSENT_PATH,
+            MCP_OAUTH_CONSENT_PATH,
             content=b"x" * (9 * 1024),
             headers={"content-type": "application/x-www-form-urlencoded"},
         )
@@ -223,7 +230,7 @@ def test_consent_form_escapes_untrusted_identity_fields():
             "client_name": evil_name,
             "client_id": evil_id,
             "redirect_uri": evil_redirect,
-            "resource": "https://example.test/grok/mcp/",
+            "resource": "https://example.test/connect/mcp/",
             "scopes": ["agent-call:use"],
             "csrf_token": "csrf-token",
             "transaction_id": "tx-1",
@@ -255,7 +262,7 @@ def test_consent_page_escapes_untrusted_client_identity(oauth_settings):
             client_id=registered["client_id"],
             redirect_uri=redirect_uri,
             challenge=challenge,
-            resource=grok_mcp_resource(oauth_settings.public_base_url or ""),
+            resource=oauth_mcp_resource(oauth_settings.public_base_url or ""),
         )
         assert authorize.status_code == 302
         page = client.get(authorize.headers["location"])
@@ -281,9 +288,21 @@ def test_owner_secret_never_appears_in_redirects_cookies_or_logs(oauth_settings,
             _, page = _begin_consent(client, oauth_settings)
             approved = submit_consent(client, html=page.text)
         location = approved.headers.get("location", "")
-        assert GROK_OAUTH_OWNER_SECRET not in location
-        assert GROK_OAUTH_OWNER_SECRET not in page.text
-        assert GROK_OAUTH_OWNER_SECRET not in caplog.text
+        assert MCP_OAUTH_OWNER_SECRET not in location
+        assert MCP_OAUTH_OWNER_SECRET not in page.text
+        assert MCP_OAUTH_OWNER_SECRET not in caplog.text
         query = parse_qs(urlparse(location).query)
         assert query.get("code")
-        assert GROK_OAUTH_OWNER_SECRET not in str(query)
+        assert MCP_OAUTH_OWNER_SECRET not in str(query)
+
+
+def test_consent_policy_does_not_allow_callback_policy_injection():
+    for uri in ("https://bad.example; script-src *", "javascript:alert(1)", "https://*.example/cb"):
+        policy = consent_security_headers(uri)["Content-Security-Policy"]
+        assert "form-action 'self';" in policy
+        assert "script-src 'none';" in policy
+    policy = consent_security_headers("https://client.example/cb?next=;script-src *")[
+        "Content-Security-Policy"
+    ]
+    assert "form-action 'self' https://client.example;" in policy
+    assert "script-src 'none';" in policy

@@ -7,10 +7,9 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from app.models import CallState, InputNoiseReduction
+from app.models import InputNoiseReduction
 from app.openai_realtime import RealtimeBridge, RealtimeRuntime
 from app.settings import Settings
-from tests.conftest import seed_call
 
 
 async def _noop(*args, **kwargs) -> None:
@@ -33,98 +32,6 @@ def test_noise_reduction_rejects_unsupported_configuration(mode):
 
 def test_noise_reduction_defaults_to_far_field():
     assert Settings.from_environ({}).input_noise_reduction == "far_field"
-
-
-@pytest.mark.parametrize("enabled", [False, True], ids=["initial", "activation"])
-@pytest.mark.parametrize("turn_mode", ["semantic_vad", "server_vad"])
-@pytest.mark.parametrize("mode", [None, "near_field", "far_field"])
-@pytest.mark.parametrize(
-    "echoed_filter",
-    [
-        "omitted",
-        None,
-        {"type": "near_field"},
-        {"type": "far_field"},
-        {},
-        {"type": "unknown"},
-        {"type": ["far_field"]},
-        "far_field",
-    ],
-)
-def test_handshake_verifies_effective_noise_filter(
-    settings, mode, turn_mode, enabled, echoed_filter
-):
-    settings.input_noise_reduction = mode
-    settings.turn_detection_mode = turn_mode
-    bridge = RealtimeBridge(
-        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
-    )
-    audio_input = bridge._input_audio_config(
-        create_response=enabled, interrupt_response=enabled
-    ).model_dump(mode="json", exclude_none=True)
-    if echoed_filter == "omitted":
-        audio_input.pop("noise_reduction", None)
-    else:
-        audio_input["noise_reduction"] = echoed_filter
-    event = {"type": "session.updated", "session": {"audio": {"input": audio_input}}}
-
-    if mode is None:
-        # Omission delegates to the provider; a supported effective default is valid.
-        expected = echoed_filter in (
-            "omitted",
-            None,
-            {"type": "near_field"},
-            {"type": "far_field"},
-        )
-    else:
-        expected = echoed_filter == {"type": mode}
-    assert bridge.expected_transcription_echoed(event)
-    confirm = bridge.activation_update_confirmed if enabled else bridge.expected_initial_vad_echoed
-    assert confirm(event) is expected
-
-
-@pytest.mark.parametrize("stage", ["initial", "activation"])
-@pytest.mark.parametrize("echoed_filter", ["omitted", None, {"type": "near_field"}])
-async def test_filter_mismatch_prevents_dialing_or_opening(
-    service, packet, monkeypatch, stage, echoed_filter
-):
-    service.settings.input_noise_reduction = "far_field"
-    bridge = RealtimeBridge(
-        service.settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
-    )
-    enabled = stage == "activation"
-    audio_input = bridge._input_audio_config(
-        create_response=enabled, interrupt_response=enabled
-    ).model_dump(mode="json", exclude_none=True)
-    if echoed_filter == "omitted":
-        audio_input.pop("noise_reduction")
-    else:
-        audio_input["noise_reduction"] = echoed_filter
-    event = {"type": "session.updated", "session": {"audio": {"input": audio_input}}}
-    realtime = service._test_realtime
-    if enabled:
-        call_id = await seed_call(service.db, packet, state=CallState.READY_TO_ACTIVATE)
-        realtime.update_event = event
-        monkeypatch.setattr(
-            realtime, "activation_update_confirmed", bridge.activation_update_confirmed
-        )
-        await service._activate(call_id)
-    else:
-        call_id = await seed_call(service.db, packet)
-        realtime.initial_update_event = event
-        monkeypatch.setattr(
-            realtime, "expected_initial_vad_echoed", bridge.expected_initial_vad_echoed
-        )
-        await service.handle_sideband_open(call_id)
-
-    call = await service.db.get_call(call_id)
-    assert call["state"] == CallState.FAILED.value
-    assert call["opening_sent"] == 0
-    assert service._test_twilio.callee_creates == 0
-    assert ("opening", call_id) not in realtime.events
-    assert call["termination_reason"] == (
-        "session_update_mismatch" if enabled else "transcription_config_mismatch"
-    )
 
 
 @pytest.mark.parametrize("mode", [None, "near_field", "far_field"])

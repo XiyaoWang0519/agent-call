@@ -12,11 +12,12 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from app.grok_oauth.constants import OWNER_SECRET_MIN_LENGTH
+from app.mcp_oauth.constants import OWNER_SECRET_MIN_LENGTH
 
 _ARGON2ID_HASH = re.compile(
     r"^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/=_-]+\$[A-Za-z0-9+/=_-]+$"
 )
+# Legacy derivation labels are a storage format: keep existing ciphertext readable.
 _SIGNING_INFO: Final[bytes] = b"agent-call-grok-oauth-signing-v1"
 _STORAGE_INFO: Final[bytes] = b"agent-call-grok-oauth-storage-v1"
 _MAC_INFO: Final[bytes] = b"agent-call-grok-oauth-mac-v1"
@@ -99,11 +100,9 @@ def verify_sentinel(token: str, fernet: Fernet) -> None:
     try:
         plaintext = fernet.decrypt(token.encode("ascii"))
     except (InvalidToken, ValueError, TypeError) as exc:
-        raise RuntimeError(
-            "GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY is invalid for this database"
-        ) from exc
+        raise RuntimeError("MCP_OAUTH_STORAGE_ENCRYPTION_KEY is invalid for this database") from exc
     if plaintext != _SENTINEL_PLAINTEXT:
-        raise RuntimeError("GROK_MCP_OAUTH_STORAGE_ENCRYPTION_KEY is invalid for this database")
+        raise RuntimeError("MCP_OAUTH_STORAGE_ENCRYPTION_KEY is invalid for this database")
 
 
 def new_token(nbytes: int = 32) -> str:

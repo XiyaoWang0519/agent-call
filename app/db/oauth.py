@@ -8,11 +8,11 @@ if TYPE_CHECKING:
     from app.db.protocols import DatabaseAccess
 
 from app.db.engine import _iso_now
-from app.grok_oauth import constants as grok_oauth_constants
+from app.mcp_oauth import constants as mcp_oauth_constants
 
 
 class OAuthMixin:
-    """SQLite persistence for the optional Grok OAuth authorization server."""
+    """SQLite persistence for the optional MCP OAuth authorization server."""
 
     async def oauth_load_runtime_state(self: DatabaseAccess) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM oauth_runtime_state WHERE singleton = 1")
@@ -343,9 +343,9 @@ class OAuthMixin:
         now = datetime.now(UTC)
         created_at = now.isoformat()
         cutoff = (
-            now - timedelta(seconds=grok_oauth_constants.OAUTH_AUDIT_RETENTION_SECONDS)
+            now - timedelta(seconds=mcp_oauth_constants.OAUTH_AUDIT_RETENTION_SECONDS)
         ).isoformat()
-        max_rows = grok_oauth_constants.OAUTH_AUDIT_MAX_COUNT
+        max_rows = mcp_oauth_constants.OAUTH_AUDIT_MAX_COUNT
         async with self._immediate_transaction() as conn:
             await conn.execute(
                 """INSERT INTO oauth_audit (event, metadata_json, created_at)

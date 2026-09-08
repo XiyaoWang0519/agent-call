@@ -152,6 +152,117 @@ async def test_terminal_state_and_raw_transcript_saved_before_extraction(setting
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("statuses", "expected"),
+    [
+        (["met", "met"], "completed"),
+        (["met", "unmet"], "partially_completed"),
+        (["unmet"], "failed"),
+        (["met", "uncertain"], "unknown"),
+        ([], "unknown"),
+    ],
+)
+async def test_completed_objective_requires_supported_assessments(
+    settings, service, packet, statuses, expected
+):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.add_transcript_turn(
+        call_id=call_id,
+        turn_id="turn_evidence",
+        speaker="callee",
+        text="We support inbound calls. Outbound calls are unavailable.",
+        source_event_type="transcription.completed",
+        source_event_id="evt_evidence",
+    )
+    parsed = ExtractedCallResult(
+        outcome="completed",
+        summary="The service capabilities were discussed.",
+        objective_assessments=[
+            {
+                "description": f"Requirement {index}",
+                "status": status,
+                "evidence_turn_ids": [" turn_evidence "],
+            }
+            for index, status in enumerate(statuses)
+        ],
+        confidence=0.95,
+    )
+    result = await Finalizer(
+        settings, service.db, SimpleNamespace(responses=FakeResponses(parsed=parsed))
+    ).finalize(call_id)
+
+    assert result.outcome == expected
+    assert result.finalization_status == "succeeded"
+    assert (await service.db.get_result(call_id)).outcome == expected
+    assert all(item.evidence_turn_ids == ["turn_evidence"] for item in parsed.objective_assessments)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence_ids", [[], ["invented_turn"]])
+async def test_met_objective_cannot_use_missing_evidence(settings, service, packet, evidence_ids):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    parsed = ExtractedCallResult(
+        outcome="completed",
+        summary="Completed.",
+        objective_assessments=[
+            {"description": "Get an answer", "status": "met", "evidence_turn_ids": evidence_ids}
+        ],
+        confidence=0.95,
+    )
+    responses = FakeResponses(parsed=parsed)
+    result = await Finalizer(settings, service.db, SimpleNamespace(responses=responses)).finalize(
+        call_id
+    )
+
+    assert result.outcome == "unknown"
+    assert result.finalization_status == ("failed" if evidence_ids else "succeeded")
+    assert responses.calls == (2 if evidence_ids else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("objective_outcome", ["partially_completed", "failed"])
+async def test_ended_call_preserves_incomplete_objective(
+    settings, service, packet, objective_outcome
+):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.update_call(call_id, termination_reason="conference_end")
+    await service.db.add_transcript_turn(
+        call_id=call_id,
+        turn_id="unanswered_question",
+        speaker="assistant",
+        text="What setup does your service require?",
+        source_event_type="response.output_audio_transcript.done",
+        source_event_id="evt_unanswered_question",
+    )
+
+    class InspectingResponses(FakeResponses):
+        async def parse(inner_self, **kwargs):
+            payload = json.loads(kwargs["input"])
+            assert payload["approved_plan"]["objective"] == packet.objective
+            assert payload["termination_reason"] == "conference_end"
+            assert payload["transcript"][0]["turn_id"] == "unanswered_question"
+            return await super().parse(**kwargs)
+
+    responses = InspectingResponses(
+        parsed=ExtractedCallResult(
+            outcome=objective_outcome,
+            summary="The call ended before the setup question was answered.",
+            confidence=0.95,
+        )
+    )
+    finalizer = Finalizer(settings, service.db, SimpleNamespace(responses=responses))
+
+    result = await finalizer.finalize(call_id)
+
+    assert result.call_status == "completed"
+    assert result.finalization_status == "succeeded"
+    assert result.transcript_complete is True
+    assert result.outcome == objective_outcome
+    assert "before the setup question was answered" in result.summary
+    assert (await service.db.get_result(call_id)).outcome == objective_outcome
+
+
+@pytest.mark.asyncio
 async def test_extractor_timeout_can_exceed_live_control_timeout(settings, service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
     parsed = ExtractedCallResult(

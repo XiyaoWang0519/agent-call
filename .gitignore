@@ -16,6 +16,8 @@ htmlcov/
 .playwright-mcp/
 .live-phone/
 .live-phone-results/
+.tunnel/
+.start.lock
 dist/
 *.egg-info/
 

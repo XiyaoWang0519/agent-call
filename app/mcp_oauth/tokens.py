@@ -6,11 +6,11 @@ from typing import Any
 from joserfc import jwk, jwt
 from joserfc.errors import JoseError
 
-from app.grok_oauth.constants import GROK_OAUTH_SUBJECT
+from app.mcp_oauth.constants import MCP_OAUTH_SUBJECT
 
 
 class AccessTokenIssuer:
-    """Issue and verify HS256 access tokens for the Grok MCP resource."""
+    """Issue and verify HS256 access tokens for the MCP MCP resource."""
 
     def __init__(self, *, issuer: str, audience: str, signing_key: bytes) -> None:
         self.issuer = issuer
@@ -26,7 +26,7 @@ class AccessTokenIssuer:
         jti: str,
         family_id: str,
         expires_in: int,
-        subject: str = GROK_OAUTH_SUBJECT,
+        subject: str = MCP_OAUTH_SUBJECT,
     ) -> str:
         now = int(time.time())
         payload: dict[str, Any] = {
@@ -59,6 +59,6 @@ class AccessTokenIssuer:
             return None
         if claims.get("aud") != self.audience:
             return None
-        if claims.get("sub") != GROK_OAUTH_SUBJECT:
+        if claims.get("sub") != MCP_OAUTH_SUBJECT:
             return None
         return claims

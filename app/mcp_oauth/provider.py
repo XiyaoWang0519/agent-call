@@ -23,18 +23,18 @@ from pydantic import AnyUrl
 
 from app.db import Database
 from app.db.engine import _iso_now
-from app.grok_oauth import constants as grok_oauth_constants
-from app.grok_oauth.constants import (
+from app.mcp_oauth import constants as mcp_oauth_constants
+from app.mcp_oauth.constants import (
     FAILED_ATTEMPT_LIMIT,
     FAILED_ATTEMPT_WINDOW_SECONDS,
-    GROK_MCP_PATH,
-    GROK_OAUTH_CONSENT_PATH,
-    GROK_OAUTH_SCOPE,
-    GROK_OAUTH_SUBJECT,
+    MCP_OAUTH_CONSENT_PATH,
+    MCP_OAUTH_SCOPE,
+    MCP_OAUTH_SUBJECT,
+    OAUTH_MCP_PATH,
     OAUTH_STORAGE_KEY_SALT,
     OWNER_SECRET_RATE_LIMIT_KEY,
 )
-from app.grok_oauth.crypto import (
+from app.mcp_oauth.crypto import (
     decrypt_text,
     derive_mac_key,
     derive_signing_key,
@@ -47,54 +47,54 @@ from app.grok_oauth.crypto import (
     verify_owner_secret,
     verify_sentinel,
 )
-from app.grok_oauth.rate_limit import FailedAttemptLimiter
-from app.grok_oauth.registration import (
+from app.mcp_oauth.rate_limit import FailedAttemptLimiter
+from app.mcp_oauth.registration import (
     is_valid_pkce_s256_challenge,
     normalize_registered_client,
 )
-from app.grok_oauth.tokens import AccessTokenIssuer
+from app.mcp_oauth.tokens import AccessTokenIssuer
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
 
 
-def grok_oauth_issuer(public_base_url: str) -> str:
+def mcp_oauth_issuer(public_base_url: str) -> str:
     return public_base_url.rstrip("/")
 
 
-def grok_mcp_resource(public_base_url: str) -> str:
-    return f"{grok_oauth_issuer(public_base_url)}{GROK_MCP_PATH}"
+def oauth_mcp_resource(public_base_url: str) -> str:
+    return f"{mcp_oauth_issuer(public_base_url)}{OAUTH_MCP_PATH}"
 
 
 def normalize_resource(value: str) -> str:
     return value.rstrip("/")
 
 
-class GrokOAuthProvider(OAuthProvider):
-    """Self-hosted single-owner OAuth 2.1 provider for the Grok MCP endpoint."""
+class MCPOAuthProvider(OAuthProvider):
+    """Self-hosted single-owner OAuth 2.1 provider for the browser MCP endpoint."""
 
     def __init__(self, settings: Settings) -> None:
         if not settings.public_base_url:
-            raise RuntimeError("PUBLIC_BASE_URL is required when Grok OAuth is enabled")
-        issuer = grok_oauth_issuer(settings.public_base_url)
-        resource = grok_mcp_resource(settings.public_base_url)
+            raise RuntimeError("PUBLIC_BASE_URL is required when MCP OAuth is enabled")
+        issuer = mcp_oauth_issuer(settings.public_base_url)
+        resource = oauth_mcp_resource(settings.public_base_url)
         super().__init__(
             base_url=issuer,
             resource_base_url=issuer,
             issuer_url=issuer,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
-                valid_scopes=[GROK_OAUTH_SCOPE],
-                default_scopes=[GROK_OAUTH_SCOPE],
+                valid_scopes=[MCP_OAUTH_SCOPE],
+                default_scopes=[MCP_OAUTH_SCOPE],
             ),
             revocation_options=RevocationOptions(enabled=True),
-            required_scopes=[GROK_OAUTH_SCOPE],
+            required_scopes=[MCP_OAUTH_SCOPE],
         )
         self._settings = settings
         self.resource = resource
-        owner_hash = Settings.reveal(settings.grok_mcp_oauth_owner_secret_hash)
-        signing_material = Settings.reveal(settings.grok_mcp_oauth_signing_key)
-        storage_material = Settings.reveal(settings.grok_mcp_oauth_storage_encryption_key)
+        owner_hash = Settings.reveal(settings.mcp_oauth_owner_secret_hash)
+        signing_material = Settings.reveal(settings.mcp_oauth_signing_key)
+        storage_material = Settings.reveal(settings.mcp_oauth_storage_encryption_key)
         self._owner_secret_hash = owner_hash
         self._fernet = derive_storage_fernet(storage_material, salt=OAUTH_STORAGE_KEY_SALT)
         self._mac_key = derive_mac_key(storage_material, salt=OAUTH_STORAGE_KEY_SALT)
@@ -110,11 +110,9 @@ class GrokOAuthProvider(OAuthProvider):
             max_failures=FAILED_ATTEMPT_LIMIT,
             window_seconds=FAILED_ATTEMPT_WINDOW_SECONDS,
         )
-        self.access_token_ttl = settings.grok_mcp_oauth_access_token_ttl_seconds
-        self.refresh_token_ttl_seconds = (
-            settings.grok_mcp_oauth_refresh_token_ttl_days * 24 * 60 * 60
-        )
-        self.auth_code_ttl = settings.grok_mcp_oauth_auth_code_ttl_seconds
+        self.access_token_ttl = settings.mcp_oauth_access_token_ttl_seconds
+        self.refresh_token_ttl_seconds = settings.mcp_oauth_refresh_token_ttl_days * 24 * 60 * 60
+        self.auth_code_ttl = settings.mcp_oauth_auth_code_ttl_seconds
 
     def attach_database(self, db: Database) -> None:
         self._db = db
@@ -159,7 +157,7 @@ class GrokOAuthProvider(OAuthProvider):
                 owner_hash_fingerprint=self._owner_fingerprint,
                 signing_key_fingerprint=self._signing_fingerprint,
             )
-            logger.info("revoked grok oauth families after credential rotation count=%s", revoked)
+            logger.info("revoked MCP OAuth families after credential rotation count=%s", revoked)
         await store.oauth_purge_expired(_iso_now())
 
     def _canonical_resource(self, value: str | None) -> str:
@@ -176,8 +174,8 @@ class GrokOAuthProvider(OAuthProvider):
         return self.resource
 
     def _scopes(self, requested: list[str] | None) -> list[str]:
-        scopes = list(requested or [GROK_OAUTH_SCOPE])
-        if scopes != [GROK_OAUTH_SCOPE]:
+        scopes = list(requested or [MCP_OAUTH_SCOPE])
+        if scopes != [MCP_OAUTH_SCOPE]:
             raise AuthorizeError(error="invalid_scope", error_description="invalid scope")
         return scopes
 
@@ -213,12 +211,12 @@ class GrokOAuthProvider(OAuthProvider):
                 )
         now = datetime.now(UTC)
         unused_before = now - timedelta(
-            seconds=grok_oauth_constants.OAUTH_CLIENT_UNUSED_RETENTION_SECONDS
+            seconds=mcp_oauth_constants.OAUTH_CLIENT_UNUSED_RETENTION_SECONDS
         )
         inserted = await self._store().oauth_insert_client_with_quota(
             client_id=normalized.client_id,
             ciphertext=self.encrypt_payload(normalized.model_dump(mode="json")),
-            max_clients=grok_oauth_constants.OAUTH_CLIENT_MAX_COUNT,
+            max_clients=mcp_oauth_constants.OAUTH_CLIENT_MAX_COUNT,
             unused_before=unused_before.isoformat(),
             now=now.isoformat(),
         )
@@ -266,8 +264,8 @@ class GrokOAuthProvider(OAuthProvider):
             csrf_hash=self.hash_secret_material(csrf_token),
             ciphertext=self.encrypt_payload(payload),
             expires_at=expires_at.isoformat(),
-            max_transactions=grok_oauth_constants.OAUTH_TRANSACTION_MAX_COUNT,
-            max_per_client=grok_oauth_constants.OAUTH_TRANSACTION_MAX_PER_CLIENT,
+            max_transactions=mcp_oauth_constants.OAUTH_TRANSACTION_MAX_COUNT,
+            max_per_client=mcp_oauth_constants.OAUTH_TRANSACTION_MAX_PER_CLIENT,
             now=now.isoformat(),
         )
         if not inserted:
@@ -281,7 +279,7 @@ class GrokOAuthProvider(OAuthProvider):
             transaction_id,
         )
         query = urlencode({"tx": transaction_id})
-        return f"{GROK_OAUTH_CONSENT_PATH}?{query}"
+        return f"{MCP_OAUTH_CONSENT_PATH}?{query}"
 
     async def load_transaction(self, transaction_id: str) -> dict[str, Any] | None:
         row = await self._store().oauth_get_transaction(transaction_id)
@@ -346,7 +344,7 @@ class GrokOAuthProvider(OAuthProvider):
                     "scopes": transaction["scopes"],
                     "resource": transaction["resource"],
                     "code_challenge": transaction["code_challenge"],
-                    "subject": GROK_OAUTH_SUBJECT,
+                    "subject": MCP_OAUTH_SUBJECT,
                 }
             ),
             expires_at=expires_at.isoformat(),
@@ -388,7 +386,7 @@ class GrokOAuthProvider(OAuthProvider):
             expires_at=expires_at.timestamp(),
             code_challenge=str(payload["code_challenge"]),
             resource=str(payload["resource"]),
-            subject=str(payload.get("subject") or GROK_OAUTH_SUBJECT),
+            subject=str(payload.get("subject") or MCP_OAUTH_SUBJECT),
         )
 
     async def exchange_authorization_code(
@@ -433,7 +431,7 @@ class GrokOAuthProvider(OAuthProvider):
             client_id=str(row["client_id"]),
             scopes=list(payload["scopes"]),
             expires_at=int(expires_at.timestamp()),
-            subject=str(payload.get("subject") or GROK_OAUTH_SUBJECT),
+            subject=str(payload.get("subject") or MCP_OAUTH_SUBJECT),
         )
 
     async def exchange_refresh_token(
@@ -478,7 +476,7 @@ class GrokOAuthProvider(OAuthProvider):
             return None
         scope = str(claims.get("scope") or "")
         scopes = [part for part in scope.split() if part]
-        if GROK_OAUTH_SCOPE not in scopes:
+        if MCP_OAUTH_SCOPE not in scopes:
             return None
         expires_at = claims.get("exp")
         return AccessToken(
@@ -487,7 +485,7 @@ class GrokOAuthProvider(OAuthProvider):
             scopes=scopes,
             expires_at=int(expires_at) if isinstance(expires_at, int) else None,
             resource=self.resource,
-            subject=GROK_OAUTH_SUBJECT,
+            subject=MCP_OAUTH_SUBJECT,
             claims=claims,
         )
 
@@ -508,7 +506,7 @@ class GrokOAuthProvider(OAuthProvider):
 
     async def revoke_all(self) -> int:
         count = await self._store().oauth_revoke_all_families()
-        logger.info("revoked all grok oauth families count=%s", count)
+        logger.info("revoked all MCP OAuth families count=%s", count)
         return count
 
     async def _issue_token_pair(
@@ -564,7 +562,7 @@ class GrokOAuthProvider(OAuthProvider):
                 {
                     "scopes": scopes,
                     "resource": self.resource,
-                    "subject": GROK_OAUTH_SUBJECT,
+                    "subject": MCP_OAUTH_SUBJECT,
                 }
             ),
             expires_at=refresh_expires.isoformat(),

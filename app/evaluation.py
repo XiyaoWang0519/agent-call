@@ -24,7 +24,6 @@ EVALUATION_DEBUG_TOKEN = "evaluation-debug-token"
 EVALUATION_DEPLOY_TOKEN = "evaluation-deploy-token"
 EVALUATION_OPENAI_KEY = "sk-evaluation-not-a-real-key"
 EVALUATION_OPENAI_WEBHOOK = "whsec_evaluation-not-a-real-secret"
-EVALUATION_EXA_KEY = "exa-evaluation-not-a-real-key"
 EVALUATION_TWILIO_AUTH = "evaluation-twilio-auth-token"
 
 # Sample destination used only by doctor --prepare-only policy checks and smoke.
@@ -33,7 +32,6 @@ EVALUATION_TARGET_PHONE = "+15550000002"
 EVALUATION_SECRET_FIELDS: tuple[tuple[str, str], ...] = (
     ("openai_api_key", EVALUATION_OPENAI_KEY),
     ("openai_webhook_secret", EVALUATION_OPENAI_WEBHOOK),
-    ("exa_api_key", EVALUATION_EXA_KEY),
     ("twilio_auth_token", EVALUATION_TWILIO_AUTH),
     ("mcp_bearer_token", EVALUATION_MCP_BEARER),
     ("debug_api_token", EVALUATION_DEBUG_TOKEN),

@@ -8,13 +8,13 @@ from starlette.datastructures import FormData
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from twilio.request_validator import RequestValidator
 
-from app.grok_oauth.constants import CONSENT_BODY_MAX_BYTES, REGISTER_BODY_MAX_BYTES
+from app.mcp_oauth.constants import CONSENT_BODY_MAX_BYTES, REGISTER_BODY_MAX_BYTES
 from app.settings import Settings
 
 OPENAI_WEBHOOK_BODY_MAX_BYTES = 256 * 1024
 TWILIO_WEBHOOK_BODY_MAX_BYTES = 64 * 1024
-GROK_OAUTH_CONSENT_BODY_MAX_BYTES = CONSENT_BODY_MAX_BYTES
-GROK_OAUTH_REGISTER_BODY_MAX_BYTES = REGISTER_BODY_MAX_BYTES
+MCP_OAUTH_CONSENT_BODY_MAX_BYTES = CONSENT_BODY_MAX_BYTES
+MCP_OAUTH_REGISTER_BODY_MAX_BYTES = REGISTER_BODY_MAX_BYTES
 
 
 class _RequestBodyTooLarge(Exception):
@@ -33,10 +33,10 @@ class WebhookBodyLimitMiddleware:
             return OPENAI_WEBHOOK_BODY_MAX_BYTES
         if path.startswith("/webhooks/twilio/"):
             return TWILIO_WEBHOOK_BODY_MAX_BYTES
-        if path == "/grok/oauth/consent":
-            return GROK_OAUTH_CONSENT_BODY_MAX_BYTES
+        if path == "/oauth/consent":
+            return MCP_OAUTH_CONSENT_BODY_MAX_BYTES
         if path == "/register":
-            return GROK_OAUTH_REGISTER_BODY_MAX_BYTES
+            return MCP_OAUTH_REGISTER_BODY_MAX_BYTES
         return None
 
     @staticmethod

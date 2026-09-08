@@ -146,6 +146,17 @@ class FollowUp(EvidenceValue):
     owner_action_required: bool = True
 
 
+class ObjectiveAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(description="One material requirement from the approved objective.")
+    status: Literal["met", "unmet", "uncertain"]
+    evidence_turn_ids: list[str] = Field(
+        default_factory=list,
+        description="Exact transcript turn IDs supporting this assessment; met requires evidence.",
+    )
+
+
 class ExtractedCallResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -159,8 +170,17 @@ class ExtractedCallResult(BaseModel):
         "transferred",
         "failed",
         "unknown",
-    ]
+    ] = Field(
+        description=(
+            "Whether the approved call objective was achieved, based on transcript evidence. "
+            "A connected or ended call alone is not a completed objective."
+        )
+    )
     summary: str
+    objective_assessments: list[ObjectiveAssessment] = Field(
+        default_factory=list,
+        description="Assess every material requirement, including unanswered or incomplete parts.",
+    )
     commitments: list[Commitment] = Field(default_factory=list)
     confirmation_numbers: list[EvidenceValue] = Field(default_factory=list)
     follow_ups: list[FollowUp] = Field(default_factory=list)
@@ -171,8 +191,12 @@ class StoredCallResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     call_id: str
-    call_status: Literal["completed", "transferred", "failed", "timed_out"]
-    finalization_status: Literal["succeeded", "failed", "telephony_only"]
+    call_status: Literal["completed", "transferred", "failed", "timed_out"] = Field(
+        description="Telephony lifecycle status; completed means the call ended, not task success."
+    )
+    finalization_status: Literal["succeeded", "failed", "telephony_only"] = Field(
+        description="Result extraction status; succeeded does not mean the call objective succeeded."
+    )
     outcome: Literal[
         "completed",
         "partially_completed",
@@ -183,7 +207,12 @@ class StoredCallResult(BaseModel):
         "transferred",
         "failed",
         "unknown",
-    ]
+    ] = Field(
+        description=(
+            "Assessment of the approved call objective, distinct from telephony and extraction "
+            "status. Read the summary for achieved and unanswered parts of the request."
+        )
+    )
     result_source: Literal[
         "realtime_tool", "post_call_extractor", "telephony_only", "extraction_failed"
     ]
@@ -193,7 +222,13 @@ class StoredCallResult(BaseModel):
     follow_ups: list[FollowUp] = Field(default_factory=list)
     answered_by: str | None = None
     answer_handling: str | None = None
-    transcript_complete: bool
+    transcript_complete: bool = Field(
+        description=(
+            "Transcript availability heuristic: speech was captured without a known fatal "
+            "transcription or session error. Does not prove every utterance was captured, "
+            "heard by the callee, or that the objective was completed."
+        )
+    )
     raw_transcript_available: bool
     finalized_at: datetime = Field(default_factory=utc_now)
 
