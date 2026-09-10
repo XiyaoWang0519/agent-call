@@ -240,68 +240,24 @@ class TranscriptTurn(BaseModel):
     text: str
     source_event_type: str
     source_event_id: str
+    start_ms: float | None = Field(default=None, ge=0)
+    end_ms: float | None = Field(default=None, ge=0)
     sequence_number: int
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class InputTranscription(BaseModel):
+class LiveAudioOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    model: str = Field(min_length=1)
-    delay: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+    voice: str = "marin"
 
 
-class SemanticVad(BaseModel):
+class LiveAudio(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    type: Literal["semantic_vad"] = "semantic_vad"
-    eagerness: Literal["low", "medium", "high", "auto"] = "auto"
-    create_response: bool
-    interrupt_response: bool
+    # SIP negotiates the codec. Do not send a WebSocket audio.format here.
+    output: LiveAudioOutput
 
 
-class ServerVad(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["server_vad"] = "server_vad"
-    threshold: float = Field(default=0.5, ge=0, le=1)
-    prefix_padding_ms: int = Field(default=300, ge=0, le=1000)
-    silence_duration_ms: int = Field(default=300, ge=200, le=1000)
-    create_response: bool
-    interrupt_response: bool
-
-
-class InputNoiseReduction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["near_field", "far_field"]
-
-
-class RealtimeAudioInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # Do not set audio format for SIP: OpenAI negotiates G.711 with the carrier.
-    # Explicit format values have been observed to clobber PCMU into PCM and silence the leg.
-    transcription: InputTranscription
-    turn_detection: SemanticVad | ServerVad
-    noise_reduction: InputNoiseReduction | None = None
-
-
-class RealtimeAudioOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    voice: Literal["cedar"] = "cedar"
-    speed: float = Field(default=1.0, ge=0.25, le=1.5)
-
-
-class RealtimeAudio(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    input: RealtimeAudioInput
-    output: RealtimeAudioOutput
-
-
-class RealtimeFunctionTool(BaseModel):
+class LiveFunctionTool(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["function"] = "function"
@@ -319,36 +275,47 @@ class RealtimeFunctionTool(BaseModel):
     parameters: dict[str, Any]
 
 
+class LiveResponsesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model: Literal["gpt-5.6-terra"] = "gpt-5.6-terra"
+    reasoning: dict[str, str] = Field(default_factory=lambda: {"effort": "low"})
+    instructions: str
+    tools: list[LiveFunctionTool]
+    parallel_tool_calls: Literal[False] = False
+    tool_choice: Literal["auto"] = "auto"
+
+
+class LiveDelegation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["responses"] = "responses"
+    responses: LiveResponsesConfig
+
+
+class LiveSessionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["live"] = "live"
+    model: Literal["gpt-live-1"] = "gpt-live-1"
+    instructions: str
+    audio: LiveAudio
+    delegation: LiveDelegation
+    store: Literal[False] = False
+
+
 class AcceptPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    type: Literal["realtime"] = "realtime"
-    model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
-    reasoning: dict[str, Literal["low"]] = Field(
-        default_factory=lambda: {"effort": "low"}  # type: ignore[arg-type]
-    )
-    output_modalities: list[Literal["audio"]] = Field(
-        default_factory=lambda: ["audio"]  # type: ignore[arg-type]
-    )
-    max_output_tokens: Literal["inf"] = "inf"
-    parallel_tool_calls: Literal[True] = True
-    tool_choice: Literal["auto"] = "auto"
-    # Writes Realtime session activity to the OpenAI Traces dashboard.
-    tracing: Literal["auto"] = "auto"
-    instructions: str
-    audio: RealtimeAudio
-    tools: list[RealtimeFunctionTool]
+    session: LiveSessionConfig
 
 
-class RealtimeIncomingData(BaseModel):
-    call_id: str
+class LiveIncomingData(BaseModel):
+    type: Literal["sip"]
+    session_id: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
     sip_headers: list[dict[str, str]] = Field(default_factory=list)
 
 
-class RealtimeIncomingEvent(BaseModel):
-    type: Literal["realtime.call.incoming"]
+class LiveIncomingEvent(BaseModel):
+    type: Literal["live.transport.incoming"]
     id: str
-    data: RealtimeIncomingData
+    data: LiveIncomingData
 
 
 class WebSearchRequest(BaseModel):
@@ -483,6 +450,8 @@ class AdvisoryOutcome(BaseModel):
 class VoiceEndCallRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    farewell: str = Field(min_length=2, max_length=500)
+
     reason: Literal[
         "objective_completed",
         "callee_declined",
@@ -493,6 +462,11 @@ class VoiceEndCallRequest(BaseModel):
 
 
 class CallUsage(BaseModel):
+    live_session_seconds: float = 0.0
+    live_usage_finalized: bool = False
+    backend_input_tokens: int = 0
+    backend_cached_input_tokens: int = 0
+    backend_output_tokens: int = 0
     realtime_input_text_tokens: int = 0
     realtime_input_audio_tokens: int = 0
     realtime_input_cached_text_tokens: int = 0
@@ -510,6 +484,8 @@ class CallCost(BaseModel):
     currency: str = "USD"
     estimated: bool = True
     usage: CallUsage
+    live_cost_usd: float = 0.0
+    backend_cost_usd: float = 0.0
     realtime_cost_usd: float
     extractor_cost_usd: float
     twilio_cost_usd: float

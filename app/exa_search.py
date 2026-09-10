@@ -37,7 +37,7 @@ class ExaSearchResult:
 
 
 def _serialized_size(value: dict[str, Any]) -> int:
-    # RealtimeBridge currently uses json.dumps with these defaults for function output.
+    # LiveBridge currently uses json.dumps with these defaults for function output.
     return len(json.dumps(value).encode("utf-8"))
 
 

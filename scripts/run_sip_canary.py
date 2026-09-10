@@ -129,8 +129,8 @@ async def run(args: argparse.Namespace) -> int:
     checks = {
         "accept_2xx": audit["openai_accept_status"] is not None
         and 200 <= audit["openai_accept_status"] < 300,
-        "transcription_echoed": audit["transcription_verified"] == 1,
-        "semantic_vad_echoed": audit["semantic_vad_verified"] == 1,
+        "live_session_verified": audit["live_session_verified"] == 1,
+        "carrier_monitor_bound": bool(audit["media_stream_sid"]),
         "spoken_nonce_transcribed": bool(nonce_turns),
         "automatic_response_after_nonce": responded_after_nonce,
         "record_outcome_tool_behavior": audit["advisory_outcome"] is not None
@@ -139,7 +139,7 @@ async def run(args: argparse.Namespace) -> int:
         "tool_output_continuation": audit["tool_continuation_observed"] == 1
         if use_outcome_tool
         else True,
-        "interruption_cancel_event": audit["interruption_observed"] == 1,
+        "carrier_interruption_observed": audit["interruption_observed"] == 1,
         "interruption_audio_stopped": interruption_confirmed,
         "terminal_result_available": terminal.get("result") is not None,
         "raw_transcript_available": terminal.get("result", {}).get("raw_transcript_available")

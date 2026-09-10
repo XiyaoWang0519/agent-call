@@ -3,221 +3,92 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
-from app.openai_realtime import RealtimeBridge
+from app.openai_live import LiveBridge
+from app.settings import Settings
 
 
 async def _noop(*args, **kwargs) -> None:
     return None
 
 
-def test_initial_accept_payload_is_typed_and_matches_release_contract(settings, packet):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
+def bridge_for(settings):
+    return LiveBridge(settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop)
 
-    assert payload["type"] == "realtime"
-    assert payload["model"] == "gpt-realtime-2.1"
-    assert payload["reasoning"] == {"effort": "low"}
-    assert payload["output_modalities"] == ["audio"]
-    assert payload["max_output_tokens"] == "inf"
-    assert payload["parallel_tool_calls"] is True
-    assert payload["tool_choice"] == "auto"
-    assert payload["tracing"] == "auto"
-    assert payload["audio"]["input"] == {
-        "transcription": {"model": "gpt-realtime-whisper"},
-        "noise_reduction": {"type": "far_field"},
-        "turn_detection": {
-            "type": "semantic_vad",
-            "eagerness": "auto",
-            "create_response": False,
-            "interrupt_response": False,
-        },
-    }
-    assert payload["audio"]["output"] == {
-        "voice": "cedar",
-        "speed": 1.0,
-    }
-    assert "format" not in payload["audio"]["input"]
-    assert "format" not in payload["audio"]["output"]
-    assert [tool["name"] for tool in payload["tools"]] == [
+
+def test_accept_contract_separates_live_voice_and_responses_tools(settings, packet):
+    payload = bridge_for(settings).build_accept_payload(packet).model_dump(exclude_none=True)
+    assert set(payload) == {"session"}
+    session = payload["session"]
+    assert session["type"] == "live"
+    assert session["model"] == "gpt-live-1"
+    assert session["store"] is False
+    assert session["audio"] == {"output": {"voice": "marin"}}
+    assert session["delegation"]["type"] == "responses"
+    backend = session["delegation"]["responses"]
+    assert backend["model"] == "gpt-5.6-terra"
+    assert backend["reasoning"] == {"effort": "low"}
+    assert backend["parallel_tool_calls"] is False
+    assert backend["tool_choice"] == "auto"
+    assert packet.approved_context_json() in backend["instructions"]
+    assert packet.approved_context_json() not in session["instructions"]
+    assert {t["name"] for t in backend["tools"]} == {
         "transfer_to_owner",
         "record_call_outcome",
         "search_web",
         "send_dtmf",
-    ]
-    assert "ask_agent" not in [tool["name"] for tool in payload["tools"]]
-    search_web = payload["tools"][2]
-    assert search_web["parameters"] == {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "minLength": 2,
-                "maxLength": 500,
-                "description": (
-                    "A standalone natural-language web search query with all context needed "
-                    "to understand it."
-                ),
-            }
-        },
-        "required": ["query"],
-        "additionalProperties": False,
+        "finish_call_after_goodbye",
     }
-    send_dtmf = payload["tools"][3]
-    assert send_dtmf["parameters"]["required"] == ["digits"]
-    assert send_dtmf["parameters"]["properties"]["digits"]["pattern"] == "^[0-9*#w]{1,32}$"
-    assert (
-        "explicitly requested short test sequence together"
-        in send_dtmf["parameters"]["properties"]["digits"]["description"]
-    )
-    assert send_dtmf["parameters"]["additionalProperties"] is False
-    # Closing is classified silently after speech; no closing tool can induce a
-    # spoken tool preamble instead of the actual farewell.
-    assert "say goodbye" in payload["instructions"].lower()
-    assert "callee has nothing further" in payload["instructions"]
-    assert "answer it fully" in payload["instructions"]
+    assert all(t["type"] == "function" and "function" not in t for t in backend["tools"])
+    closing = next(t for t in backend["tools"] if t["name"] == "finish_call_after_goodbye")
+    assert closing["parameters"]["required"] == ["reason", "farewell"]
+    assert "turn_detection" not in str(payload)
+    assert "transcription" not in session["audio"]
 
 
-def test_accept_payload_includes_ask_agent_when_enabled(settings, packet):
-    settings.ask_agent_enabled = True
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
-    names = [tool["name"] for tool in payload["tools"]]
-    assert names == [
-        "transfer_to_owner",
-        "record_call_outcome",
-        "search_web",
-        "send_dtmf",
-        "ask_agent",
-    ]
-    ask_agent = next(tool for tool in payload["tools"] if tool["name"] == "ask_agent")
-    assert ask_agent["parameters"]["required"] == ["question"]
-    assert "question" in ask_agent["parameters"]["properties"]
-    assert "Never guess" in ask_agent["description"]
-    assert "ask_agent" in payload["instructions"]
+@pytest.mark.parametrize("field", ["model", "parallel_tool_calls"])
+def test_session_echo_requires_expected_backend(settings, packet, field):
+    bridge = bridge_for(settings)
+    session = bridge.build_accept_payload(packet).session.model_dump()
+    assert bridge.session_configuration_confirmed({"session": session})
+    session["delegation"]["responses"][field] = "unexpected"
+    assert not bridge.session_configuration_confirmed({"session": session})
 
 
-def test_session_created_echo_requires_transcription_and_full_initial_vad(settings, packet):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    event = {
-        "session": {
-            "audio": {
-                "input": {
-                    "transcription": {"model": "gpt-realtime-whisper"},
-                    "noise_reduction": {"type": "far_field"},
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": False,
-                        "interrupt_response": False,
-                    },
-                }
-            }
-        }
-    }
-    assert bridge.expected_transcription_echoed(event)
-    assert bridge.expected_initial_vad_echoed(event)
-    event["session"]["audio"]["input"]["turn_detection"]["eagerness"] = "high"
-    assert not bridge.expected_initial_vad_echoed(event)
-
-
-def test_semantic_vad_high_setting_is_available_for_tuning(settings, packet):
-    from app.settings import Settings
-
-    values = settings.model_dump()
-    values["semantic_vad_eagerness"] = "high"
-    tuned_settings = Settings(**values)
-    bridge = RealtimeBridge(
-        tuned_settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-
-    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
-    turn = payload["audio"]["input"]["turn_detection"]
-    assert turn["eagerness"] == "high"
-    assert bridge.expected_initial_vad_echoed(
-        {"session": {"audio": {"input": payload["audio"]["input"]}}}
-    )
-
-
-def test_activation_echo_must_preserve_configured_semantic_vad(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    event = {
-        "session": {
-            "audio": {
-                "input": {
-                    "noise_reduction": {"type": "far_field"},
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": True,
-                        "interrupt_response": True,
-                    },
-                }
-            }
-        }
-    }
-
-    assert bridge.activation_update_confirmed(event)
-    event["session"]["audio"]["input"]["turn_detection"]["eagerness"] = "high"
-    assert not bridge.activation_update_confirmed(event)
+def test_session_echo_rejects_wrong_voice_model(settings, packet):
+    bridge = bridge_for(settings)
+    session = bridge.build_accept_payload(packet).session.model_dump()
+    session["model"] = "gpt-realtime-2.1"
+    assert not bridge.session_configuration_confirmed({"session": session})
 
 
 @pytest.mark.parametrize("key", [None, SecretStr(""), SecretStr("  ")])
 def test_no_exa_omits_search_tool_and_search_instructions(settings, packet, key):
     settings.exa_api_key = key
     settings.ask_agent_enabled = True
-    bridge = RealtimeBridge(
-        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
-    )
-    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
-    assert "search_web" not in {tool["name"] for tool in payload["tools"]}
-    assert "search_web" not in payload["instructions"]
-    assert "Web search is unavailable" in payload["instructions"]
-    assert "ask_agent" in {tool["name"] for tool in payload["tools"]}
+    backend = bridge_for(settings).build_accept_payload(packet).session.delegation.responses
+    assert "search_web" not in {tool.name for tool in backend.tools}
+    assert "search_web" not in backend.instructions
+    assert "Web search is unavailable" in backend.instructions
+    assert "ask_agent" in {tool.name for tool in backend.tools}
 
 
-def test_default_server_vad_payload_preserves_latency_settings(packet):
-    from app.settings import Settings
+def test_optional_owner_and_hold_tools(settings, packet):
+    settings.ask_agent_enabled = settings.hold_detection_enabled = True
+    backend = bridge_for(settings).build_accept_payload(packet).session.delegation.responses
+    assert {"ask_agent", "report_hold"} <= {t.name for t in backend.tools}
+    assert "never guess or invent the pending answer" in backend.instructions
 
-    settings = Settings(_env_file=None)
-    bridge = RealtimeBridge(
-        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
-    )
-    payload = bridge.build_accept_payload(packet).model_dump(exclude_none=True)
-    assert payload["audio"]["input"]["turn_detection"] == {
-        "type": "server_vad",
-        "threshold": 0.5,
-        "prefix_padding_ms": 300,
-        "silence_duration_ms": 300,
-        "create_response": False,
-        "interrupt_response": False,
-    }
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"LIVE_MODEL": "gpt-realtime-2.1"},
+        {"LIVE_BACKEND_MODEL": "gpt-realtime-mini"},
+        {"LIVE_BACKEND_REASONING_EFFORT": "invalid"},
+    ],
+)
+def test_configuration_cannot_switch_back_to_realtime(env):
+    with pytest.raises(ValidationError):
+        Settings.from_environ(env)

@@ -245,7 +245,7 @@ class Finalizer:
             "answered_by": call.get("answered_by"),
             "duration_seconds": call.get("duration_seconds"),
             "transfer_outcome": call.get("transfer_outcome"),
-            "realtime_advisory_outcome": call.get("advisory_outcome"),
+            "voice_advisory_outcome": call.get("advisory_outcome"),
             # Only the citable id is exposed; source_event_id and friends are omitted so
             # the extractor cannot confuse a similar-looking id namespace with turn_id.
             "transcript": [

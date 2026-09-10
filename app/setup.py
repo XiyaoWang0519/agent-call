@@ -154,7 +154,7 @@ def _collect(*, public_url: str | None = None) -> dict[str, str]:
         ),
     }
     print("In that OpenAI project, add the /webhooks/openai endpoint for this service.")
-    print("Subscribe to realtime.call.incoming, then copy its signing secret below.")
+    print("Subscribe to live.transport.incoming, then copy its signing secret below.")
     values["OPENAI_WEBHOOK_SECRET"] = _ask("OpenAI webhook signing secret", secret=True)
     values["TWILIO_ACCOUNT_SID"] = _ask(
         "Twilio account SID",

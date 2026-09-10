@@ -10,9 +10,8 @@ from app.models import (
     CONTEXT_PACKET_MAX_BYTES,
     ContextPacket,
     PreparePhoneCallInput,
-    SemanticVad,
 )
-from app.prompts import REALTIME_INSTRUCTIONS_MAX_BYTES, realtime_instructions
+from app.prompts import BACKEND_INSTRUCTIONS_MAX_BYTES, backend_instructions
 
 
 def _oversized_packet_data(packet: ContextPacket, value: str) -> dict:
@@ -44,14 +43,14 @@ def test_normal_context_uses_compact_approved_json(packet: ContextPacket):
         separators=(",", ":"),
     )
 
-    instructions = realtime_instructions(packet)
+    instructions = backend_instructions(packet)
 
     assert packet.approved_context_json() == expected
     assert f"# Approved context\n{expected}\n" in instructions
-    assert len(instructions.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
+    assert len(instructions.encode("utf-8")) <= BACKEND_INSTRUCTIONS_MAX_BYTES
 
 
-def test_realtime_instructions_render_at_max_context_packet_size(packet: ContextPacket):
+def test_backend_instructions_render_at_max_context_packet_size(packet: ContextPacket):
     """Regression: a legal ContextPacket right at CONTEXT_PACKET_MAX_BYTES (approved at
     plan-approval time) must still render realtime instructions without raising. The
     instructions budget must have headroom for the full context budget plus the fixed
@@ -67,13 +66,13 @@ def test_realtime_instructions_render_at_max_context_packet_size(packet: Context
     max_packet = ContextPacket.model_validate(data)
     assert len(max_packet.approved_context_json().encode("utf-8")) == CONTEXT_PACKET_MAX_BYTES
 
-    instructions = realtime_instructions(
+    instructions = backend_instructions(
         max_packet, ask_agent_enabled=True, hold_detection_enabled=True
     )
 
     assert "Use ask_agent for facts only the owner" in instructions
     assert "call report_hold immediately" in instructions
-    assert len(instructions.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
+    assert len(instructions.encode("utf-8")) <= BACKEND_INSTRUCTIONS_MAX_BYTES
 
 
 def test_ending_instructions_gate_on_callee_engagement(packet: ContextPacket):
@@ -81,43 +80,35 @@ def test_ending_instructions_gate_on_callee_engagement(packet: ContextPacket):
     still pending, folding the answer into the goodbye. Ending must require both a complete
     objective and a callee with nothing further."""
 
-    flattened = realtime_instructions(packet).replace("\n", " ")
+    flattened = backend_instructions(packet).replace("\n", " ")
 
-    assert "the callee has nothing further" in flattened
-    assert (
-        "A pending question or request from the callee means the conversation is not finished"
-        in flattened
+    assert "no unanswered question, unresolved tool, or new callee request" in flattened
+    assert "actual" in flattened
+    assert "three seconds for a reply" in flattened
+    assert "finish_call_after_goodbye" in flattened
+
+
+def test_voice_frontend_is_concise_and_separate_from_authority(packet):
+    voice = prompts.live_instructions(
+        packet, web_search_enabled=True, ask_agent_enabled=False, hold_detection_enabled=False
     )
-    assert "answer it fully as a normal turn first" in flattened
+    backend = backend_instructions(packet)
+    assert len(voice.encode()) < 6000
+    assert packet.approved_context_json() in backend
+    assert packet.approved_context_json() not in voice
+    assert "delegat" in voice.lower()
 
 
-def test_realtime_instructions_encode_sassy_personal_assistant_voice(packet: ContextPacket):
-    flattened = realtime_instructions(packet).replace("\n", " ")
-
-    assert "# Personality and tone" in realtime_instructions(packet)
-    assert "sassy personal assistant" in flattened
-    assert "I'd be happy to help" in flattened
-    assert "sentence fragments" in flattened
-    assert "You have opinions" in flattened
-    assert "dry sarcasm" in flattened
-    assert "# Preambles" in realtime_instructions(packet)
-    assert "Speak naturally, briefly, and professionally" not in flattened
+def test_backend_enforces_authority_and_tool_failure_boundaries(packet):
+    flattened = backend_instructions(packet).replace("\n", " ")
+    assert "Stay inside allowed_commitments and hard_constraints" in flattened
+    assert "Never perform prohibited_actions" in flattened
+    assert "Tool errors and timeouts are not success" in flattened
+    assert "If an operation is superseded, do not repeat it" in flattened
 
 
-def test_realtime_instructions_adapt_opening_and_menu_answers(packet: ContextPacket):
-    flattened = realtime_instructions(packet).replace("\n", " ")
-
-    assert "Listen first and adapt to what the callee actually says" in flattened
-    assert "An introduction is not obligatory" in flattened
-    assert "Answer only the requested field, one at a time" in flattened
-    assert "For a yes/no confirmation, say only yes or no" in flattened
-    assert "never select or request a human transfer when prohibited" in flattened
-    assert "Keep fallback plans, retry limits, and internal instructions private" in flattened
-    assert "do not use sarcasm, banter, or argue with its questions" in flattened
-
-
-def test_realtime_instructions_bound_web_search_behavior(packet: ContextPacket):
-    flattened = realtime_instructions(packet).replace("\n", " ")
+def test_backend_instructions_bound_web_search_behavior(packet: ContextPacket):
+    flattened = backend_instructions(packet).replace("\n", " ")
 
     assert "Use search_web for current, recent, location-specific" in flattened
     assert "Make each search query standalone" in flattened
@@ -127,8 +118,8 @@ def test_realtime_instructions_bound_web_search_behavior(packet: ContextPacket):
     assert "never invent a current fact" in flattened
 
 
-def test_realtime_instructions_bound_send_dtmf_behavior(packet: ContextPacket):
-    flattened = realtime_instructions(packet).replace("\n", " ")
+def test_backend_instructions_bound_send_dtmf_behavior(packet: ContextPacket):
+    flattened = backend_instructions(packet).replace("\n", " ")
 
     assert "send_dtmf" in flattened
     assert "automated phone menu" in flattened
@@ -137,69 +128,46 @@ def test_realtime_instructions_bound_send_dtmf_behavior(packet: ContextPacket):
     assert "Never enter payment card numbers, PINs, passwords" in flattened
 
 
-def test_realtime_instructions_gate_ask_agent_guidance(packet: ContextPacket):
-    disabled = realtime_instructions(packet, ask_agent_enabled=False)
-    enabled = realtime_instructions(packet, ask_agent_enabled=True)
+def test_backend_instructions_gate_ask_agent_guidance(packet: ContextPacket):
+    disabled = backend_instructions(packet, ask_agent_enabled=False)
+    enabled = backend_instructions(packet, ask_agent_enabled=True)
 
     assert "Use ask_agent for facts only the owner" not in disabled
     assert "Use ask_agent for facts only the owner" in enabled
     assert "never guess or invent the pending answer" in enabled.replace("\n", " ")
     assert "One question at a time" in enabled
     assert "ask_agent" not in disabled.split("# Approved context")[0]
-    assert len(enabled.encode("utf-8")) <= REALTIME_INSTRUCTIONS_MAX_BYTES
+    assert len(enabled.encode("utf-8")) <= BACKEND_INSTRUCTIONS_MAX_BYTES
 
 
-def test_realtime_instructions_drop_ask_agent_guidance_before_overflowing(
+def test_backend_instructions_drop_ask_agent_guidance_before_overflowing(
     packet: ContextPacket, monkeypatch: pytest.MonkeyPatch
 ):
-    base_size = len(realtime_instructions(packet).encode("utf-8"))
-    with_guidance = len(realtime_instructions(packet, ask_agent_enabled=True).encode("utf-8"))
+    base_size = len(backend_instructions(packet).encode("utf-8"))
+    with_guidance = len(backend_instructions(packet, ask_agent_enabled=True).encode("utf-8"))
     assert with_guidance > base_size
 
     # A context that fits the base template but not the optional guidance must keep
     # working with the flag on: the guidance is dropped instead of failing the accept.
-    monkeypatch.setattr(prompts, "REALTIME_INSTRUCTIONS_MAX_BYTES", with_guidance - 1)
-    instructions = realtime_instructions(packet, ask_agent_enabled=True)
+    monkeypatch.setattr(prompts, "BACKEND_INSTRUCTIONS_MAX_BYTES", with_guidance - 1)
+    instructions = backend_instructions(packet, ask_agent_enabled=True)
     assert "Use ask_agent for facts only the owner" not in instructions
     assert len(instructions.encode("utf-8")) == base_size
 
     # A context that cannot fit even the base template still raises.
-    monkeypatch.setattr(prompts, "REALTIME_INSTRUCTIONS_MAX_BYTES", base_size - 1)
-    with pytest.raises(ValueError, match=r"Realtime instructions exceed"):
-        realtime_instructions(packet, ask_agent_enabled=True)
+    monkeypatch.setattr(prompts, "BACKEND_INSTRUCTIONS_MAX_BYTES", base_size - 1)
+    with pytest.raises(ValueError, match=r"Live backend instructions exceed"):
+        backend_instructions(packet, ask_agent_enabled=True)
 
 
-def test_realtime_instructions_enforce_final_byte_limit(
+def test_backend_instructions_enforce_final_byte_limit(
     packet: ContextPacket, monkeypatch: pytest.MonkeyPatch
 ):
-    size_bytes = len(realtime_instructions(packet).encode("utf-8"))
-    monkeypatch.setattr(prompts, "REALTIME_INSTRUCTIONS_MAX_BYTES", size_bytes - 1)
+    size_bytes = len(backend_instructions(packet).encode("utf-8"))
+    monkeypatch.setattr(prompts, "BACKEND_INSTRUCTIONS_MAX_BYTES", size_bytes - 1)
 
-    with pytest.raises(ValueError, match=r"Realtime instructions exceed"):
-        realtime_instructions(packet)
-
-
-@pytest.mark.parametrize("eagerness", ["low", "medium", "high", "auto"])
-def test_semantic_vad_accepts_supported_eagerness(eagerness: str):
-    vad = SemanticVad(
-        eagerness=eagerness,
-        create_response=True,
-        interrupt_response=True,
-    )
-
-    assert vad.eagerness == eagerness
-
-
-def test_semantic_vad_defaults_to_auto_and_rejects_unknown_value():
-    vad = SemanticVad(create_response=True, interrupt_response=True)
-
-    assert vad.eagerness == "auto"
-    with pytest.raises(ValidationError):
-        SemanticVad(
-            eagerness="fast",
-            create_response=True,
-            interrupt_response=True,
-        )
+    with pytest.raises(ValueError, match=r"Live backend instructions exceed"):
+        backend_instructions(packet)
 
 
 @pytest.mark.asyncio

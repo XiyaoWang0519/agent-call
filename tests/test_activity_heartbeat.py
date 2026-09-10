@@ -46,7 +46,7 @@ async def test_realtime_deltas_flush_one_latest_arrival_without_per_event_writes
         )
         # Production invokes this on the reader before dispatching the delta.
         service._note_call_activity(call_id, latest)
-        await service.handle_realtime_event(
+        await service.handle_live_event(
             call_id,
             {"type": "response.audio.delta", "event_id": f"evt_{sequence}"},
         )
@@ -201,7 +201,7 @@ async def test_terminal_call_clears_all_activity_tracking(service, packet):
     service._watchdog_claims.add(call_id)
     service._active_response_ids[call_id] = "resp_live"
     service._sip_output_playing.add(call_id)
-    service._audio_drain_terminations[call_id] = ("resp_live", "voice_model_end_call")
+    service._voice_end_reply_waits[call_id] = object()
     service._inflight_tools.add(call_id)
 
     assert await service.terminate_call(call_id, "owner_request") is True
@@ -213,7 +213,7 @@ async def test_terminal_call_clears_all_activity_tracking(service, packet):
     assert call_id in service._activity_tombstones
     assert call_id not in service._active_response_ids
     assert call_id not in service._sip_output_playing
-    assert call_id not in service._audio_drain_terminations
+    assert call_id not in service._voice_end_reply_waits
     assert call_id not in service._inflight_tools
     assert call_id not in service._dtmf_listen_deadlines_ns
 
@@ -235,10 +235,15 @@ async def test_live_assistant_response_prevents_false_stale_timeout(service, pac
 async def test_sip_output_events_track_live_playback(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
 
-    await service.handle_realtime_event(call_id, {"type": "output_audio_buffer.started"})
-    assert call_id in service._sip_output_playing
+    from app.call_audio import CallAudio
+    from tests.test_call_audio import SILENCE, VOICE
 
-    await service.handle_realtime_event(call_id, {"type": "output_audio_buffer.stopped"})
+    service._call_audio[call_id] = CallAudio(connected=True)
+    service.observe_media_audio(call_id, "outbound", 0, VOICE)
+    service.observe_media_audio(call_id, "outbound", 20, VOICE)
+    assert call_id in service._sip_output_playing
+    for ms in range(40, 340, 20):
+        service.observe_media_audio(call_id, "outbound", ms, SILENCE)
     assert call_id not in service._sip_output_playing
 
 

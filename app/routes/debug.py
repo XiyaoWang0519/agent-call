@@ -13,8 +13,10 @@ router = APIRouter(tags=["debug"], dependencies=[Depends(require_debug_token)])
 # surface in the debug "canary_evidence" audit block.
 DEBUG_AUDIT_CALL_FIELDS = {
     "openai_accept_status",
-    "transcription_verified",
-    "semantic_vad_verified",
+    "live_session_verified",
+    "media_stream_sid",
+    "live_usage_finalized",
+    "live_session_seconds",
     "sideband_open",
     "callee_joined",
     "callee_dialed",

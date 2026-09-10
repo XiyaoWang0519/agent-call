@@ -5,14 +5,20 @@ import json
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from app.openai_realtime import (
-    REALTIME_EVENT_QUEUE_MAXSIZE,
-    RealtimeBridge,
-    RealtimeRuntime,
+from app.openai_live import (
+    LIVE_EVENT_QUEUE_MAXSIZE,
+    LiveBridge,
+    LiveRuntime,
 )
+
+
+@pytest.fixture(autouse=True)
+def short_finalization_timeout(settings):
+    settings.live_session_close_timeout_seconds = 0.01
 
 
 class QueueWebSocket:
@@ -47,6 +53,48 @@ class QueueWebSocket:
             return
         self.closed = True
         await self.incoming.put(None)
+
+
+@pytest.mark.parametrize("pending", ["none", "tool", "response", "closing"])
+async def test_closing_review_never_overlaps_pending_backend_work(settings, pending):
+    bridge = LiveBridge(
+        settings,
+        SimpleNamespace(),
+        on_event=AsyncMock(),
+        on_open=AsyncMock(),
+        on_fatal=AsyncMock(),
+    )
+    websocket = QueueWebSocket()
+    runtime = LiveRuntime(call_id="review", openai_call_id="live_review", websocket=websocket)
+    bridge._runtime["review"] = runtime
+    if pending == "tool":
+        runtime.pending_tools["response_1"] = {"tool_1"}
+    elif pending == "response":
+        runtime.response_ids["delegation_1"] = "response_1"
+    elif pending == "closing":
+        runtime.closing = True
+    await bridge.review_closing("review")
+    assert [message["type"] for message in websocket.messages] == (
+        ["response.item.create", "response.create"] if pending == "none" else []
+    )
+
+
+async def test_accepted_closing_returns_result_without_another_backend_turn(settings):
+    bridge = LiveBridge(
+        settings, SimpleNamespace(), on_event=AsyncMock(), on_open=AsyncMock(), on_fatal=AsyncMock()
+    )
+    websocket = QueueWebSocket()
+    runtime = LiveRuntime(call_id="close", openai_call_id="live_close", websocket=websocket)
+    runtime.tool_responses["tool_1"] = "response_1"
+    runtime.pending_tools["response_1"] = {"tool_1"}
+    runtime.completed_responses.add("response_1")
+    bridge._runtime["close"] = runtime
+    await bridge.send_tool_result(
+        "close", "tool_1", {"accepted": True, "status": "closing_pending"}, continue_response=False
+    )
+    await bridge._continue_ready_batches(runtime)
+    assert [message["type"] for message in websocket.messages] == ["response.item.create"]
+    assert "tool_1" in runtime.emitted_results
 
 
 class FirstCloseFailsWebSocket(QueueWebSocket):
@@ -91,8 +139,8 @@ async def _start_bridge(
     on_activity: Callable[[str], None] | None = None,
     on_observe: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> tuple[
-    RealtimeBridge,
-    RealtimeRuntime,
+    LiveBridge,
+    LiveRuntime,
     asyncio.Task[None],
     list[tuple[str, str]],
     asyncio.Event,
@@ -104,7 +152,7 @@ async def _start_bridge(
         fatals.append((failed_call_id, reason))
         fatal_called.set()
 
-    bridge = RealtimeBridge(
+    bridge = LiveBridge(
         settings,
         SimpleNamespace(),
         on_event=on_event,
@@ -113,10 +161,10 @@ async def _start_bridge(
         on_activity=on_activity,
         on_observe=on_observe,
     )
-    runtime = RealtimeRuntime(call_id=call_id, openai_call_id=f"rtc_{call_id}")
+    runtime = LiveRuntime(call_id=call_id, openai_call_id=f"rtc_{call_id}")
     bridge._runtime[call_id] = runtime
     monkeypatch.setattr(
-        "app.openai_realtime.websockets.connect",
+        "app.openai_live.websockets.connect",
         lambda *args, **kwargs: FakeConnection(websocket),
     )
     task = asyncio.create_task(bridge._run(runtime), name=f"test-sideband:{call_id}")
@@ -195,18 +243,22 @@ async def test_session_updated_readiness_bypasses_blocked_dispatcher(settings, m
 
     update = asyncio.create_task(bridge.verify_initial_session("call_readiness"))
     await asyncio.wait_for(websocket.sent.wait(), timeout=1)
-    echoed = {"type": "session.updated", "session": {"audio": {"input": {}}}}
-    await websocket.feed({"type": "input_audio_buffer.speech_started"})
+    echoed = {
+        "type": "session.updated",
+        "client_event_id": websocket.messages[-1]["event_id"],
+        "session": {"model": "gpt-live-1"},
+    }
+    await websocket.feed({"type": "session.input_transcript.delta"})
     await websocket.feed(echoed)
 
     assert await asyncio.wait_for(update, timeout=1) == echoed
     assert handled_types == ["test.block"]
-    assert observed_types == ["test.block", "input_audio_buffer.speech_started", "session.updated"]
+    assert observed_types == ["test.block", "session.input_transcript.delta", "session.updated"]
 
     release_first.set()
     await websocket.close()
     await asyncio.wait_for(task, timeout=1)
-    assert handled_types == ["test.block", "input_audio_buffer.speech_started", "session.updated"]
+    assert handled_types == ["test.block", "session.input_transcript.delta", "session.updated"]
     assert fatals == []
 
 
@@ -214,12 +266,11 @@ async def test_session_updated_readiness_bypasses_blocked_dispatcher(settings, m
 async def test_on_open_can_drain_production_runtime_without_parent_child_cycle(
     settings, monkeypatch
 ):
-    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_CLOSE_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr("app.openai_live.LIVE_CLOSE_TIMEOUT_SECONDS", 0.1)
     websocket = QueueWebSocket()
     fatals: list[tuple[str, str]] = []
     drain_returned = asyncio.Event()
-    bridge_holder: dict[str, RealtimeBridge] = {}
+    bridge_holder: dict[str, LiveBridge] = {}
 
     async def on_open(call_id: str) -> None:
         await bridge_holder["bridge"].drain_and_close(call_id)
@@ -228,7 +279,7 @@ async def test_on_open_can_drain_production_runtime_without_parent_child_cycle(
     async def on_fatal(call_id: str, reason: str) -> None:
         fatals.append((call_id, reason))
 
-    bridge = RealtimeBridge(
+    bridge = LiveBridge(
         settings,
         SimpleNamespace(),
         on_event=_noop,
@@ -236,10 +287,10 @@ async def test_on_open_can_drain_production_runtime_without_parent_child_cycle(
         on_fatal=on_fatal,
     )
     bridge_holder["bridge"] = bridge
-    runtime = RealtimeRuntime(call_id="call_open_drain", openai_call_id="rtc_open_drain")
+    runtime = LiveRuntime(call_id="call_open_drain", openai_call_id="rtc_open_drain")
     bridge._runtime[runtime.call_id] = runtime
     monkeypatch.setattr(
-        "app.openai_realtime.websockets.connect",
+        "app.openai_live.websockets.connect",
         lambda *args, **kwargs: FakeConnection(websocket),
     )
     runtime.task = asyncio.create_task(bridge._run(runtime), name="sideband:call_open_drain")
@@ -259,11 +310,10 @@ async def test_on_open_can_drain_production_runtime_without_parent_child_cycle(
 async def test_child_close_failure_wakes_supervisor_and_clears_runtime(
     settings, monkeypatch, close_mode
 ):
-    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_CLOSE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.openai_live.LIVE_CLOSE_TIMEOUT_SECONDS", 0.01)
     websocket = FirstCloseFailsWebSocket(close_mode)
     fatals: list[tuple[str, str]] = []
-    bridge_holder: dict[str, RealtimeBridge] = {}
+    bridge_holder: dict[str, LiveBridge] = {}
     after_drain = asyncio.Event()
 
     async def on_open(call_id: str) -> None:
@@ -274,7 +324,7 @@ async def test_child_close_failure_wakes_supervisor_and_clears_runtime(
     async def on_fatal(call_id: str, reason: str) -> None:
         fatals.append((call_id, reason))
 
-    bridge = RealtimeBridge(
+    bridge = LiveBridge(
         settings,
         SimpleNamespace(),
         on_event=_noop,
@@ -282,10 +332,10 @@ async def test_child_close_failure_wakes_supervisor_and_clears_runtime(
         on_fatal=on_fatal,
     )
     bridge_holder["bridge"] = bridge
-    runtime = RealtimeRuntime(call_id=f"call_close_{close_mode}", openai_call_id="rtc_close")
+    runtime = LiveRuntime(call_id=f"call_close_{close_mode}", openai_call_id="rtc_close")
     bridge._runtime[runtime.call_id] = runtime
     monkeypatch.setattr(
-        "app.openai_realtime.websockets.connect",
+        "app.openai_live.websockets.connect",
         lambda *args, **kwargs: FakeConnection(websocket),
     )
     runtime.task = asyncio.create_task(bridge._run(runtime), name=f"sideband:{runtime.call_id}")
@@ -306,11 +356,10 @@ async def test_child_close_failure_wakes_supervisor_and_clears_runtime(
 async def test_dispatcher_close_failure_finishes_current_handler_before_cleanup(
     settings, monkeypatch
 ):
-    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_CLOSE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.openai_live.LIVE_CLOSE_TIMEOUT_SECONDS", 0.01)
     websocket = FirstCloseFailsWebSocket("raises")
     handler_steps: list[str] = []
-    bridge: RealtimeBridge
+    bridge: LiveBridge
 
     async def on_event(call_id: str, event: dict[str, Any]) -> None:
         handler_steps.append("before_drain")
@@ -339,10 +388,9 @@ async def test_dispatcher_close_failure_finishes_current_handler_before_cleanup(
 
 @pytest.mark.asyncio
 async def test_external_drain_waits_for_queued_events_before_cancel_fallback(settings, monkeypatch):
-    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0.01)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_CLOSE_TIMEOUT_SECONDS", 0.1)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_TASK_DRAIN_TIMEOUT_SECONDS", 0.25)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_TASK_CANCEL_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr("app.openai_live.LIVE_CLOSE_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr("app.openai_live.LIVE_TASK_DRAIN_TIMEOUT_SECONDS", 0.25)
+    monkeypatch.setattr("app.openai_live.LIVE_TASK_CANCEL_TIMEOUT_SECONDS", 0.1)
     websocket = QueueWebSocket()
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -388,7 +436,6 @@ async def test_external_drain_waits_for_queued_events_before_cancel_fallback(set
 
 @pytest.mark.asyncio
 async def test_close_all_stops_every_registered_runtime(settings, monkeypatch):
-    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0)
     websocket = QueueWebSocket()
     bridge, runtime, task, fatals, _ = await _start_bridge(
         settings,
@@ -410,14 +457,13 @@ async def test_close_all_gives_up_on_cancellation_resistant_task_and_logs(
 ):
     # Keep drain_and_close's own bounded retries fast so the test exercises close_all's
     # final bounded pass rather than timing out inside drain_and_close first.
-    monkeypatch.setattr("app.openai_realtime.REALTIME_MEDIA_DRAIN_SECONDS", 0)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_TASK_DRAIN_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr("app.openai_realtime.REALTIME_SHUTDOWN_FINAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("app.openai_live.LIVE_TASK_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.openai_live.LIVE_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.openai_live.LIVE_SHUTDOWN_FINAL_TIMEOUT_SECONDS", 0.05)
     release = asyncio.Event()
 
     async def stubborn() -> None:
-        # Swallows cancellation like a stalled send shielded by _send_batch would, so
+        # Swallows cancellation like a stalled tool-result send would, so
         # close_all's final wait must give up rather than hang forever.
         while True:
             try:
@@ -426,7 +472,7 @@ async def test_close_all_gives_up_on_cancellation_resistant_task_and_logs(
             except asyncio.CancelledError:
                 continue
 
-    bridge = RealtimeBridge(
+    bridge = LiveBridge(
         settings,
         SimpleNamespace(),
         on_event=_noop,
@@ -434,12 +480,12 @@ async def test_close_all_gives_up_on_cancellation_resistant_task_and_logs(
         on_fatal=_noop,
     )
     task = asyncio.create_task(stubborn(), name="sideband:call_stuck")
-    runtime = RealtimeRuntime(call_id="call_stuck", openai_call_id="rtc_stuck")
+    runtime = LiveRuntime(call_id="call_stuck", openai_call_id="rtc_stuck")
     runtime.task = task
     bridge._runtime[runtime.call_id] = runtime
 
     try:
-        with caplog.at_level("ERROR", logger="app.openai_realtime"):
+        with caplog.at_level("ERROR", logger="app.openai_live"):
             await asyncio.wait_for(bridge.close_all(), timeout=2)
 
         assert any("sideband:call_stuck" in record.getMessage() for record in caplog.records)
@@ -450,21 +496,21 @@ async def test_close_all_gives_up_on_cancellation_resistant_task_and_logs(
 
 @pytest.mark.asyncio
 async def test_stalled_websocket_send_raises_timeout(settings, monkeypatch):
-    monkeypatch.setattr("app.openai_realtime.REALTIME_SEND_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("app.openai_live.LIVE_SEND_TIMEOUT_SECONDS", 0.05)
 
     class HangingWebSocket:
         async def send(self, message: str) -> None:
             # Never returns, modeling a dead TCP connection mid-send.
             await asyncio.Event().wait()
 
-    bridge = RealtimeBridge(
+    bridge = LiveBridge(
         settings,
         SimpleNamespace(),
         on_event=_noop,
         on_open=_noop,
         on_fatal=_noop,
     )
-    runtime = RealtimeRuntime(call_id="call_stalled_send", openai_call_id="rtc_stalled_send")
+    runtime = LiveRuntime(call_id="call_stalled_send", openai_call_id="rtc_stalled_send")
     runtime.websocket = HangingWebSocket()
     bridge._runtime[runtime.call_id] = runtime
 
@@ -518,12 +564,12 @@ async def test_queue_overflow_is_fatal_instead_of_dropping_events(settings, monk
     )
     await websocket.feed({"type": "test.block", "sequence": 0})
     await asyncio.wait_for(first_started.wait(), timeout=1)
-    for sequence in range(1, REALTIME_EVENT_QUEUE_MAXSIZE + 2):
+    for sequence in range(1, LIVE_EVENT_QUEUE_MAXSIZE + 2):
         await websocket.feed({"type": "test.event", "sequence": sequence})
 
     await asyncio.wait_for(fatal_called.wait(), timeout=1)
     await asyncio.wait_for(task, timeout=1)
-    assert fatals == [("call_overflow", "sideband_error:RealtimeEventQueueOverflow")]
+    assert fatals == [("call_overflow", "sideband_error:LiveEventQueueOverflow")]
     assert runtime.dispatcher_task is not None and runtime.dispatcher_task.cancelled()
 
 
@@ -551,3 +597,65 @@ async def test_handler_failure_is_fatal_and_cancels_reader(settings, monkeypatch
     assert fatals == [("call_handler_failure", "sideband_error:HandlerFailure")]
     assert runtime.receiver_task is not None and runtime.receiver_task.cancelled()
     assert runtime.dispatcher_task is not None and runtime.dispatcher_task.done()
+
+
+async def test_final_usage_is_persisted_even_with_blocked_dispatch(settings, monkeypatch):
+    websocket = QueueWebSocket()
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    persisted = asyncio.Event()
+
+    async def on_event(call_id, event):
+        if event["type"] == "test.block":
+            blocked.set()
+            await release.wait()
+
+    bridge, runtime, task, fatals, _ = await _start_bridge(
+        settings, monkeypatch, call_id="final_usage", websocket=websocket, on_event=on_event
+    )
+
+    async def on_finalized(call_id, event):
+        assert event["usage"]["seconds"] == 8
+        persisted.set()
+
+    bridge.on_finalized = on_finalized
+    await websocket.feed({"type": "test.block"})
+    await blocked.wait()
+    await websocket.feed({"type": "session.closed", "usage": {"seconds": 8}})
+    await asyncio.wait_for(persisted.wait(), timeout=1)
+    assert runtime.closed_event.is_set()
+    release.set()
+    await bridge.drain_and_close(runtime.call_id)
+    assert task.done()
+    assert not fatals
+
+
+async def test_termination_worker_does_not_wait_on_its_calling_open_handler(settings, monkeypatch):
+    websocket = QueueWebSocket()
+    ready = asyncio.Event()
+    holder = {}
+    returned = asyncio.Event()
+
+    async def on_open(call_id):
+        await ready.wait()
+        initiator = asyncio.current_task()
+        worker = asyncio.create_task(
+            holder["bridge"].drain_and_close(call_id, dependent_task=initiator)
+        )
+        await worker
+        returned.set()
+
+    bridge, runtime, task, fatals, _ = await _start_bridge(
+        settings,
+        monkeypatch,
+        call_id="worker_close",
+        websocket=websocket,
+        on_event=_noop,
+        on_open=on_open,
+    )
+    holder["bridge"] = bridge
+    ready.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert returned.is_set()
+    assert runtime.call_id not in bridge._runtime
+    assert not fatals

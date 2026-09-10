@@ -302,10 +302,11 @@ def test_valid_openai_incoming_webhook_reaches_call_service(settings):
         {
             "object": "event",
             "id": "evt_incoming",
-            "type": "realtime.call.incoming",
+            "type": "live.transport.incoming",
             "created_at": int(time.time()),
             "data": {
-                "call_id": "rtc_incoming",
+                "type": "sip",
+                "session_id": "rtc_incoming",
                 "sip_headers": [
                     {"name": "X-Plan-Id", "value": "plan_1"},
                     {"name": "X-Bridge-Call-Id", "value": "call_1"},

@@ -7,12 +7,7 @@ from types import SimpleNamespace
 import pytest
 from twilio.base.exceptions import TwilioRestException
 
-from app.openai_realtime import (
-    RESPONSE_PURPOSE_METADATA_KEY,
-    VOICEMAIL_RESPONSE_PURPOSE,
-    RealtimeBridge,
-    RealtimeRuntime,
-)
+from app.openai_live import LiveBridge, LiveRuntime
 from app.twilio_bridge import TwilioBridge
 
 
@@ -59,67 +54,6 @@ class SecondSendFailsWebSocket(FakeWebSocket):
         await super().send(message)
 
 
-class StreamingFakeWebSocket(FakeWebSocket):
-    def __init__(self, echo: dict):
-        super().__init__()
-        self.echo = echo
-        self.incoming: asyncio.Queue[str | None] = asyncio.Queue()
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> str:
-        message = await self.incoming.get()
-        if message is None:
-            raise StopAsyncIteration
-        return message
-
-    async def send(self, message: str) -> None:
-        await super().send(message)
-        await self.incoming.put(json.dumps(self.echo))
-
-    async def close(self) -> None:
-        if not self.closed:
-            await self.incoming.put(None)
-        await super().close()
-
-
-class FakeConnection:
-    def __init__(self, websocket: StreamingFakeWebSocket):
-        self.websocket = websocket
-
-    async def __aenter__(self) -> StreamingFakeWebSocket:
-        return self.websocket
-
-    async def __aexit__(self, *args) -> None:
-        await self.websocket.close()
-
-
-@pytest.mark.asyncio
-async def test_opening_response_uses_session_context_without_a_script(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
-    )
-
-    await bridge.create_opening("call_1")
-
-    assert websocket.messages == [
-        {
-            "type": "response.create",
-            "event_id": "opening_call_1",
-            "response": {"output_modalities": ["audio"]},
-        }
-    ]
-
-
 @pytest.mark.asyncio
 async def test_send_hook_runs_after_success_and_cannot_change_send_outcome(settings):
     observed: list[tuple[str, str, int]] = []
@@ -131,7 +65,7 @@ async def test_send_hook_runs_after_success_and_cannot_change_send_outcome(setti
         if event["type"] == "response.cancel":
             raise RuntimeError("telemetry failed")
 
-    bridge = RealtimeBridge(
+    bridge = LiveBridge(
         settings,
         SimpleNamespace(),
         on_event=_noop,
@@ -139,7 +73,7 @@ async def test_send_hook_runs_after_success_and_cannot_change_send_outcome(setti
         on_fatal=_noop,
         on_send=hook,
     )
-    bridge._runtime["call_1"] = RealtimeRuntime(
+    bridge._runtime["call_1"] = LiveRuntime(
         call_id="call_1", openai_call_id="rtc_1", websocket=websocket
     )
 
@@ -152,446 +86,12 @@ async def test_send_hook_runs_after_success_and_cannot_change_send_outcome(setti
     ]
     assert len(websocket.messages) == 2
 
-    bridge._runtime["call_2"] = RealtimeRuntime(
+    bridge._runtime["call_2"] = LiveRuntime(
         call_id="call_2", openai_call_id="rtc_2", websocket=FailingSendWebSocket()
     )
     with pytest.raises(RuntimeError, match="socket send failed"):
         await bridge.send("call_2", {"type": "response.create"})
     assert all(call_id == "call_1" for call_id, _, _ in observed)
-
-
-@pytest.mark.asyncio
-async def test_voicemail_prompt_does_not_script_identity_or_callback_wording(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
-    )
-
-    await bridge.create_voicemail("call_1")
-
-    response = websocket.messages[0]["response"]
-    instructions = response["instructions"]
-    assert "approved context" in instructions
-    assert "Poke" not in instructions
-    assert "AI assistant" not in instructions
-    assert "callback" not in instructions
-    assert response["metadata"] == {RESPONSE_PURPOSE_METADATA_KEY: VOICEMAIL_RESPONSE_PURPOSE}
-    assert response["tool_choice"] == "none"
-
-
-def test_session_prompt_anchors_caller_role_without_scripting_wording(settings, packet):
-    instructions = (
-        RealtimeBridge(
-            settings,
-            SimpleNamespace(),
-            on_event=_noop,
-            on_open=_noop,
-            on_fatal=_noop,
-        )
-        .build_accept_payload(packet)
-        .instructions
-    )
-
-    assert "# Role" in instructions
-    assert "You are always the caller" in instructions
-    assert "# Opening" in instructions
-    assert "Always identify yourself" not in instructions
-    assert "You are Poke" not in instructions
-    assert "Am I speaking with" not in instructions
-
-
-@pytest.mark.asyncio
-async def test_sideband_receives_initial_update_echo_while_open_handler_waits(
-    settings, monkeypatch
-):
-    echoed = {
-        "type": "session.updated",
-        "session": {
-            "audio": {
-                "input": {
-                    "transcription": {"model": "gpt-realtime-whisper"},
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": False,
-                        "interrupt_response": False,
-                    },
-                }
-            }
-        },
-    }
-    websocket = StreamingFakeWebSocket(echoed)
-    opened = asyncio.Event()
-    fatals: list[tuple[str, str]] = []
-    bridge: RealtimeBridge
-
-    async def on_open(call_id: str) -> None:
-        updated = await bridge.verify_initial_session(call_id)
-        assert updated == echoed
-        opened.set()
-        await websocket.close()
-
-    async def on_fatal(call_id: str, reason: str) -> None:
-        fatals.append((call_id, reason))
-
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=on_open,
-        on_fatal=on_fatal,
-    )
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1")
-    bridge._runtime["call_1"] = runtime
-    monkeypatch.setattr(
-        "app.openai_realtime.websockets.connect", lambda *args, **kwargs: FakeConnection(websocket)
-    )
-
-    await asyncio.wait_for(bridge._run(runtime), timeout=1)
-
-    assert opened.is_set()
-    assert fatals == []
-
-
-@pytest.mark.asyncio
-async def test_activation_update_is_serialized_and_waits_for_echo(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
-    bridge._runtime["call_1"] = runtime
-
-    pending = asyncio.create_task(bridge.enable_automatic_responses("call_1"))
-    await asyncio.wait_for(websocket.sent.wait(), timeout=1)
-    echoed = {
-        "type": "session.updated",
-        "session": {
-            "audio": {
-                "input": {
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": True,
-                        "interrupt_response": True,
-                    }
-                }
-            }
-        },
-    }
-    runtime.update_waiter.set_result(echoed)
-    assert await pending == echoed
-    assert websocket.messages == [
-        {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "audio": {
-                    "input": {
-                        # Transcription must be re-asserted: session.update replaces the
-                        # nested audio.input object, so omitting it would drop callee
-                        # transcription for the rest of the call.
-                        "transcription": {"model": "gpt-realtime-whisper"},
-                        "noise_reduction": {"type": "far_field"},
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "auto",
-                            "create_response": True,
-                            "interrupt_response": True,
-                        },
-                    }
-                },
-            },
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_initial_session_update_reasserts_safe_audio_gate(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
-    bridge._runtime["call_1"] = runtime
-
-    pending = asyncio.create_task(bridge.verify_initial_session("call_1"))
-    await asyncio.wait_for(websocket.sent.wait(), timeout=1)
-    echoed = {
-        "type": "session.updated",
-        "session": {
-            "audio": {
-                "input": {
-                    "transcription": {"model": "gpt-realtime-whisper"},
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "auto",
-                        "create_response": False,
-                        "interrupt_response": False,
-                    },
-                }
-            }
-        },
-    }
-    runtime.update_waiter.set_result(echoed)
-
-    assert await pending == echoed
-    assert websocket.messages == [
-        {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "audio": {
-                    "input": {
-                        "transcription": {"model": "gpt-realtime-whisper"},
-                        "noise_reduction": {"type": "far_field"},
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "auto",
-                            "create_response": False,
-                            "interrupt_response": False,
-                        },
-                    }
-                },
-            },
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_function_output_precedes_manual_continuation(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
-    )
-    await bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
-    assert websocket.messages == [
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "function_call_output",
-                "call_id": "tool_1",
-                "output": '{"accepted": true}',
-            },
-        },
-        {"type": "response.create"},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_tool_output_and_continuation_cannot_be_interleaved(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = BlockingFirstSendWebSocket()
-    bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
-    )
-
-    tool_result = asyncio.create_task(
-        bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
-    )
-    await asyncio.wait_for(websocket.first_sent.wait(), timeout=1)
-    competing_send = asyncio.create_task(bridge.send("call_1", {"type": "response.cancel"}))
-    await asyncio.sleep(0)
-
-    assert [message["type"] for message in websocket.messages] == ["conversation.item.create"]
-
-    websocket.release_first.set()
-    await asyncio.gather(tool_result, competing_send)
-    assert [message["type"] for message in websocket.messages] == [
-        "conversation.item.create",
-        "response.create",
-        "response.cancel",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_cancellation_after_first_frame_finishes_atomic_tool_pair(settings):
-    observed: list[str] = []
-
-    async def on_send(call_id: str, event: dict) -> None:
-        observed.append(event["type"])
-
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-        on_send=on_send,
-    )
-    websocket = BlockingFirstSendWebSocket()
-    bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
-    )
-
-    tool_result = asyncio.create_task(
-        bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
-    )
-    await asyncio.wait_for(websocket.first_sent.wait(), timeout=1)
-    competing_send = asyncio.create_task(bridge.send("call_1", {"type": "response.cancel"}))
-    tool_result.cancel()
-    await asyncio.sleep(0)
-
-    assert tool_result.done() is False
-    assert competing_send.done() is False
-    assert [message["type"] for message in websocket.messages] == ["conversation.item.create"]
-
-    websocket.release_first.set()
-    with pytest.raises(asyncio.CancelledError):
-        await tool_result
-    assert observed[:2] == ["conversation.item.create", "response.create"]
-
-    await competing_send
-    assert [message["type"] for message in websocket.messages] == [
-        "conversation.item.create",
-        "response.create",
-        "response.cancel",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_cancelled_single_frame_waiting_for_lock_is_never_sent(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
-    bridge._runtime["call_1"] = runtime
-    await runtime.send_lock.acquire()
-
-    pending = asyncio.create_task(bridge.send("call_1", {"type": "response.cancel"}))
-    await asyncio.sleep(0)
-    assert pending.done() is False
-    pending.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await pending
-
-    runtime.send_lock.release()
-    await asyncio.sleep(0)
-    assert websocket.messages == []
-
-
-@pytest.mark.asyncio
-async def test_cancelled_tool_pair_waiting_for_lock_is_never_sent(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    runtime = RealtimeRuntime(call_id="call_1", openai_call_id="rtc_1", websocket=websocket)
-    bridge._runtime["call_1"] = runtime
-    await runtime.send_lock.acquire()
-
-    pending = asyncio.create_task(bridge.send_tool_result("call_1", "tool_1", {"accepted": True}))
-    await asyncio.sleep(0)
-    assert pending.done() is False
-    pending.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(pending, timeout=0.1)
-
-    runtime.send_lock.release()
-    await asyncio.sleep(0)
-    assert websocket.messages == []
-
-
-@pytest.mark.asyncio
-async def test_partial_tool_result_send_notifies_only_successful_frames(settings):
-    observed: list[str] = []
-
-    async def on_send(call_id: str, event: dict) -> None:
-        observed.append(event["type"])
-
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-        on_send=on_send,
-    )
-    websocket = SecondSendFailsWebSocket()
-    bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
-    )
-
-    with pytest.raises(RuntimeError, match="second socket send failed"):
-        await bridge.send_tool_result("call_1", "tool_1", {"accepted": True})
-
-    assert [message["type"] for message in websocket.messages] == ["conversation.item.create"]
-    assert observed == ["conversation.item.create"]
-
-
-@pytest.mark.asyncio
-async def test_terminal_function_output_creates_a_dedicated_closing_response(settings):
-    bridge = RealtimeBridge(
-        settings,
-        SimpleNamespace(),
-        on_event=_noop,
-        on_open=_noop,
-        on_fatal=_noop,
-    )
-    websocket = FakeWebSocket()
-    bridge._runtime["call_1"] = RealtimeRuntime(
-        call_id="call_1", openai_call_id="rtc_1", websocket=websocket
-    )
-    await bridge.send_tool_result(
-        "call_1",
-        "tool_1",
-        {"accepted": True},
-        continuation_instructions="Say one concise goodbye. Do not call any function.",
-    )
-    assert websocket.messages == [
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "function_call_output",
-                "call_id": "tool_1",
-                "output": '{"accepted": true}',
-            },
-        },
-        {
-            "type": "response.create",
-            "response": {
-                "output_modalities": ["audio"],
-                "instructions": "Say one concise goodbye. Do not call any function.",
-            },
-        },
-    ]
 
 
 class FakeParticipants:
@@ -646,7 +146,7 @@ async def test_twilio_participant_options_match_bridge_contract(settings, packet
     assert agent["early_media"] is False
     assert agent["muted"] is False
     assert agent["jitter_buffer_size"] == "small"
-    assert agent["to"].startswith("sip:proj_test@sip.api.openai.com;transport=tls?")
+    assert agent["to"].startswith("sip:proj_test@sip.api.openai.com;transport=tls;secure=true?")
     assert "X-Plan-Id=plan_1" in agent["to"]
     assert "X-Bridge-Call-Id=call_1" in agent["to"]
     assert agent["conference_status_callback_event"] == [
@@ -702,40 +202,202 @@ async def test_complete_conference_treats_missing_resource_as_already_closed(set
     await bridge.complete_conference("CF-missing")
 
 
-async def test_resumed_call_state_is_silent_context_without_an_extra_response(settings):
-    websocket = FakeWebSocket()
-    bridge = RealtimeBridge(
-        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
+def connected_bridge(settings, websocket=None):
+    websocket = websocket or FakeWebSocket()
+    bridge = LiveBridge(settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop)
+    runtime = LiveRuntime(call_id="call_1", openai_call_id="session_1", websocket=websocket)
+    bridge._runtime["call_1"] = runtime
+    return bridge, runtime, websocket
+
+
+def collect(bridge, runtime, event, delegation="delegation_1"):
+    bridge._observe_tool_batch(
+        runtime, {"type": "response.event", "delegation_id": delegation, "event": event}
     )
-    bridge._runtime["call_resumed"] = RealtimeRuntime(
-        call_id="call_resumed", openai_call_id="rtc_resumed", websocket=websocket
+
+
+def collect_tool(bridge, runtime, tool_id="tool_1"):
+    collect(bridge, runtime, {"type": "response.created", "response": {"id": "resp_1"}})
+    collect(
+        bridge,
+        runtime,
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": tool_id,
+                "name": "search_web",
+                "arguments": "{}",
+            },
+        },
     )
-    await bridge.notify_call_resumed("call_resumed")
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "create_voicemail",
+        "enable_conversation",
+        "suspend_conversation",
+        "notify_call_resumed",
+    ],
+)
+async def test_voice_control_uses_native_context_append(settings, method):
+    bridge, _, websocket = connected_bridge(settings)
+    await getattr(bridge, method)("call_1")
     assert len(websocket.messages) == 1
     event = websocket.messages[0]
-    assert event["type"] == "conversation.item.create"
-    assert event["item"]["role"] == "system"
-    assert "still connected" in event["item"]["content"][0]["text"]
-    assert "brief natural goodbye FIRST" in event["item"]["content"][0]["text"]
+    assert event["type"] == "session.instructions.append"
+    assert event["delegation_id"] is None
+    assert 0 < len(event["content"].encode()) <= 500
+    assert event["event_id"]
+    assert "response" not in event
 
 
-async def test_closing_classification_is_text_only_and_outside_conversation(settings):
-    websocket = FakeWebSocket()
-    bridge = RealtimeBridge(
-        settings, SimpleNamespace(), on_event=_noop, on_open=_noop, on_fatal=_noop
+async def test_instruction_updates_reject_oversize_before_send(settings):
+    bridge, _, websocket = connected_bridge(settings)
+    with pytest.raises(ValueError):
+        await bridge.append_instructions("call_1", "界" * 200)
+    assert websocket.messages == []
+
+
+async def test_tool_batch_waits_for_terminal_event_and_all_outputs(settings):
+    bridge, runtime, websocket = connected_bridge(settings)
+    collect_tool(bridge, runtime)
+    collect_tool(bridge, runtime, "tool_2")
+    await bridge.send_tool_result("call_1", "tool_1", {"ok": True})
+    assert [m["type"] for m in websocket.messages] == ["response.item.create"]
+    # Terminal responses have empty output; the earlier output items remain authoritative.
+    collect(
+        bridge, runtime, {"type": "response.completed", "response": {"id": "resp_1", "output": []}}
     )
-    bridge._runtime["call_check"] = RealtimeRuntime(
-        call_id="call_check", openai_call_id="rtc_check", websocket=websocket
+    await bridge._continue_ready_batches(runtime)
+    assert len(websocket.messages) == 1
+    await bridge.send_tool_result("call_1", "tool_2", {"ok": True}, continue_response=False)
+    assert [m["type"] for m in websocket.messages] == [
+        "response.item.create",
+        "response.item.create",
+        "response.create",
+    ]
+    assert websocket.messages[-1] == {"type": "response.create"}
+    assert "delivery_hint" in json.loads(websocket.messages[1]["item"]["output"])
+    await bridge.send_tool_result("call_1", "tool_2", {"ok": True})
+    await bridge._continue_ready_batches(runtime)
+    assert len(websocket.messages) == 3
+
+
+async def test_all_results_before_completion_continue_only_after_completion(settings):
+    bridge, runtime, websocket = connected_bridge(settings)
+    collect_tool(bridge, runtime)
+    await bridge.send_tool_result("call_1", "tool_1", {"ok": True})
+    assert len(websocket.messages) == 1
+    collect(
+        bridge, runtime, {"type": "response.completed", "response": {"id": "resp_1", "output": []}}
     )
-    await bridge.check_spoken_closing("call_check", "spoken_response")
+    await bridge._continue_ready_batches(runtime)
+    assert websocket.messages[-1] == {"type": "response.create"}
+
+
+async def test_arguments_done_does_not_authorize_a_tool_result(settings):
+    bridge, runtime, websocket = connected_bridge(settings)
+    collect(
+        bridge,
+        runtime,
+        {"type": "response.function_call_arguments.done", "call_id": "tool_1", "arguments": "{}"},
+    )
+    with pytest.raises(RuntimeError, match="does not belong"):
+        await bridge.send_tool_result("call_1", "tool_1", {"ok": True})
+    assert not websocket.messages
+
+
+async def test_result_send_failure_remains_retryable(settings):
+    bridge, runtime, _ = connected_bridge(settings, FailingSendWebSocket())
+    collect_tool(bridge, runtime)
+    with pytest.raises(RuntimeError):
+        await bridge.send_tool_result("call_1", "tool_1", {"ok": True})
+    assert not runtime.emitted_results
+    runtime.websocket = FakeWebSocket()
+    await bridge.send_tool_result("call_1", "tool_1", {"ok": True})
+    assert runtime.emitted_results == {"tool_1"}
+
+
+async def test_continuation_failure_does_not_resend_accepted_result(settings):
+    bridge, runtime, websocket = connected_bridge(settings, SecondSendFailsWebSocket())
+    collect_tool(bridge, runtime)
+    collect(
+        bridge, runtime, {"type": "response.completed", "response": {"id": "resp_1", "output": []}}
+    )
+    with pytest.raises(RuntimeError):
+        await bridge.send_tool_result("call_1", "tool_1", {"ok": True})
+    assert runtime.emitted_results == {"tool_1"}
+    assert not runtime.continued_responses
+    runtime.websocket = FakeWebSocket()
+    await bridge._continue_ready_batches(runtime)
+    assert runtime.websocket.messages == [{"type": "response.create"}]
+    assert len(websocket.messages) == 1
+
+
+async def test_cancelled_send_waiting_for_lock_is_never_written(settings):
+    bridge, runtime, websocket = connected_bridge(settings)
+    await runtime.send_lock.acquire()
+    task = asyncio.create_task(bridge.send("call_1", {"type": "session.close"}))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    runtime.send_lock.release()
+    assert not websocket.messages
+
+
+async def test_readiness_only_updates_supported_responses_fields(settings):
+    bridge, runtime, websocket = connected_bridge(settings)
+    task = asyncio.create_task(bridge.verify_initial_session("call_1"))
+    await websocket.sent.wait()
     event = websocket.messages[0]
-    assert event["event_id"] == "closing_check_spoken_response"
-    response = event["response"]
-    assert response["conversation"] == "none"
-    assert response["output_modalities"] == ["text"]
-    assert response["tools"] == []
-    assert response["tool_choice"] == "none"
-    assert response["metadata"] == {
-        "agent_call_purpose": "closing_check",
-        "spoken_response_id": "spoken_response",
+    assert event["type"] == "session.update"
+    assert event["session"] == {
+        "delegation": {"type": "responses", "responses": {"tool_choice": "auto"}}
     }
+    assert runtime.update_event_id == event["event_id"]
+    expected = {
+        "type": "session.updated",
+        "client_event_id": event["event_id"],
+        "session": {"model": "gpt-live-1"},
+    }
+    runtime.update_waiter.set_result(expected)
+    assert await task == expected
+    assert runtime.update_waiter is None
+
+
+async def test_cancellation_after_write_finishes_bookkeeping_and_continuation(settings):
+    bridge, runtime, websocket = connected_bridge(settings, BlockingFirstSendWebSocket())
+    collect_tool(bridge, runtime)
+    collect(
+        bridge, runtime, {"type": "response.completed", "response": {"id": "resp_1", "output": []}}
+    )
+    task = asyncio.create_task(bridge.send_tool_result("call_1", "tool_1", {"ok": True}))
+    await websocket.first_sent.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    websocket.release_first.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runtime.emitted_results == {"tool_1"}
+    assert runtime.continued_responses == {"resp_1"}
+    await bridge.send_tool_result("call_1", "tool_1", {"ok": True})
+    assert [m["type"] for m in websocket.messages] == ["response.item.create", "response.create"]
+
+
+async def test_cancelled_tool_result_waiting_for_ownership_is_not_sent(settings):
+    bridge, runtime, websocket = connected_bridge(settings)
+    collect_tool(bridge, runtime)
+    await runtime.tool_lock.acquire()
+    task = asyncio.create_task(bridge.send_tool_result("call_1", "tool_1", {"ok": True}))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    runtime.tool_lock.release()
+    assert not websocket.messages
+    assert not runtime.emitted_results

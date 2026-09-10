@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from openai import InvalidWebhookSignatureError
 from pydantic import ValidationError
 
-from app.models import RealtimeIncomingEvent
+from app.models import LiveIncomingEvent
 
 router = APIRouter(prefix="/webhooks/openai", tags=["openai-webhooks"])
 
@@ -20,12 +20,12 @@ async def openai_webhook(request: Request) -> Response:
     webhook_id = request.headers.get("webhook-id")
     if not webhook_id or not await service.record_webhook_once(webhook_id):
         raise HTTPException(status_code=400, detail="replayed or missing webhook-id")
-    if event.type != "realtime.call.incoming":
+    if event.get("type") != "live.transport.incoming":
         return Response(status_code=204)
     try:
-        typed = RealtimeIncomingEvent.model_validate(event.model_dump())
+        typed = LiveIncomingEvent.model_validate(event)
         await service.handle_openai_incoming(
-            typed.data.call_id,
+            typed.data.session_id,
             typed.data.sip_headers,
         )
     except (ValidationError, LookupError, RuntimeError) as exc:

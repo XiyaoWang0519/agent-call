@@ -25,4 +25,4 @@ uv run python scripts/run_sip_canary.py --mode no-outcome-tool
 Both exit nonzero if any gate fails. The debug evidence endpoint they use requires `DEBUG_API_TOKEN`.
 
 > [!NOTE]
-> No mini realtime model can be selected by configuration in v1. Do not relax the `realtime_model` literal or the `MINI_MODELS_ENABLED=false` gate until that exact model passes both canaries, including SIP tool calling.
+> The voice model is fixed to `gpt-live-1`; the task backend is `gpt-5.6-terra`. The previous Realtime and mini-model configuration paths have been removed. Verify this exact integration with received audio before relying on it.

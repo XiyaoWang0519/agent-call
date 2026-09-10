@@ -122,6 +122,25 @@ SCENARIOS = {
             audit={"interruption_observed": 1},
         ),
         Scenario(
+            "closing-follow-up",
+            OBJECTIVE + " Repeat the desk's test words and answer simple arithmetic questions. "
+            "End with a spoken goodbye when asked. Address any new request that arrives before "
+            "the connection ends.",
+            (
+                HELLO,
+                Step("expect", r".+"),
+                FACT,
+                FACT_CHECK,
+                GOODBYE,
+                END,
+                Step("say", "Wait, one more question. What is two plus two?"),
+                Step("expect", r"four|\b4\b"),
+                GOODBYE,
+                END,
+            ),
+            spoken_closing=True,
+        ),
+        Scenario(
             "ivr",
             "Navigate the automated menu to reach the test desk, then complete its audio test.",
             (

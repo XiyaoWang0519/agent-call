@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -11,34 +12,47 @@ from app.db.engine import _decode_json_columns, _iso_now
 from app.models import TERMINAL_STATES, CallState
 
 
+class _ClaimWithdrawn(Exception):
+    pass
+
+
 class TerminationMixin:
     async def claim_termination(
-        self: DatabaseAccess, call_id: str, reason: str
+        self: DatabaseAccess,
+        call_id: str,
+        reason: str,
+        *,
+        claim_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any] | None:
         """Atomically claim and enter termination, returning the claimed current row."""
 
         placeholders, terminal_states = self._in_clause(state.value for state in TERMINAL_STATES)
-        async with self._immediate_transaction() as conn:
-            cursor = await conn.execute(
-                f"""UPDATE calls
-                   SET termination_claimed=1,
-                       state=?,
-                       termination_reason=?,
-                       transfer_outcome=CASE
-                           WHEN transfer_outcome LIKE 'joining:%'
-                           THEN 'failed:termination_won'
-                           ELSE transfer_outcome
-                       END,
-                       last_event_at=?
-                   WHERE call_id=?
-                     AND termination_claimed=0
-                     AND state NOT IN ({placeholders})
-                     AND COALESCE(transfer_outcome, '') NOT LIKE 'in_progress:%'
-                     AND COALESCE(transfer_outcome, '') NOT LIKE 'completed:%'
-                   RETURNING *""",  # noqa: S608
-                (CallState.TERMINATING.value, reason, _iso_now(), call_id, *terminal_states),
-            )
-            row = await cursor.fetchone()
+        try:
+            async with self._immediate_transaction() as conn:
+                cursor = await conn.execute(
+                    f"""UPDATE calls
+                       SET termination_claimed=1,
+                           state=?,
+                           termination_reason=?,
+                           transfer_outcome=CASE
+                               WHEN transfer_outcome LIKE 'joining:%'
+                               THEN 'failed:termination_won'
+                               ELSE transfer_outcome
+                           END,
+                           last_event_at=?
+                       WHERE call_id=?
+                         AND termination_claimed=0
+                         AND state NOT IN ({placeholders})
+                         AND COALESCE(transfer_outcome, '') NOT LIKE 'in_progress:%'
+                         AND COALESCE(transfer_outcome, '') NOT LIKE 'completed:%'
+                       RETURNING *""",  # noqa: S608
+                    (CallState.TERMINATING.value, reason, _iso_now(), call_id, *terminal_states),
+                )
+                row = await cursor.fetchone()
+                if row and claim_guard is not None and not claim_guard():
+                    raise _ClaimWithdrawn
+        except _ClaimWithdrawn:
+            return None
         return _decode_json_columns(dict(row)) if row else None
 
     async def claim_startup_recovery(

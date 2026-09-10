@@ -13,7 +13,7 @@ from typing import Any
 
 from app.db import TRANSFER_ELIGIBLE_STATES, Database
 from app.models import ContextPacket
-from app.openai_realtime import RealtimeBridge
+from app.openai_live import LiveBridge
 from app.twilio_bridge import TwilioBridge
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ class OwnerTransferCoordinator:
     termination, and the public transfer_to_owner API.
 
     ``db`` and ``twilio`` are stable for the coordinator's lifetime and are held as
-    typed objects. ``realtime`` can be replaced on CallService after construction
+    typed objects. ``live`` can be replaced on CallService after construction
     (tests do this to install a fake), so it is supplied as a callable returning the
     current value rather than captured once. The remaining CallService behaviors this
     coordinator doesn't own (spawning tasks, awaiting network tasks, checking/using
@@ -52,7 +52,7 @@ class OwnerTransferCoordinator:
         db: Database,
         twilio: TwilioBridge,
         *,
-        realtime: Callable[[], RealtimeBridge],
+        live: Callable[[], LiveBridge],
         is_stopping: Callable[[], bool],
         spawn: Callable[..., asyncio.Task[Any]],
         await_network_task: Callable[..., Awaitable[Any]],
@@ -62,7 +62,7 @@ class OwnerTransferCoordinator:
     ) -> None:
         self._db = db
         self._twilio = twilio
-        self._realtime = realtime
+        self._live = live
         self._is_stopping = is_stopping
         self._spawn = spawn
         self._await_network_task = await_network_task
@@ -326,7 +326,7 @@ class OwnerTransferRun:
         if self.tool_call_id is None:
             return
         try:
-            await self._coordinator._realtime().send_tool_result(
+            await self._coordinator._live().send_tool_result(
                 self.call_id,
                 self.tool_call_id,
                 {"accepted": False, "error": error},
@@ -635,7 +635,7 @@ class OwnerTransferRun:
             if tool_call_id is not None:
                 try:
                     # A successful tool output must be observable before the AI leg disappears.
-                    await coordinator._realtime().send_tool_result(
+                    await coordinator._live().send_tool_result(
                         call_id,
                         tool_call_id,
                         {"accepted": True, "status": "owner_joined"},

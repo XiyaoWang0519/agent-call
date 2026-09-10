@@ -40,8 +40,9 @@ def grade(scenario: Scenario, evidence: dict[str, Any]) -> dict[str, bool]:
             accept_2xx=isinstance(audit.get("openai_accept_status"), int)
             and 200 <= audit["openai_accept_status"] < 300,
             transcript_retained=final.get("result", {}).get("raw_transcript_available") is True,
-            transcription_verified=audit.get("transcription_verified") == 1,
-            vad_verified=audit.get("semantic_vad_verified") == 1,
+            live_session_verified=audit.get("live_session_verified") == 1,
+            carrier_monitor_bound=bool(audit.get("media_stream_sid")),
+            live_usage_finalized=audit.get("live_usage_finalized") == 1,
         )
         required_roles = ["callee"] + (["owner"] if scenario.owner_steps else [])
         for role in required_roles:

@@ -22,14 +22,14 @@ flowchart LR
     W[Twilio callbacks] --> T
     T --> L[Agent Call on your computer]
     L --> D[Local SQLite storage]
-    L -->|Outbound API and realtime control| P[OpenAI / Twilio]
+    L -->|Outbound API and Live control| P[OpenAI / Twilio]
 ```
 
 The browser connector request comes from the provider's infrastructure. Entering `http://localhost:8000` in a web connector does not give that provider access to your computer. OpenAI documents a public HTTPS endpoint or Secure MCP Tunnel for development, and explicitly permits HTTPS forwarding for local testing. Claude's custom remote connectors require reachability from Anthropic's cloud. [OpenAI connection guide](https://developers.openai.com/plugins/deploy/connect-chatgpt), [Claude network requirements](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp).
 
 For Agent Call's common two-client path, forward a public HTTPS origin to `http://127.0.0.1:8000`. The same origin must reach OAuth discovery and authorization routes, `/connect/mcp/`, `/webhooks/openai`, and `/webhooks/twilio/*`. Forwarding only `/connect/mcp/` is insufficient. Preserve paths, query strings, headers, and callback bodies: webhook authentication depends on them. Keep the app's authentication and signature validation enabled.
 
-The local process makes outbound API requests and opens its own outbound OpenAI realtime WebSocket. Phone audio flows between Twilio and OpenAI SIP; this app does not require opening a local SIP port or an inbound audio WebSocket. OpenAI describes the incoming webhook and subsequent outbound monitoring connection in its [Realtime SIP guide](https://developers.openai.com/api/docs/guides/realtime-sip).
+The local process makes outbound API requests and opens its own outbound OpenAI Live control WebSocket. Phone audio flows between Twilio and OpenAI SIP; the app opens no local SIP port, but its public HTTPS origin must accept the signed Twilio carrier-monitor WebSocket. OpenAI describes the incoming webhook and subsequent outbound monitoring connection in its [Live SIP guide](https://developers.openai.com/api/docs/guides/voice-sip?api=live).
 
 OpenAI's Secure MCP Tunnel is another way to connect an MCP server to supported OpenAI products. It is not, by itself, a shared solution for Claude plus this application's OpenAI/Twilio webhook ingress. That conclusion follows from the app's separate callback routes; no Secure MCP Tunnel integration has been validated here. [Secure MCP Tunnel documentation](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
 

@@ -133,7 +133,7 @@ flyctl machine list -a poke-call
 flyctl machine stop <old-poke-call-machine-id> -a poke-call
 ```
 
-- OpenAI Platform → Project → Webhooks → `https://agent-call.fly.dev/webhooks/openai` (`realtime.call.incoming`)
+- OpenAI Platform → Project → Webhooks → `https://agent-call.fly.dev/webhooks/openai` (`live.transport.incoming`)
 - Any Twilio configs that still reference `poke-call.fly.dev`
 
 ## 7. Configure the agent client

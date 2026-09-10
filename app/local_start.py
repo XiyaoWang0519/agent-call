@@ -158,7 +158,7 @@ def _serve(values: dict[str, str], port: int, profile: str, tunnel: QuickTunnel)
                 )
                 return 1
             print(f"\nLocal server ready. Browser connector: {url}/connect/mcp/", flush=True)
-            print(f"OpenAI webhook: {url}/webhooks/openai (realtime.call.incoming)", flush=True)
+            print(f"OpenAI webhook: {url}/webhooks/openai (live.transport.incoming)", flush=True)
             print("Use your owner login password on the authorization page.", flush=True)
             print(
                 "Keep this terminal and computer running. Ctrl-C stops when calls are idle.",

@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS calls (
     twilio_owner_call_sid TEXT,
     openai_call_id TEXT UNIQUE,
     openai_accept_status INTEGER,
+    live_session_verified INTEGER NOT NULL DEFAULT 0,
+    media_stream_sid TEXT,
+    live_session_seconds REAL NOT NULL DEFAULT 0,
+    live_usage_finalized INTEGER NOT NULL DEFAULT 0,
+    backend_input_tokens INTEGER NOT NULL DEFAULT 0,
+    backend_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    backend_output_tokens INTEGER NOT NULL DEFAULT 0,
     transcription_verified INTEGER NOT NULL DEFAULT 0,
     semantic_vad_verified INTEGER NOT NULL DEFAULT 0,
     tool_call_count INTEGER NOT NULL DEFAULT 0,
@@ -88,6 +95,12 @@ CREATE INDEX IF NOT EXISTS calls_state_idx ON calls(state);
 CREATE INDEX IF NOT EXISTS calls_twilio_ai_idx ON calls(twilio_ai_call_sid);
 CREATE INDEX IF NOT EXISTS calls_twilio_callee_idx ON calls(twilio_callee_call_sid);
 
+CREATE TABLE IF NOT EXISTS live_backend_usage (
+    call_id TEXT NOT NULL REFERENCES calls(call_id),
+    response_id TEXT NOT NULL,
+    PRIMARY KEY (call_id, response_id)
+);
+
 CREATE TABLE IF NOT EXISTS call_latency_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     call_id TEXT NOT NULL REFERENCES calls(call_id),
@@ -110,6 +123,8 @@ CREATE TABLE IF NOT EXISTS transcripts (
     text TEXT NOT NULL,
     source_event_type TEXT NOT NULL,
     source_event_id TEXT NOT NULL,
+    start_ms REAL,
+    end_ms REAL,
     sequence_number INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(call_id, source_event_id),
@@ -333,6 +348,13 @@ class DatabaseEngine:
             ),
         )
         migrations = {
+            "live_session_verified": "INTEGER NOT NULL DEFAULT 0",
+            "media_stream_sid": "TEXT",
+            "live_session_seconds": "REAL NOT NULL DEFAULT 0",
+            "live_usage_finalized": "INTEGER NOT NULL DEFAULT 0",
+            "backend_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "backend_cached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+            "backend_output_tokens": "INTEGER NOT NULL DEFAULT 0",
             "openai_accept_status": "INTEGER",
             "transcription_verified": "INTEGER NOT NULL DEFAULT 0",
             "semantic_vad_verified": "INTEGER NOT NULL DEFAULT 0",
@@ -358,6 +380,11 @@ class DatabaseEngine:
             if name not in existing:
                 await conn.execute(f"ALTER TABLE calls ADD COLUMN {name} {definition}")
                 existing.add(name)
+        async with conn.execute("PRAGMA table_info(transcripts)") as cursor:
+            transcript_columns = {row[1] for row in await cursor.fetchall()}
+        for name in ("start_ms", "end_ms"):
+            if name not in transcript_columns:
+                await conn.execute(f"ALTER TABLE transcripts ADD COLUMN {name} REAL")
         if "xai_call_id" in existing:
             await conn.execute(
                 "UPDATE calls SET openai_call_id=COALESCE(openai_call_id, xai_call_id)"
