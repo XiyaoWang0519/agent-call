@@ -19,7 +19,7 @@ class CallActivityTracker:
     """Owns call-liveness/activity bookkeeping for CallService.
 
     A composed collaborator (not a mixin): CallService holds one instance and
-    delegates activity/liveness tracking to it. ``_audio_drain_terminations``
+    delegates activity/liveness tracking to it. ``_voice_end_reply_waits``
     stays on CallService (it is termination-flow state, not activity state);
     this tracker consults/clears it through the callables supplied at
     construction time instead of owning it directly.
@@ -29,12 +29,12 @@ class CallActivityTracker:
         self,
         db: Database,
         *,
-        is_audio_drain_active: Callable[[str], bool],
-        clear_audio_drain: Callable[[str], object],
+        is_closing: Callable[[str], bool],
+        clear_closing: Callable[[str], object],
     ) -> None:
         self._db = db
-        self._is_audio_drain_active = is_audio_drain_active
-        self._clear_audio_drain = clear_audio_drain
+        self._is_closing = is_closing
+        self._clear_closing = clear_closing
         self.latest: dict[str, LatencyMark] = {}
         self.dirty: dict[str, LatencyMark] = {}
         self.watchdog_claims: set[str] = set()
@@ -71,14 +71,14 @@ class CallActivityTracker:
         return (
             call_id in self.active_response_ids
             or call_id in self.sip_output_playing
-            or self._is_audio_drain_active(call_id)
+            or self._is_closing(call_id)
             or call_id in self.inflight_tools
         )
 
     def begin_dtmf_listen_grace(self, call_id: str, *, seconds: float) -> bool:
         """Keep an intentional post-DTMF silence out of the stale-call path.
 
-        Realtime emits no sideband frames for silence or a bare IVR beep. After a
+        Control events need not arrive during silence or a bare IVR beep. After a
         successful tone send, that quiet period is expected while the remote system
         processes the input. The deadline is monotonic, process-local, and reset by a
         later DTMF send.
@@ -103,7 +103,7 @@ class CallActivityTracker:
     def clear_assistant_work(self, call_id: str) -> None:
         self.active_response_ids.pop(call_id, None)
         self.sip_output_playing.discard(call_id)
-        self._clear_audio_drain(call_id)
+        self._clear_closing(call_id)
         self.inflight_tools.discard(call_id)
         self.dtmf_listen_deadlines_ns.pop(call_id, None)
 

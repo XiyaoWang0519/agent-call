@@ -29,7 +29,6 @@ from app.twilio_bridge import ParticipantInfo
 def settings(tmp_path: Path) -> Settings:
     return Settings(
         agent_call_profile="live",
-        turn_detection_mode="semantic_vad",
         openai_api_key=SecretStr("sk-test"),
         openai_webhook_secret=SecretStr(
             "whsec_" + base64.b64encode(b"test webhook secret").decode()
@@ -120,6 +119,12 @@ class FakeTwilio:
         self.dtmf: list[tuple[str, str, str]] = []
         self.dtmf_exc: Exception | None = None
 
+    async def callee_status(self, call_sid):
+        return {"CallSid": call_sid, "CallStatus": "in-progress", "CallDuration": "0"}
+
+    async def stop_audio_monitor(self, callee_call_sid, stream_sid):
+        return None
+
     async def create_agent_participant(self, **kwargs) -> ParticipantInfo:
         self.agent_creates += 1
         return ParticipantInfo("CA" + "a" * 32, "CF" + "a" * 32)
@@ -154,7 +159,7 @@ class FakeTwilio:
         self.dtmf.append((conference_sid_or_name, participant_call_sid, digits))
 
 
-class FakeRealtime:
+class FakeLive:
     def __init__(self):
         self.events: list[tuple[str, str]] = []
         self.initial_updates: list[str] = []
@@ -172,78 +177,55 @@ class FakeRealtime:
         self.suspend_calls: list[str] = []
         self.suspend_failures_remaining = 0
         self.request_response_calls: list[tuple[str, str | None]] = []
-        self.update_event = {
-            "type": "session.updated",
-            "session": {
-                "audio": {
-                    "input": {
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "auto",
-                            "create_response": True,
-                            "interrupt_response": True,
-                        }
-                    }
-                }
-            },
-        }
         self.initial_update_event = {
             "type": "session.updated",
             "session": {
-                "audio": {
-                    "input": {
-                        "transcription": {"model": "gpt-realtime-whisper"},
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "auto",
-                            "create_response": False,
-                            "interrupt_response": False,
-                        },
-                    }
-                }
+                "model": "gpt-live-1",
+                "delegation": {
+                    "type": "responses",
+                    "responses": {"model": "gpt-5.6-terra", "parallel_tool_calls": False},
+                },
             },
         }
 
-    async def verify_initial_session(self, call_id: str):
-        self.initial_updates.append(call_id)
-        return self.initial_update_event
+    def session_configuration_confirmed(self, event):
+        from app.openai_live import LiveBridge
 
-    async def enable_automatic_responses(self, call_id: str):
-        self.events.append(("session.update", call_id))
-        return self.update_event
+        return LiveBridge.session_configuration_confirmed(
+            SimpleNamespace(
+                settings=SimpleNamespace(
+                    live_model="gpt-live-1", live_backend_model="gpt-5.6-terra"
+                )
+            ),
+            event,
+        )
 
-    async def suspend_automatic_responses(self, call_id: str):
-        if self.suspend_failures_remaining > 0:
+    async def enable_conversation(self, call_id):
+        self.events.append(("session.instructions.append", call_id))
+
+    async def suspend_conversation(self, call_id):
+        if self.suspend_failures_remaining:
             self.suspend_failures_remaining -= 1
             raise RuntimeError("injected suspend failure")
         self.suspend_calls.append(call_id)
-        self.events.append(("session.update", call_id))
+
+    async def verify_initial_session(self, call_id: str):
+        self.initial_updates.append(call_id)
         return self.initial_update_event
 
     async def request_response(self, call_id: str, *, instructions: str | None = None) -> None:
         self.request_response_calls.append((call_id, instructions))
         self.events.append(("opening", call_id))
 
+    async def review_closing(self, call_id: str, *, assistant_text: str = "") -> bool:
+        self.events.append(("closing_review", call_id))
+        return True
+
     async def accept_and_connect(
         self, *, call_id: str, openai_call_id: str, packet: ContextPacket
     ) -> int:
         self.accepts.append((call_id, openai_call_id))
         return 200
-
-    def activation_update_confirmed(self, event):
-        turn = event["session"]["audio"]["input"]["turn_detection"]
-        return (
-            turn["type"] == "semantic_vad"
-            and turn["eagerness"] == "auto"
-            and turn["create_response"] is True
-            and turn["interrupt_response"] is True
-        )
-
-    async def create_opening(self, call_id: str) -> None:
-        self.events.append(("opening", call_id))
-
-    async def cancel_response(self, call_id: str, response_id: str | None = None) -> None:
-        self.events.append(("cancel_response", call_id))
 
     async def create_voicemail(self, call_id: str) -> None:
         self.events.append(("voicemail", call_id))
@@ -254,7 +236,7 @@ class FakeRealtime:
     async def reject(self, openai_call_id: str) -> None:
         self.rejects.append(openai_call_id)
 
-    async def drain_and_close(self, call_id: str) -> None:
+    async def drain_and_close(self, call_id: str, *, dependent_task=None) -> None:
         self.closed.append(call_id)
 
     async def close_all(self) -> None:
@@ -392,8 +374,7 @@ async def seed_call(
         twilio_ai_call_sid="CA" + "a" * 32,
         twilio_callee_call_sid="CA" + "b" * 32,
         openai_call_id=openai_call_id,
-        transcription_verified=1,
-        semantic_vad_verified=1,
+        live_session_verified=1,
         callee_joined=int(state != CallState.PREWARMING),
     )
     return call_id
@@ -407,14 +388,33 @@ async def service(settings: Settings):
     placeholder_openai = SimpleNamespace()
     exa = FakeExa()
     svc = CallService(settings, db, twilio=twilio, openai=placeholder_openai, exa=exa)
-    realtime = FakeRealtime()
+    realtime = FakeLive()
     finalizer = FakeFinalizer(db)
-    svc.realtime = realtime
+    svc.live = realtime
     svc.finalizer = finalizer
     svc._test_twilio = twilio
-    svc._test_realtime = realtime
+    svc._test_live = realtime
     svc._test_finalizer = finalizer
     svc._test_exa = exa
+
+    async def start_audio_monitor(**kwargs):
+        call_id = kwargs["call_id"]
+        accepted = await svc.accept_media_monitor(
+            call_id,
+            kwargs["plan_id"],
+            {
+                "customParameters": {"token": kwargs["token"]},
+                "accountSid": settings.twilio_account_sid,
+                "callSid": kwargs["callee_call_sid"],
+                "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1},
+                "tracks": ["inbound", "outbound"],
+                "streamSid": "MZ" + "d" * 32,
+            },
+        )
+        assert accepted
+        return "MZ" + "d" * 32
+
+    twilio.start_audio_monitor = start_audio_monitor
     yield svc
     try:
         await svc.stop()

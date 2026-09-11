@@ -19,31 +19,38 @@ def _tool_event(
     arguments: str,
 ) -> dict[str, str]:
     return {
-        "type": "response.function_call_arguments.done",
-        "event_id": f"evt_{tool_call_id}",
-        "call_id": tool_call_id,
-        "name": name,
-        "arguments": arguments,
+        "type": "response.event",
+        "delegation_id": "delegation_test",
+        "event": {
+            "type": "response.output_item.done",
+            "response_id": "resp_test",
+            "item": {
+                "type": "function_call",
+                "call_id": tool_call_id,
+                "name": name,
+                "arguments": arguments,
+            },
+        },
     }
 
 
 async def test_send_dtmf_happy_path_records_twilio_call_and_result(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_dtmf", "send_dtmf", '{"digits":"1w2"}'),
     )
     await wait_background()
 
     assert service._test_twilio.dtmf == [("CF" + "a" * 32, "CA" + "b" * 32, "1w2")]
-    assert service._test_realtime.tool_results[-1] == (
+    assert service._test_live.tool_results[-1] == (
         call_id,
         "tool_dtmf",
         {"ok": True, "digits": "1w2"},
     )
-    assert service._test_realtime.tool_result_continuations[-1] is False
-    assert service._test_realtime.tool_result_continuation_texts[-1] is None
+    assert service._test_live.tool_result_continuations[-1] is False
+    assert service._test_live.tool_result_continuation_texts[-1] is None
     assert call_id in service._dtmf_listen_deadlines_ns
     call = await service.db.get_call(call_id)
     assert call["tool_call_count"] == 1
@@ -55,7 +62,7 @@ async def test_send_dtmf_listen_grace_blocks_watchdog_then_expires(service, pack
     monkeypatch.setattr("app.db.telemetry.monotonic_ns", lambda: clock_ns[0])
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_dtmf_grace", "send_dtmf", '{"digits":"123#"}'),
     )
@@ -84,14 +91,14 @@ async def test_send_dtmf_rejects_invalid_digits(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
 
     for bad_digits in ('{"digits":"5551234;DROP"}', '{"digits":""}'):
-        await service.handle_realtime_event(
+        await service.handle_live_event(
             call_id,
             _tool_event("tool_dtmf_bad", "send_dtmf", bad_digits),
         )
         await wait_background()
 
         assert service._test_twilio.dtmf == []
-        assert service._test_realtime.tool_results[-1][2] == {
+        assert service._test_live.tool_results[-1][2] == {
             "ok": False,
             "error": "invalid_dtmf_request",
         }
@@ -100,14 +107,14 @@ async def test_send_dtmf_rejects_invalid_digits(service, packet):
 async def test_send_dtmf_rejects_when_call_not_ready(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.PREWARMING)
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_dtmf_not_ready", "send_dtmf", '{"digits":"1"}'),
     )
     await wait_background()
 
     assert service._test_twilio.dtmf == []
-    assert service._test_realtime.tool_results[-1][2] == {
+    assert service._test_live.tool_results[-1][2] == {
         "ok": False,
         "error": "call_not_ready",
     }
@@ -117,14 +124,14 @@ async def test_send_dtmf_rejects_when_callee_sid_missing(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await service.db.update_call(call_id, twilio_callee_call_sid=None)
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_dtmf_no_sid", "send_dtmf", '{"digits":"1"}'),
     )
     await wait_background()
 
     assert service._test_twilio.dtmf == []
-    assert service._test_realtime.tool_results[-1][2] == {
+    assert service._test_live.tool_results[-1][2] == {
         "ok": False,
         "error": "call_not_ready",
     }
@@ -134,17 +141,17 @@ async def test_send_dtmf_twilio_failure_reports_error_and_clears_inflight(servic
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._test_twilio.dtmf_exc = TwilioRestException(500, "https://twilio.test", "boom")
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_dtmf_fail", "send_dtmf", '{"digits":"1"}'),
     )
     await wait_background()
 
-    assert service._test_realtime.tool_results[-1][2] == {
+    assert service._test_live.tool_results[-1][2] == {
         "ok": False,
         "error": "dtmf_failed",
     }
-    assert service._test_realtime.tool_result_continuations[-1] is True
+    assert service._test_live.tool_result_continuations[-1] is True
     assert call_id not in service._inflight_tools
     assert call_id not in service._dtmf_listen_deadlines_ns
 

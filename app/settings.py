@@ -26,17 +26,6 @@ from app.mcp_oauth.constants import (
 )
 from app.mcp_oauth.crypto import is_argon2id_hash
 
-SUPPORTED_TRANSCRIPTION_MODELS = frozenset(
-    {
-        "whisper-1",
-        "gpt-4o-mini-transcribe",
-        "gpt-4o-mini-transcribe-2025-12-15",
-        "gpt-4o-transcribe",
-        "gpt-4o-transcribe-diarize",
-        "gpt-realtime-whisper",
-    }
-)
-TRANSCRIPTION_DELAYS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 _LOOPBACK_HOSTS = frozenset({"localhost", "localhost."})
 _E164_PATTERN = re.compile(r"\+[1-9]\d{1,14}")
 _COUNTRY_PREFIX_PATTERN = re.compile(r"\+[1-9]\d{0,2}")
@@ -164,14 +153,11 @@ class Settings(BaseSettings):
     hold_max_seconds: float = Field(default=300.0, gt=0, le=600)
     wait_for_call_event_max_seconds: float = Field(default=20.0, gt=0, le=25)
     allowed_country_codes: list[str] = Field(default_factory=lambda: ["+1"])
-    input_transcription_model: str = "gpt-realtime-whisper"
-    input_transcription_delay: str | None = None
-    # None omits the API setting and leaves the provider default in effect.
-    input_noise_reduction: Literal["near_field", "far_field"] | None = "far_field"
-    semantic_vad_eagerness: Literal["low", "medium", "high", "auto"] = "auto"
-    turn_detection_mode: Literal["semantic_vad", "server_vad"] = "server_vad"
-    server_vad_silence_duration_ms: int = Field(default=300, ge=200, le=1000)
-    server_vad_threshold: float = Field(default=0.5, ge=0, le=1)
+    live_model: Literal["gpt-live-1"] = "gpt-live-1"
+    live_voice: str = "marin"
+    live_backend_model: Literal["gpt-5.6-terra"] = "gpt-5.6-terra"
+    live_backend_reasoning_effort: Literal["none", "low", "medium"] = "low"
+    live_session_close_timeout_seconds: float = Field(default=15.0, ge=1, le=60)
     openai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     openai_keepalive_expiry_seconds: float | None = Field(default=60.0, ge=5, le=300)
@@ -179,8 +165,6 @@ class Settings(BaseSettings):
     extractor_model: str = "gpt-5.4-mini-2026-03-17"
     database_url: str = "sqlite:///./agent_call.db"
     public_base_url: str | None = None
-    realtime_model: Literal["gpt-realtime-2.1"] = "gpt-realtime-2.1"
-    mini_models_enabled: bool = False
     setup_deadline_seconds: Literal[60] = 60
     watchdog_stale_seconds: Literal[15] = 15
     plan_ttl_seconds: Literal[600] = 600
@@ -197,6 +181,12 @@ class Settings(BaseSettings):
     mcp_oauth_refresh_token_ttl_days: int = 90
     mcp_oauth_auth_code_ttl_seconds: int = 300
 
+    # Live voice duration and delegated Responses usage are separate charges.
+    live_price_per_minute: float = Field(default=0.05, ge=0)
+    backend_input_price_per_1m: float = Field(default=2.00, ge=0)
+    backend_cached_input_price_per_1m: float = Field(default=0.20, ge=0)
+    backend_output_price_per_1m: float = Field(default=12.00, ge=0)
+    # Historical Realtime records remain readable; no running session uses these rates.
     # Cost tracking (estimated pricing, USD per 1M tokens unless noted)
     realtime_text_input_price_per_1m: float = Field(default=4.00, ge=0)
     realtime_audio_input_price_per_1m: float = Field(default=32.00, ge=0)
@@ -263,25 +253,8 @@ class Settings(BaseSettings):
             )
         return stripped
 
-    @field_validator("input_transcription_model")
-    @classmethod
-    def validate_transcription_model(cls, value: str) -> str:
-        if value not in SUPPORTED_TRANSCRIPTION_MODELS:
-            supported = ", ".join(sorted(SUPPORTED_TRANSCRIPTION_MODELS))
-            raise ValueError(f"unsupported transcription model; expected one of: {supported}")
-        return value
-
     @model_validator(mode="after")
-    def validate_transcription_delay(self) -> Settings:
-        if self.input_transcription_delay is not None:
-            if self.input_transcription_model != "gpt-realtime-whisper":
-                raise ValueError(
-                    "INPUT_TRANSCRIPTION_DELAY is only valid with gpt-realtime-whisper"
-                )
-            if self.input_transcription_delay not in TRANSCRIPTION_DELAYS:
-                raise ValueError("invalid INPUT_TRANSCRIPTION_DELAY")
-        if self.mini_models_enabled:
-            raise ValueError("mini realtime models are release-gated and disabled in v1")
+    def validate_openai_timeouts(self) -> Settings:
         if self.openai_connect_timeout_seconds > self.openai_http_timeout_seconds:
             raise ValueError(
                 "OPENAI_CONNECT_TIMEOUT_SECONDS cannot exceed OPENAI_HTTP_TIMEOUT_SECONDS"

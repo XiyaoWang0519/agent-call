@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from app.models import CallState
 from tests.conftest import seed_call, wait_background
+
+
+async def test_carrier_hangup_does_not_wait_for_live_usage(service, packet, monkeypatch):
+    call_id = await seed_call(service.db, packet)
+    carrier_closed = asyncio.Event()
+    release_usage = asyncio.Event()
+
+    async def delayed_usage(*args, **kwargs):
+        await release_usage.wait()
+
+    async def close_carrier(*args, **kwargs):
+        carrier_closed.set()
+
+    monkeypatch.setattr(service.live, "drain_and_close", delayed_usage)
+    monkeypatch.setattr(service.twilio, "complete_conference", close_carrier)
+    task = asyncio.create_task(
+        service._teardown_call_media(await service.db.get_call(call_id), preserve_conference=False)
+    )
+    try:
+        await asyncio.wait_for(carrier_closed.wait(), timeout=0.5)
+        assert not task.done()
+    finally:
+        release_usage.set()
+        await task
 
 
 @pytest.mark.asyncio
@@ -20,7 +45,7 @@ async def test_callee_exit_completes_conference_and_hangup_exactly_once(service,
     await service.handle_conference_event(call_id, form)
     await wait_background()
     assert len(service._test_twilio.completed) == 1
-    assert service._test_realtime.hangups == ["rtc_test"]
+    assert service._test_live.hangups == ["rtc_test"]
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
     assert service._test_finalizer.states_seen == [CallState.COMPLETED.value]

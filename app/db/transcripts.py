@@ -24,6 +24,8 @@ class TranscriptsMixin:
         text: str,
         source_event_type: str,
         source_event_id: str,
+        start_ms: float | None = None,
+        end_ms: float | None = None,
     ) -> TranscriptTurn | None:
         async with self._write_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
@@ -41,8 +43,8 @@ class TranscriptsMixin:
                 await conn.execute(
                     """INSERT INTO transcripts
                        (call_id, turn_id, speaker, text, source_event_type, source_event_id,
-                        sequence_number, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        sequence_number, created_at, start_ms, end_ms)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         call_id,
                         turn_id,
@@ -52,6 +54,8 @@ class TranscriptsMixin:
                         source_event_id,
                         sequence,
                         created_at,
+                        start_ms,
+                        end_ms,
                     ),
                 )
             except aiosqlite.IntegrityError:
@@ -65,6 +69,8 @@ class TranscriptsMixin:
             text=text,
             source_event_type=source_event_type,
             source_event_id=source_event_id,
+            start_ms=start_ms,
+            end_ms=end_ms,
             sequence_number=sequence,
             created_at=datetime.fromisoformat(created_at),
         )

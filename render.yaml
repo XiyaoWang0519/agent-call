@@ -12,12 +12,12 @@ services:
     envVars:
       - key: DATABASE_URL
         value: sqlite:////var/data/agent_call.db
-      - key: INPUT_TRANSCRIPTION_MODEL
-        value: gpt-realtime-whisper
+      - key: LIVE_MODEL
+        value: gpt-live-1
+      - key: LIVE_BACKEND_MODEL
+        value: gpt-5.6-terra
       - key: EXTRACTOR_MODEL
-        value: gpt-5.4-nano-2026-03-17
-      - key: MINI_MODELS_ENABLED
-        value: "false"
+        value: gpt-5.4-mini-2026-03-17
       - key: AGENT_PUSH_ENABLED
         value: "false"
       - key: ASK_AGENT_ENABLED

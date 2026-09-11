@@ -14,6 +14,16 @@ from app.settings import Settings
 
 
 def compute_call_cost(call: Mapping[str, Any], settings: Settings) -> CallCost:
+    live_seconds = float(call.get("live_session_seconds") or 0)
+    backend_input = int(call.get("backend_input_tokens") or 0)
+    backend_cached = int(call.get("backend_cached_input_tokens") or 0)
+    backend_output = int(call.get("backend_output_tokens") or 0)
+    live_cost_usd = live_seconds / 60 * settings.live_price_per_minute
+    backend_cost_usd = (
+        max(0, backend_input - backend_cached) * settings.backend_input_price_per_1m
+        + backend_cached * settings.backend_cached_input_price_per_1m
+        + backend_output * settings.backend_output_price_per_1m
+    ) / 1e6
     input_text = int(call.get("realtime_input_text_tokens") or 0)
     input_audio = int(call.get("realtime_input_audio_tokens") or 0)
     cached_text = int(call.get("realtime_input_cached_text_tokens") or 0)
@@ -54,9 +64,21 @@ def compute_call_cost(call: Mapping[str, Any], settings: Settings) -> CallCost:
     exa_search_count = int(call.get("exa_search_count") or 0)
     exa_cost_usd = float(call.get("exa_cost_dollars") or 0)
 
-    total_cost_usd = realtime_cost_usd + extractor_cost_usd + twilio_cost_usd + exa_cost_usd
+    total_cost_usd = (
+        live_cost_usd
+        + backend_cost_usd
+        + realtime_cost_usd
+        + extractor_cost_usd
+        + twilio_cost_usd
+        + exa_cost_usd
+    )
 
     usage = CallUsage(
+        live_session_seconds=live_seconds,
+        live_usage_finalized=bool(call.get("live_usage_finalized")),
+        backend_input_tokens=backend_input,
+        backend_cached_input_tokens=backend_cached,
+        backend_output_tokens=backend_output,
         realtime_input_text_tokens=input_text,
         realtime_input_audio_tokens=input_audio,
         realtime_input_cached_text_tokens=cached_text,
@@ -71,6 +93,8 @@ def compute_call_cost(call: Mapping[str, Any], settings: Settings) -> CallCost:
     )
     return CallCost(
         usage=usage,
+        live_cost_usd=round(live_cost_usd, 6),
+        backend_cost_usd=round(backend_cost_usd, 6),
         realtime_cost_usd=round(realtime_cost_usd, 6),
         extractor_cost_usd=round(extractor_cost_usd, 6),
         twilio_cost_usd=round(twilio_cost_usd, 6),

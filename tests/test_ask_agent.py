@@ -20,17 +20,24 @@ from app.models import (
     QuestionSource,
     StartPhoneCallOutput,
 )
-from app.openai_realtime import RealtimeBridge
+from app.openai_live import LiveBridge
 from tests.conftest import seed_call, wait_background
 
 
 def _tool_event(tool_call_id: str, name: str, arguments: str) -> dict[str, str]:
     return {
-        "type": "response.function_call_arguments.done",
-        "event_id": f"evt_{tool_call_id}",
-        "call_id": tool_call_id,
-        "name": name,
-        "arguments": arguments,
+        "type": "response.event",
+        "delegation_id": "delegation_test",
+        "event": {
+            "type": "response.output_item.done",
+            "response_id": "resp_test",
+            "item": {
+                "type": "function_call",
+                "call_id": tool_call_id,
+                "name": name,
+                "arguments": arguments,
+            },
+        },
     }
 
 
@@ -45,7 +52,7 @@ async def _ask(
     if reason is not None:
         payload["reason"] = reason
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event(tool_call_id, "ask_agent", json.dumps(payload)),
     )
@@ -81,7 +88,7 @@ async def test_ask_persists_without_immediate_tool_output(ask_service, packet):
     assert rows[0]["sequence_number"] == 1
     assert rows[0]["tool_call_id"] == "tc_1"
     assert rows[0]["question"] == "What is the owner's preferred pharmacy?"
-    assert not any(result[1] == "tc_1" for result in ask_service._test_realtime.tool_results)
+    assert not any(result[1] == "tc_1" for result in ask_service._test_live.tool_results)
     assert call_id in ask_service._pending_questions
     call = await ask_service.db.get_call(call_id)
     assert call["tool_call_count"] == 1
@@ -159,7 +166,7 @@ async def test_mcp_rejects_unsupported_not_found_without_claiming_question(ask_s
     assert question["status"] == "pending"
     assert not any(
         tool_call_id == "tc_unsupported_not_found"
-        for _, tool_call_id, _ in ask_service._test_realtime.tool_results
+        for _, tool_call_id, _ in ask_service._test_live.tool_results
     )
 
 
@@ -176,12 +183,12 @@ async def test_answer_delivers_correlated_output_and_continuation(ask_service, p
     assert result["status"] == "accepted"
     assert result["question_id"] == question_id
     assert "wait_for_call_event" in result["next_action"]
-    assert ask_service._test_realtime.tool_results[-1] == (
+    assert ask_service._test_live.tool_results[-1] == (
         call_id,
         "tc_1",
         {"status": "answered", "answer": "CVS on Market Street"},
     )
-    text = ask_service._test_realtime.tool_result_continuation_texts[-1]
+    text = ask_service._test_live.tool_result_continuation_texts[-1]
     assert text is not None
     assert "Relay the relevant part" in text
     row = await ask_service.db.get_question(question_id)
@@ -200,7 +207,7 @@ async def test_timeout_exactly_once_then_answer_is_expired(ask_service, packet):
     await asyncio.sleep(0.12)
     await wait_background()
 
-    timeout_results = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_timeout"]
+    timeout_results = [r for r in ask_service._test_live.tool_results if r[1] == "tc_timeout"]
     assert len(timeout_results) == 1
     assert timeout_results[0][2]["status"] == "timeout"
     assert timeout_results[0][2]["error"] == "no_answer_from_agent"
@@ -212,7 +219,7 @@ async def test_timeout_exactly_once_then_answer_is_expired(ask_service, packet):
     assert late["status"] == "expired"
     assert "wait_for_call_event" in late["next_action"]
     assert f"after_sequence={row['sequence_number']}" in late["next_action"]
-    assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_timeout"]) == 1
+    assert len([r for r in ask_service._test_live.tool_results if r[1] == "tc_timeout"]) == 1
 
 
 @pytest.mark.asyncio
@@ -230,7 +237,7 @@ async def test_answer_timeout_race_exactly_one_output(ask_service, packet):
     await answer_task
     await wait_background()
 
-    correlated = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_race"]
+    correlated = [r for r in ask_service._test_live.tool_results if r[1] == "tc_race"]
     assert len(correlated) == 1
     assert correlated[0][2]["status"] in {"answered", "timeout"}
     final = await ask_service.db.get_question(question_id)
@@ -251,7 +258,7 @@ async def test_duplicate_answer_idempotent_and_unknown_question_errors(ask_servi
     assert second["status"] == "already_answered"
     assert "wait_for_call_event" in second["next_action"]
     assert f"after_sequence={rows[0]['sequence_number']}" in second["next_action"]
-    assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_1"]) == 1
+    assert len([r for r in ask_service._test_live.tool_results if r[1] == "tc_1"]) == 1
 
     with pytest.raises(LookupError, match="unknown question"):
         await ask_service.answer_call_question(call_id, "missing_qid", "nope")
@@ -271,10 +278,10 @@ async def test_second_ask_while_pending_returns_error_and_keeps_call_active(ask_
     )
     await wait_background()
 
-    second = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_b"]
+    second = [r for r in ask_service._test_live.tool_results if r[1] == "tc_b"]
     assert len(second) == 1
     assert second[0][2] == {"status": "error", "error": "question_pending"}
-    assert not any(r[1] == "tc_a" for r in ask_service._test_realtime.tool_results)
+    assert not any(r[1] == "tc_a" for r in ask_service._test_live.tool_results)
     call = await ask_service.db.get_call(call_id)
     assert call["state"] == CallState.ACTIVE.value
     assert await ask_service.db.count_call_questions(call_id) == 1
@@ -296,7 +303,7 @@ async def test_question_limit_returns_error(ask_service, packet):
         question="Another allowed-length question here",
     )
     await wait_background()
-    limited = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_limit_2"]
+    limited = [r for r in ask_service._test_live.tool_results if r[1] == "tc_limit_2"]
     assert limited[-1][2] == {"status": "error", "error": "question_limit_reached"}
 
 
@@ -307,7 +314,7 @@ async def test_termination_cancels_pending_and_late_answer_is_call_ended(ask_ser
     await _ask(ask_service, call_id, tool_call_id="tc_term")
     rows = await ask_service.db.get_questions_after(call_id, 0)
     question_id = rows[0]["question_id"]
-    before = len(ask_service._test_realtime.tool_results)
+    before = len(ask_service._test_live.tool_results)
 
     await ask_service.terminate_call(call_id, "owner_request")
     await wait_background()
@@ -315,7 +322,7 @@ async def test_termination_cancels_pending_and_late_answer_is_call_ended(ask_ser
     row = await ask_service.db.get_question(question_id)
     assert row["status"] == "cancelled"
     assert call_id not in ask_service._pending_questions
-    assert len(ask_service._test_realtime.tool_results) == before
+    assert len(ask_service._test_live.tool_results) == before
 
     late = await ask_service.answer_call_question(call_id, question_id, "after end")
     assert late["status"] == "call_ended"
@@ -389,7 +396,7 @@ async def test_ask_agent_while_voice_end_pending_returns_call_ending(ask_service
     await _ask(ask_service, call_id, tool_call_id="tc_ending")
     await wait_background()
 
-    result = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_ending"]
+    result = [r for r in ask_service._test_live.tool_results if r[1] == "tc_ending"]
     assert result[-1][2] == {"status": "error", "error": "call_ending"}
 
 
@@ -401,20 +408,22 @@ async def test_ask_agent_disabled_returns_error_and_tool_absent_from_payload(
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     await _ask(service, call_id, tool_call_id="tc_disabled")
     await wait_background()
-    result = [r for r in service._test_realtime.tool_results if r[1] == "tc_disabled"]
+    result = [r for r in service._test_live.tool_results if r[1] == "tc_disabled"]
     assert result[-1][2] == {"status": "error", "error": "ask_agent_disabled"}
 
     async def _noop(*args, **kwargs) -> None:
         return None
 
-    bridge = RealtimeBridge(
+    bridge = LiveBridge(
         settings,
         SimpleNamespace(),
         on_event=_noop,
         on_open=_noop,
         on_fatal=_noop,
     )
-    names = [tool.name for tool in bridge.build_accept_payload(packet).tools]
+    names = [
+        tool.name for tool in bridge.build_accept_payload(packet).session.delegation.responses.tools
+    ]
     assert "ask_agent" not in names
 
 
@@ -504,7 +513,7 @@ async def test_answer_rejected_while_call_terminating(ask_service, packet):
     assert result["status"] == "call_ended"
     row = await ask_service.db.get_question(question_id)
     assert row["status"] == "pending"
-    assert not any(r[1] == "tc_term_race" for r in ask_service._test_realtime.tool_results)
+    assert not any(r[1] == "tc_term_race" for r in ask_service._test_live.tool_results)
 
 
 @pytest.mark.asyncio
@@ -554,7 +563,7 @@ async def test_wait_for_call_event_terminal_does_not_retain_notifier(ask_service
 
 
 @pytest.mark.asyncio
-async def test_answer_delivery_cancels_active_response(ask_service, packet):
+async def test_answer_delivery_preserves_live_backend_response(ask_service, packet):
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_cancel")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -563,36 +572,40 @@ async def test_answer_delivery_cancels_active_response(ask_service, packet):
     await ask_service.answer_call_question(call_id, rows[0]["question_id"], "the answer")
     await wait_background()
 
-    assert ("cancel_response", call_id) in ask_service._test_realtime.events
-    assert call_id not in ask_service._active_response_ids
-    delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_cancel"]
+    assert ("cancel_response", call_id) not in ask_service._test_live.events
+    assert ask_service._active_response_ids[call_id] == "resp_active"
+    delivered = [r for r in ask_service._test_live.tool_results if r[1] == "tc_cancel"]
     assert len(delivered) == 1
     assert delivered[0][2]["status"] == "answered"
 
 
 @pytest.mark.asyncio
-async def test_end_call_cancels_pending_question(ask_service, packet):
+async def test_end_call_refuses_to_abandon_pending_question(ask_service, packet):
     ask_service.settings.ask_agent_answer_timeout_seconds = 30.0
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_pending")
     rows = await ask_service.db.get_questions_after(call_id, 0)
     question_id = rows[0]["question_id"]
 
-    await ask_service.handle_realtime_event(
+    await ask_service.handle_live_event(
         call_id,
-        _tool_event("tc_end", "end_call", '{"reason": "objective_completed"}'),
+        _tool_event(
+            "tc_end",
+            "finish_call_after_goodbye",
+            '{"reason": "objective_completed", "farewell": "Goodbye"}',
+        ),
     )
     await wait_background()
 
     row = await ask_service.db.get_question(question_id)
-    assert row["status"] == "cancelled"
-    assert call_id not in ask_service._pending_questions
-    assert not any(r[1] == "tc_pending" for r in ask_service._test_realtime.tool_results)
+    assert row["status"] == "pending"
+    assert call_id in ask_service._pending_questions
+    assert not any(r[1] == "tc_pending" for r in ask_service._test_live.tool_results)
 
     late = await ask_service.answer_call_question(call_id, question_id, "too late")
     await wait_background()
-    assert late["status"] == "call_ended"
-    assert not any(r[1] == "tc_pending" for r in ask_service._test_realtime.tool_results)
+    assert late["status"] == "accepted"
+    assert any(r[1] == "tc_pending" for r in ask_service._test_live.tool_results)
 
 
 @pytest.mark.asyncio
@@ -606,7 +619,7 @@ async def test_wait_for_call_event_clamps_huge_after_sequence(ask_service, packe
 
 
 @pytest.mark.asyncio
-async def test_duplicate_tool_call_id_reports_duplicate_error(ask_service, packet):
+async def test_duplicate_tool_call_id_keeps_original_result(ask_service, packet):
     call_id = await seed_call(ask_service.db, packet, state=CallState.ACTIVE)
     await _ask(ask_service, call_id, tool_call_id="tc_dup")
     rows = await ask_service.db.get_questions_after(call_id, 0)
@@ -621,8 +634,9 @@ async def test_duplicate_tool_call_id_reports_duplicate_error(ask_service, packe
     )
     await wait_background()
 
-    results = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_dup"]
-    assert results[-1][2] == {"status": "error", "error": "duplicate_tool_call"}
+    results = [r for r in ask_service._test_live.tool_results if r[1] == "tc_dup"]
+    assert len(results) == 1
+    assert results[-1][2] == {"status": "answered", "answer": "first answer"}
     assert await ask_service.db.count_call_questions(call_id) == 1
 
 
@@ -633,7 +647,7 @@ async def test_redelivered_pending_ask_is_idempotent(ask_service, packet):
     await wait_background()
     rows = await ask_service.db.get_questions_after(call_id, 0)
     question_id = rows[0]["question_id"]
-    before_results = list(ask_service._test_realtime.tool_results)
+    before_results = list(ask_service._test_live.tool_results)
 
     await _ask(
         ask_service,
@@ -643,7 +657,7 @@ async def test_redelivered_pending_ask_is_idempotent(ask_service, packet):
     )
     await wait_background()
 
-    assert ask_service._test_realtime.tool_results == before_results
+    assert ask_service._test_live.tool_results == before_results
     assert await ask_service.db.count_call_questions(call_id) == 1
     assert call_id in ask_service._pending_questions
     assert ask_service._pending_questions[call_id].question_id == question_id
@@ -651,7 +665,7 @@ async def test_redelivered_pending_ask_is_idempotent(ask_service, packet):
     accepted = await ask_service.answer_call_question(call_id, question_id, "Walgreens")
     await wait_background()
     assert accepted["status"] == "accepted"
-    delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_redeliver"]
+    delivered = [r for r in ask_service._test_live.tool_results if r[1] == "tc_redeliver"]
     assert len(delivered) == 1
     assert delivered[0][2] == {"status": "answered", "answer": "Walgreens"}
 
@@ -664,7 +678,7 @@ async def test_redelivered_pending_ask_at_question_limit_is_idempotent(ask_servi
     await wait_background()
     rows = await ask_service.db.get_questions_after(call_id, 0)
     question_id = rows[0]["question_id"]
-    before_results = list(ask_service._test_realtime.tool_results)
+    before_results = list(ask_service._test_live.tool_results)
 
     await _ask(
         ask_service,
@@ -674,7 +688,7 @@ async def test_redelivered_pending_ask_at_question_limit_is_idempotent(ask_servi
     )
     await wait_background()
 
-    assert ask_service._test_realtime.tool_results == before_results
+    assert ask_service._test_live.tool_results == before_results
     assert await ask_service.db.count_call_questions(call_id) == 1
     row = await ask_service.db.get_question(question_id)
     assert row["status"] == "pending"
@@ -682,7 +696,7 @@ async def test_redelivered_pending_ask_at_question_limit_is_idempotent(ask_servi
     accepted = await ask_service.answer_call_question(call_id, question_id, "Walgreens")
     await wait_background()
     assert accepted["status"] == "accepted"
-    delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_quota_redeliver"]
+    delivered = [r for r in ask_service._test_live.tool_results if r[1] == "tc_quota_redeliver"]
     assert len(delivered) == 1
 
 
@@ -704,7 +718,7 @@ async def test_expiry_does_not_claim_once_call_is_terminating(ask_service, packe
 
     # Termination owns the call: the deadline must not inject a timeout tool result,
     # and the row stays pending for cancel_pending_questions to claim.
-    assert not any(r[1] == "tc_expire_term" for r in ask_service._test_realtime.tool_results)
+    assert not any(r[1] == "tc_expire_term" for r in ask_service._test_live.tool_results)
     row = await ask_service.db.get_question(question_id)
     assert row["status"] == "pending"
     assert call_id not in ask_service._pending_questions
@@ -722,12 +736,12 @@ async def test_failed_answer_delivery_is_retryable(ask_service, packet):
     rows = await ask_service.db.get_questions_after(call_id, 0)
     question_id = rows[0]["question_id"]
 
-    ask_service._test_realtime.tool_result_failures_remaining = 1
+    ask_service._test_live.tool_result_failures_remaining = 1
     first = await ask_service.answer_call_question(call_id, question_id, "CVS on Market")
     await wait_background()
 
     assert first["status"] == "accepted"
-    assert not any(r[1] == "tc_retry" for r in ask_service._test_realtime.tool_results)
+    assert not any(r[1] == "tc_retry" for r in ask_service._test_live.tool_results)
     row = await ask_service.db.get_question(question_id)
     assert row["status"] == "answered"
 
@@ -737,7 +751,7 @@ async def test_failed_answer_delivery_is_retryable(ask_service, packet):
     assert retry["status"] == "accepted"
     assert retry["question_id"] == question_id
     assert "wait_for_call_event" in retry["next_action"]
-    delivered = [r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]
+    delivered = [r for r in ask_service._test_live.tool_results if r[1] == "tc_retry"]
     assert len(delivered) == 1
     # The originally claimed answer wins; the retry only re-attempts delivery.
     assert delivered[0][2] == {"status": "answered", "answer": "CVS on Market"}
@@ -747,7 +761,7 @@ async def test_failed_answer_delivery_is_retryable(ask_service, packet):
     await wait_background()
     assert third["status"] == "already_answered"
     assert "wait_for_call_event" in third["next_action"]
-    assert len([r for r in ask_service._test_realtime.tool_results if r[1] == "tc_retry"]) == 1
+    assert len([r for r in ask_service._test_live.tool_results if r[1] == "tc_retry"]) == 1
 
 
 def _messages(caplog: pytest.LogCaptureFixture, *, logger_name: str) -> list[str]:

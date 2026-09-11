@@ -1,12 +1,88 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+import asyncio
+import json
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from starlette.datastructures import FormData
+from twilio.request_validator import RequestValidator
 
 from app.models import DTMF_DIGITS_PATTERN
 from app.security import verify_twilio_request
+from app.settings import Settings
 
 router = APIRouter(prefix="/webhooks/twilio", tags=["twilio-webhooks"])
+
+
+@router.websocket("/media/{call_id}/{plan_id}")
+async def carrier_media(websocket: WebSocket, call_id: str, plan_id: str) -> None:
+    service = websocket.app.state.call_service
+    settings = service.settings
+    # Validate against the configured public origin, never the untrusted Host header.
+    url = (
+        f"{(settings.public_base_url or '').rstrip('/')}/webhooks/twilio/media/{call_id}/{plan_id}"
+    )
+    validator = RequestValidator(Settings.reveal(settings.twilio_auth_token))
+    # Twilio Voice may sign the WSS URL with a trailing slash. Restrict all
+    # canonical forms to this configured origin/path, then require the call token.
+    signature = websocket.headers.get("x-twilio-signature", "")
+    if websocket.url.query or not any(
+        validator.validate(candidate + suffix, {}, signature)
+        for candidate in (url, url.replace("https://", "wss://", 1))
+        for suffix in ("", "/")
+    ):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    bound = False
+    stream_sid: str | None = None
+    try:
+        async with asyncio.timeout(5):
+            while not bound:
+                message = await websocket.receive_text()
+                if len(message) > 32_768:
+                    raise ValueError("oversized carrier event")
+                event = json.loads(message)
+                if event.get("event") == "connected":
+                    continue
+                if event.get("event") != "start":
+                    raise ValueError("carrier stream must start before media")
+                start = event.get("start") or {}
+                if not await service.accept_media_monitor(call_id, plan_id, start):
+                    raise ValueError("carrier stream is not authorized for this call")
+                stream_sid = start["streamSid"]
+                bound = True
+        while True:
+            message = await websocket.receive_text()
+            if len(message) > 32_768:
+                raise ValueError("oversized carrier event")
+            event = json.loads(message)
+            if event.get("streamSid") != stream_sid:
+                raise ValueError("carrier stream identity changed")
+            if event.get("event") == "media":
+                media = event.get("media") or {}
+                service.observe_media_audio(
+                    call_id, media["track"], int(media["timestamp"]), media["payload"]
+                )
+            elif event.get("event") == "stop":
+                break
+    except (WebSocketDisconnect, TimeoutError, ValueError, KeyError, TypeError):
+        pass
+    finally:
+        if bound:
+            await service.media_monitor_closed(call_id)
+        try:
+            await websocket.close()
+        except (RuntimeError, WebSocketDisconnect):
+            pass
 
 
 def _form_dict(form: FormData) -> dict[str, str]:

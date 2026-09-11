@@ -89,7 +89,7 @@ def test_evaluation_mcp_start_is_live_calls_disabled(tmp_path, packet, monkeypat
         raise AssertionError("OpenAI accept must not run")
 
     monkeypatch.setattr(TwilioBridge, "create_agent_participant", capture_twilio)
-    monkeypatch.setattr("app.openai_realtime.RealtimeBridge.accept_and_connect", capture_accept)
+    monkeypatch.setattr("app.openai_live.LiveBridge.accept_and_connect", capture_accept)
 
     headers = {
         "Authorization": f"Bearer {settings.reveal(settings.mcp_bearer_token)}",

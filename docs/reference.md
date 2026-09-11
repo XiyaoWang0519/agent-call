@@ -15,12 +15,14 @@ sequenceDiagram
     A->>B: prepare_phone_call (plan + policy checks)
     A->>B: start_phone_call (explicit confirmation)
     B->>T: create conference, dial OpenAI SIP leg
-    O-->>B: realtime.call.incoming webhook
+    O-->>B: live.transport.incoming webhook
     B->>O: accept + prewarm over sideband WebSocket
     B->>T: now dial the callee (with AMD)
     T->>C: ring
     O<<->>C: conversation (transcribed live)
-    O->>B: end_call → one spoken goodbye → teardown
+    O->>B: delegated finish_call_after_goodbye
+    T-->>B: carrier playback + three-second reply window
+    B->>O: session.close → final usage
     A->>B: wait_for_call_event → get_call_result
 ```
 
@@ -52,7 +54,7 @@ During a live call, `wait_for_call_event` is the canonical monitoring loop; once
 - Destination policy blocks malformed E.164, emergency/N11/short codes, premium-rate prefixes, disallowed country codes, and the service's own Twilio number.
 - The voice model may not share or request passwords, auth codes, payment credentials, or government identifiers. It chooses how to open from the approved call context; the bridge does not impose identity, disclosure, or recipient-confirmation wording.
 - The agent can press automated phone-menu (IVR) keys via a signed announce webhook, but is instructed never to enter payment, authentication, or identity digits that way.
-- The in-call model decides when the conversation is done and invokes its private `end_call` function; the bridge asks for one final spoken goodbye, waits for it, then tears down OpenAI and Twilio.
+- The voice frontend says goodbye, then delegates `finish_call_after_goodbye`; the bridge verifies the farewell and carrier playback, preserves three seconds for a reply, then finalizes Live and releases Twilio.
 - Evaluation/dummy profile: `prepare_phone_call` still persists a plan; `start_phone_call` returns `live_calls_disabled` before any OpenAI or Twilio client request.
 
 > [!WARNING]
@@ -63,7 +65,7 @@ During a live call, `wait_for_call_event` is the canonical monitoring loop; once
 | Piece | Job |
 | --- | --- |
 | ChatGPT / Work / Claude web | Intended primary MCP clients; see [verification status](browser-clients.md) |
-| [OpenAI Realtime SIP](https://developers.openai.com/api/docs/guides/realtime-sip) | Voice agent, accept, sideband control |
+| [OpenAI GPT-Live SIP](https://developers.openai.com/api/docs/guides/voice-sip?api=live) | Voice agent, accept, sideband control |
 | [Twilio](https://www.twilio.com) | Conference, callee dial, answering-machine detection |
 | [Exa](https://exa.ai) | Optional in-call public-web search |
 | [FastAPI](https://fastapi.tiangolo.com) + FastMCP | HTTP surface and MCP tools |

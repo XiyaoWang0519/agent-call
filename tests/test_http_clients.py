@@ -10,7 +10,7 @@ from app.db import Database
 from app.exa_search import ExaSearchClient
 from app.main import create_app
 from app.openai_client import create_openai_client
-from app.openai_realtime import RealtimeBridge
+from app.openai_live import LiveBridge
 from app.settings import Settings
 from app.twilio_bridge import TwilioBridge
 
@@ -195,21 +195,15 @@ def test_openai_connect_timeout_cannot_exceed_request_timeout(settings):
 
 
 @pytest.mark.asyncio
-async def test_realtime_accept_has_a_total_wall_clock_deadline(settings, packet):
+async def test_live_accept_has_a_total_wall_clock_deadline(settings, packet):
     settings.openai_connect_timeout_seconds = 0.005
     settings.openai_http_timeout_seconds = 0.01
 
     async def hanging_accept(*args, **kwargs):
         await asyncio.Event().wait()
 
-    client = SimpleNamespace(
-        realtime=SimpleNamespace(
-            calls=SimpleNamespace(
-                with_raw_response=SimpleNamespace(accept=hanging_accept),
-            )
-        )
-    )
-    bridge = RealtimeBridge(
+    client = SimpleNamespace(post=hanging_accept)
+    bridge = LiveBridge(
         settings,
         client,
         on_event=lambda *args: None,
@@ -226,7 +220,7 @@ async def test_realtime_accept_has_a_total_wall_clock_deadline(settings, packet)
 
 
 @pytest.mark.asyncio
-async def test_realtime_accept_logs_only_allowlisted_response_metadata(settings, packet, caplog):
+async def test_live_accept_logs_only_allowlisted_response_metadata(settings, packet, caplog):
     provider_secret = "sk-provider-secret-123456789"
 
     async def accept(*args, **kwargs):
@@ -239,12 +233,8 @@ async def test_realtime_accept_logs_only_allowlisted_response_metadata(settings,
             text=f"sensitive response {provider_secret}",
         )
 
-    client = SimpleNamespace(
-        realtime=SimpleNamespace(
-            calls=SimpleNamespace(with_raw_response=SimpleNamespace(accept=accept))
-        )
-    )
-    bridge = RealtimeBridge(
+    client = SimpleNamespace(post=accept)
+    bridge = LiveBridge(
         settings,
         client,
         on_event=lambda *args: None,
@@ -256,7 +246,7 @@ async def test_realtime_accept_logs_only_allowlisted_response_metadata(settings,
         return None
 
     bridge._run = no_sideband
-    with caplog.at_level("INFO", logger="app.openai_realtime"):
+    with caplog.at_level("INFO", logger="app.openai_live"):
         await bridge.accept_and_connect(
             call_id="call_1",
             openai_call_id="rtc_1",

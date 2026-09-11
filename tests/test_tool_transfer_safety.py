@@ -18,11 +18,18 @@ def _tool_event(
     arguments: str,
 ) -> dict[str, str]:
     return {
-        "type": "response.function_call_arguments.done",
-        "event_id": f"evt_{tool_call_id}",
-        "call_id": tool_call_id,
-        "name": name,
-        "arguments": arguments,
+        "type": "response.event",
+        "delegation_id": "delegation_test",
+        "event": {
+            "type": "response.output_item.done",
+            "response_id": "resp_test",
+            "item": {
+                "type": "function_call",
+                "call_id": tool_call_id,
+                "name": name,
+                "arguments": arguments,
+            },
+        },
     }
 
 
@@ -30,7 +37,7 @@ def _tool_event(
 async def test_search_web_returns_compact_evidence_and_records_latency(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event(
             "tool_search",
@@ -41,7 +48,7 @@ async def test_search_web_returns_compact_evidence_and_records_latency(service, 
     await wait_background()
 
     assert service._test_exa.queries == ["latest Example Clinic hours"]
-    assert service._test_realtime.tool_results[-1] == (
+    assert service._test_live.tool_results[-1] == (
         call_id,
         "tool_search",
         service._test_exa.result.output,
@@ -61,12 +68,12 @@ async def test_search_web_failure_continues_call_with_safe_error(service, packet
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._test_exa.error = ExaSearchError("search_rate_limited")
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_search", "search_web", '{"query":"current opening hours"}'),
     )
 
-    assert service._test_realtime.tool_results[-1][2] == {
+    assert service._test_live.tool_results[-1][2] == {
         "ok": False,
         "error": "search_rate_limited",
     }
@@ -79,7 +86,7 @@ async def test_search_web_failure_continues_call_with_safe_error(service, packet
 async def test_search_web_rejects_model_control_of_provider_parameters(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
 
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event(
             "tool_search",
@@ -89,7 +96,7 @@ async def test_search_web_rejects_model_control_of_provider_parameters(service, 
     )
 
     assert service._test_exa.queries == []
-    assert service._test_realtime.tool_results[-1][2] == {
+    assert service._test_live.tool_results[-1][2] == {
         "ok": False,
         "error": "invalid_search_request",
     }
@@ -114,7 +121,7 @@ async def test_invalid_tool_result_is_sent_before_single_fused_write_finishes(
 
     monkeypatch.setattr(service.db, "record_tool_call", blocked_write)
     handling = asyncio.create_task(
-        service.handle_realtime_event(
+        service.handle_live_event(
             call_id,
             _tool_event(
                 "tool_fast",
@@ -126,7 +133,7 @@ async def test_invalid_tool_result_is_sent_before_single_fused_write_finishes(
 
     await asyncio.wait_for(write_started.wait(), timeout=2)
     await asyncio.sleep(0)
-    assert service._test_realtime.tool_results[-1][1] == "tool_fast"
+    assert service._test_live.tool_results[-1][1] == "tool_fast"
     assert not handling.done()
 
     release_write.set()
@@ -151,7 +158,7 @@ async def test_valid_advisory_is_durable_before_accepted_output(service, packet,
 
     monkeypatch.setattr(service.db, "record_tool_call", blocked_write)
     handling = asyncio.create_task(
-        service.handle_realtime_event(
+        service.handle_live_event(
             call_id,
             _tool_event(
                 "tool_durable",
@@ -163,13 +170,13 @@ async def test_valid_advisory_is_durable_before_accepted_output(service, packet,
 
     await asyncio.wait_for(write_started.wait(), timeout=2)
     await asyncio.sleep(0)
-    assert service._test_realtime.tool_results == []
+    assert service._test_live.tool_results == []
 
     release_write.set()
     await asyncio.wait_for(handling, timeout=2)
     call = await service.db.get_call(call_id)
     assert call["advisory_outcome"]["summary"] == "Done"
-    assert service._test_realtime.tool_results[-1][2] == {"accepted": True}
+    assert service._test_live.tool_results[-1][2] == {"accepted": True}
 
 
 @pytest.mark.asyncio
@@ -185,7 +192,7 @@ async def test_invalid_and_unknown_tools_count_without_overwriting_valid_advisor
         _tool_event("tool_unknown", "future_tool", "{}"),
     ]
     for event in events:
-        await service.handle_realtime_event(call_id, event)
+        await service.handle_live_event(call_id, event)
 
     call = await service.db.get_call(call_id)
     assert call["tool_call_count"] == 3
@@ -206,11 +213,11 @@ async def test_nontransfer_tool_result_send_race_does_not_propagate(service, pac
         del args, kwargs
         raise RuntimeError("sideband is not open")
 
-    monkeypatch.setattr(service.realtime, "send_tool_result", teardown_race)
+    monkeypatch.setattr(service.live, "send_tool_result", teardown_race)
 
     # Must not raise: a benign teardown race sending the tool result cannot escalate
     # into a fatal error, but the durable write still has to land.
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_race", "future_tool", "{}"),
     )
@@ -232,7 +239,7 @@ async def test_advisory_persistence_failure_sends_rejection_and_propagates(
     monkeypatch.setattr(service.db, "record_tool_call", failing_write)
 
     with pytest.raises(RuntimeError, match="database unavailable"):
-        await service.handle_realtime_event(
+        await service.handle_live_event(
             call_id,
             _tool_event(
                 "tool_advisory_fail",
@@ -242,7 +249,7 @@ async def test_advisory_persistence_failure_sends_rejection_and_propagates(
         )
 
     # The model must still receive a tool result even though its outcome was lost.
-    assert service._test_realtime.tool_results[-1] == (
+    assert service._test_live.tool_results[-1] == (
         call_id,
         "tool_advisory_fail",
         {"accepted": False, "error": "outcome could not be persisted"},
@@ -254,7 +261,7 @@ async def test_response_created_marks_continuation_without_reading_call(
     service, packet, monkeypatch
 ):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         _tool_event("tool_1", "future_tool", "{}"),
     )
@@ -263,9 +270,13 @@ async def test_response_created_marks_continuation_without_reading_call(
         raise AssertionError("response.created must use one conditional UPDATE")
 
     monkeypatch.setattr(service.db, "get_call", forbidden_read)
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
-        {"type": "response.created", "response": {"id": "resp_after_tool"}},
+        {
+            "type": "response.event",
+            "delegation_id": "delegation_test",
+            "event": {"type": "response.created", "response": {"id": "resp_after_tool"}},
+        },
     )
     row = await service.db.fetch_one(
         "SELECT tool_continuation_observed FROM calls WHERE call_id=?", (call_id,)
@@ -286,45 +297,17 @@ async def test_ordinary_response_created_performs_no_tool_continuation_write(
         raise AssertionError("ordinary responses must not write tool continuation state")
 
     monkeypatch.setattr(service.db, "mark_tool_continuation_observed", forbidden_write)
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
-        {"type": "response.created", "response": {"id": "resp_ordinary"}},
+        {
+            "type": "response.event",
+            "delegation_id": "delegation_test",
+            "event": {"type": "response.created", "response": {"id": "resp_ordinary"}},
+        },
     )
 
     assert writes == 0
     assert service._active_response_ids[call_id] == "resp_ordinary"
-
-
-@pytest.mark.asyncio
-async def test_valid_end_call_arms_fallback_before_persistence_failure(
-    service, packet, monkeypatch
-):
-    call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
-    fallback_started = asyncio.Event()
-    release_fallback = asyncio.Event()
-
-    async def blocked_fallback(_call_id: str, _tool_call_id: str):
-        fallback_started.set()
-        await release_fallback.wait()
-
-    async def failed_write(*args, **kwargs):
-        del args, kwargs
-        await fallback_started.wait()
-        raise RuntimeError("database unavailable")
-
-    monkeypatch.setattr(service, "_voice_end_fallback", blocked_fallback)
-    monkeypatch.setattr(service.db, "record_tool_call", failed_write)
-
-    with pytest.raises(RuntimeError, match="database unavailable"):
-        await service.handle_realtime_event(
-            call_id,
-            _tool_event("tool_end", "end_call", '{"reason":"objective_completed"}'),
-        )
-
-    assert service._voice_end_pending[call_id][0] == "tool_end"
-    assert fallback_started.is_set()
-    release_fallback.set()
-    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -345,7 +328,9 @@ async def test_transfer_runs_in_background_and_duplicate_creates_one_owner(
     monkeypatch.setattr(service._test_twilio, "create_owner_participant", blocked_create)
     await service._handle_tool_call(
         call_id,
-        _tool_event("tool_transfer_1", "transfer_to_owner", '{"reason":"owner needed"}'),
+        _tool_event("tool_transfer_1", "transfer_to_owner", '{"reason":"owner needed"}')["event"][
+            "item"
+        ],
     )
     await asyncio.wait_for(create_started.wait(), timeout=2)
     transfer_task = service._owner_transfer_tasks[call_id]
@@ -353,10 +338,10 @@ async def test_transfer_runs_in_background_and_duplicate_creates_one_owner(
 
     await service._handle_tool_call(
         call_id,
-        _tool_event("tool_transfer_2", "transfer_to_owner", '{"reason":"again"}'),
+        _tool_event("tool_transfer_2", "transfer_to_owner", '{"reason":"again"}')["event"]["item"],
     )
     assert service._test_twilio.owner_creates == 1
-    assert service._test_realtime.tool_results[-1][2]["accepted"] is False
+    assert service._test_live.tool_results[-1][2]["accepted"] is False
 
     service._owner_join_events[call_id].set()
     release_create.set()
@@ -407,11 +392,11 @@ async def test_cancel_after_termination_claim_still_finishes_media_and_terminal_
     release_hangup = asyncio.Event()
 
     async def blocked_hangup(openai_call_id):
-        service._test_realtime.hangups.append(openai_call_id)
+        service._test_live.hangups.append(openai_call_id)
         hangup_started.set()
         await release_hangup.wait()
 
-    monkeypatch.setattr(service._test_realtime, "hangup", blocked_hangup)
+    monkeypatch.setattr(service._test_live, "hangup", blocked_hangup)
     terminating = asyncio.create_task(service.terminate_call(call_id, "owner_request"))
     await asyncio.wait_for(hangup_started.wait(), timeout=2)
     claimed = await service.db.get_call(call_id)
@@ -427,7 +412,7 @@ async def test_cancel_after_termination_claim_still_finishes_media_and_terminal_
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
     assert service._test_twilio.completed == ["CF" + "a" * 32]
-    assert service._test_realtime.closed == [call_id]
+    assert service._test_live.closed == [call_id]
 
 
 @pytest.mark.asyncio
@@ -488,7 +473,9 @@ async def test_termination_waits_for_late_owner_create_and_cleans_sid_once(
     monkeypatch.setattr(service._test_twilio, "create_owner_participant", late_create)
     await service._handle_tool_call(
         call_id,
-        _tool_event("tool_transfer", "transfer_to_owner", '{"reason":"owner needed"}'),
+        _tool_event("tool_transfer", "transfer_to_owner", '{"reason":"owner needed"}')["event"][
+            "item"
+        ],
     )
     await asyncio.wait_for(create_started.wait(), timeout=2)
 
@@ -1136,9 +1123,9 @@ async def test_stop_fails_closed_for_an_unexpected_active_call(service, packet):
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert call["termination_reason"] == "service_shutdown"
-    assert service._test_realtime.hangups == ["rtc_test"]
+    assert service._test_live.hangups == ["rtc_test"]
     assert service._test_twilio.completed == ["CF" + "a" * 32]
-    assert service._test_realtime.close_all_calls == 1
+    assert service._test_live.close_all_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1158,7 +1145,9 @@ async def test_shutdown_cleans_owner_created_after_transfer_task_cancellation(
     monkeypatch.setattr(service._test_twilio, "create_owner_participant", late_create)
     await service._handle_tool_call(
         call_id,
-        _tool_event("tool_transfer", "transfer_to_owner", '{"reason":"owner needed"}'),
+        _tool_event("tool_transfer", "transfer_to_owner", '{"reason":"owner needed"}')["event"][
+            "item"
+        ],
     )
     await asyncio.wait_for(create_started.wait(), timeout=2)
 

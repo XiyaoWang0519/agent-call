@@ -7,7 +7,7 @@
 
 Agent Call lets an AI assistant make phone calls on your behalf. Give it a task, review the call plan, and explicitly confirm before it dials. You can follow the call, provide answers, stop it, and retrieve the result and transcript.
 
-Developed with Codex, Agent Call uses OpenAI Realtime SIP (`gpt-realtime-2.1`) for the phone conversation and Twilio to reach the recipient. You run the service yourself, using your own OpenAI and Twilio accounts.
+Developed with Codex, Agent Call uses OpenAI GPT-Live SIP (`gpt-live-1`) with a delegated `gpt-5.6-terra` task backend for the phone conversation and Twilio to reach the recipient. You run the service yourself, using your own OpenAI and Twilio accounts.
 
 **Works with ChatGPT Work and Claude web, verified with real question-and-answer calls. It does not work in regular ChatGPT mode.** See [client setup, test results, and verification limits](docs/browser-clients.md).
 
@@ -16,7 +16,7 @@ Developed with Codex, Agent Call uses OpenAI Realtime SIP (`gpt-realtime-2.1`) f
 | Requirement | Try locally without calls | Make real calls |
 | --- | --- | --- |
 | Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/) or pip | Required | Required for local installation |
-| OpenAI API project with Realtime SIP access | No | API key, project ID, and webhook signing secret |
+| OpenAI API project with Live SIP access | No | API key, project ID, and webhook signing secret |
 | Twilio account and voice-capable caller number | No | Account SID, auth token, outbound SIP and conference support |
 | Your phone number | No | Owner callback number, in international E.164 format |
 | Public HTTPS address | No | A tunnel to your computer, or a hosted instance; used by webhooks and browser clients |
@@ -61,7 +61,7 @@ agent-call start
 
 On first launch, this command downloads and verifies its own pinned Cloudflare tunnel helper, obtains a temporary public HTTPS address without an extra tunnel account, and guides you through configuration. You do not need to install Docker, Git, ngrok, or cloudflared separately. Internet access is required for package dependencies, the helper download, and service connections.
 
-Enter your OpenAI API key, project ID and webhook signing secret; Twilio account SID, auth token and voice number; your owner callback number, name and timezone; and a dedicated browser login password. Exa is optional. The wizard displays the exact OpenAI webhook URL to configure for `realtime.call.incoming`. It generates the service tokens and OAuth keys and stores only a hash of the owner login password.
+Enter your OpenAI API key, project ID and webhook signing secret; Twilio account SID, auth token and voice number; your owner callback number, name and timezone; and a dedicated browser login password. Exa is optional. The wizard displays the exact OpenAI webhook URL to configure for `live.transport.incoming`. It generates the service tokens and OAuth keys and stores only a hash of the owner login password.
 
 Configuration and SQLite data live in `~/.agent-call`, independent of the current working directory. `--directory /path/to/private-folder` selects a separate instance. Existing configuration and authentication keys are reused. The command starts both the service and tunnel and displays the browser connector URL. Keep that terminal open and the computer awake through calls and finalization. Ctrl-C waits for idle calls before stopping.
 

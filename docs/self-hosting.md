@@ -48,7 +48,7 @@ Troubleshooting: [troubleshooting.md](troubleshooting.md).
 
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - A voice-enabled Twilio account (E.164 caller ID, outbound SIP, Conference Participant AMD)
-- An OpenAI project with Realtime SIP access and a webhook signing secret
+- An OpenAI project with Live SIP access and a webhook signing secret
 - Optional: an Exa API key for in-call web search. Leave it blank to disable search.
 - A stable public HTTPS origin for webhooks
 
@@ -67,16 +67,17 @@ Booting a **live** process requires every variable in `Settings.require_runtime_
 
 Do not put `ALLOWED_COUNTRY_CODES` in `.env.local`. pydantic-settings JSON-decodes list-typed fields, so `ALLOWED_COUNTRY_CODES=+1` crashes boot. Omit it and rely on the `+1` default. For a non-default allowlist, set a JSON list in the process environment (for example `ALLOWED_COUNTRY_CODES=["+1"]`).
 
-`INPUT_NOISE_REDUCTION` defaults to OpenAI's `far_field` input filter; `near_field` is also
-available. Far-field was selected after a controlled synthetic speech/noise comparison;
-that small local-transport sample does not establish real-phone robustness. Compare received
-audio and speech-start events when changing the setting: filtering can introduce false speech
-turns or delay real speech. `TURN_DETECTION_MODE=server_vad` uses a 300 ms silence threshold
-by default to reduce delayed responses. `semantic_vad` remains available for comparison; its
-eagerness controls turn completion, not background-noise sensitivity. Keep real interruptions enabled and verify them separately
-from noise rejection. A generated transcript alone does not prove that the callee heard a full sentence.
-See [conversational audio validation](call-audio-validation.md) for the non-speech noise
-acceptance scope, measured results, and remaining latency limits.
+The Live voice frontend defaults to `gpt-live-1` with `marin`; task work uses
+`gpt-5.6-terra` with low reasoning effort. Live manages speech perception and turn-taking
+natively. Remove the old `INPUT_TRANSCRIPTION_*`, `INPUT_NOISE_REDUCTION`,
+`TURN_DETECTION_MODE`, `SERVER_VAD_*`, `SEMANTIC_VAD_*` and `MINI_MODELS_ENABLED`
+settings; they no longer configure the voice path. There is no Realtime fallback.
+
+The public origin must accept signed WebSockets at `/webhooks/twilio/media/...` as well
+as HTTP callbacks. This monitor observes carrier playback; the main speech path remains
+Twilio-to-OpenAI SIP. Verify heard audio, interruptions, noisy conditions and reply timing
+with the [automated phone harness](live-phone-runbook.md). Historical Realtime measurements
+in [conversational audio validation](call-audio-validation.md) do not validate Live.
 
 Do not run `doctor --live-ready` yet. That command includes DNS/TLS and health-path checks, so it is truthful only after the live server and a public HTTPS origin exist.
 
@@ -101,7 +102,7 @@ ngrok http 8000
 
 Set `PUBLIC_BASE_URL` to the exact HTTPS origin the tunnel prints — no trailing slash — and restart. This value is security-critical: Twilio signs the full public callback URL.
 
-In **OpenAI Platform → Project → Webhooks**, create `https://YOUR_HOST/webhooks/openai`, subscribe it to `realtime.call.incoming`, and copy the signing secret to `OPENAI_WEBHOOK_SECRET`. The OpenAI project in the SIP URI is `OPENAI_PROJECT_ID`.
+In **OpenAI Platform → Project → Webhooks**, create `https://YOUR_HOST/webhooks/openai`, subscribe it to `live.transport.incoming`, and copy the signing secret to `OPENAI_WEBHOOK_SECRET`. The OpenAI project in the SIP URI is `OPENAI_PROJECT_ID`.
 
 No static Twilio webhook is needed — every Conference Participant request carries its own signed status, conference, and AMD callback URLs. Confirm the Twilio account can call the OpenAI SIP URI and can use AMD on `/Participants`.
 
@@ -247,7 +248,7 @@ flyctl deploy --ha=false --remote-only -a YOUR_FLY_APP_NAME
 curl -fsS https://YOUR_FLY_APP_NAME.fly.dev/healthz
 ```
 
-Set every required live value from `.env.example` with `flyctl secrets set` or `flyctl secrets import`. Point the OpenAI project webhook at `https://YOUR_HOST/webhooks/openai` (subscribed to `realtime.call.incoming`). After rotating the signing secret:
+Set every required live value from `.env.example` with `flyctl secrets set` or `flyctl secrets import`. Point the OpenAI project webhook at `https://YOUR_HOST/webhooks/openai` (subscribed to `live.transport.incoming`). After rotating the signing secret:
 
 ```bash
 flyctl secrets deploy -a YOUR_FLY_APP_NAME
@@ -285,27 +286,27 @@ Redeploying a prior image restores only the application image without a full reb
 
 See the [manual SIP canary guide](live-sip-canary.md). Those commands place a real billable call. Contributors should not run them casually; they are for the operator of a deployment that already has real credentials and a human on `OWNER_PHONE_E164`.
 
-## Tuning knobs (timeouts, VAD, search)
+## Tuning knobs (timeouts, backend reasoning, search)
 
 - Live-call control requests use `OPENAI_CONNECT_TIMEOUT_SECONDS` and `OPENAI_HTTP_TIMEOUT_SECONDS` (3 and 10 seconds by default) with no SDK retries; post-call extraction uses `OPENAI_EXTRACTION_TIMEOUT_SECONDS` and keeps its single application-level retry.
 - Twilio requests use the pooled, no-retry transport bounded by `TWILIO_HTTP_TIMEOUT_SECONDS`.
-- `TURN_DETECTION_MODE` defaults to `server_vad`, with `SERVER_VAD_SILENCE_DURATION_MS=300` and `SERVER_VAD_THRESHOLD=0.5`. Short silence windows can split hesitations; compare heard audio, false interruptions, and response latency before tuning.
-- `TURN_DETECTION_MODE=semantic_vad` enables semantic turn detection. `SEMANTIC_VAD_EAGERNESS` defaults to `auto`; `high` requests quicker completion, but provider turn decisions may still add latency.
+- `LIVE_BACKEND_REASONING_EFFORT` supports `none`, `low` (default) and `medium`. Compare correct answers and received audio latency before changing it.
+- `LIVE_SESSION_CLOSE_TIMEOUT_SECONDS=15` bounds the wait for final usage; a timeout does not establish complete usage accounting.
 - `OPENAI_KEEPALIVE_EXPIRY_SECONDS=60` keeps the control-plane TLS connection reusable between sporadic calls; only set it to a bounded 5–300 second value.
 - The voice model can call `search_web` for current or uncertain facts. The application fixes Exa Search to `type=auto`, 10 results, moderation, and token-efficient highlights, with a three-second wall-clock deadline controlled by `EXA_SEARCH_TIMEOUT_SECONDS`.
 - Locked dependency versions live in `uv.lock` (authoritative).
 
 ## API/schema decisions
 
-The implementation follows the current [OpenAI Realtime SIP guide](https://developers.openai.com/api/docs/guides/realtime-sip), [server-side controls guide](https://developers.openai.com/api/docs/guides/realtime-server-controls), [Realtime prompting guide](https://developers.openai.com/api/docs/guides/realtime-models-prompting), [webhook guide](https://developers.openai.com/api/docs/guides/webhooks), [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs), [Twilio Conference Participant reference](https://www.twilio.com/docs/voice/api/conference-participant-resource), [Twilio AMD guide](https://www.twilio.com/docs/voice/answering-machine-detection), and [Twilio request validation guide](https://www.twilio.com/docs/usage/security).
+The integration follows the [Live SIP guide](https://developers.openai.com/api/docs/guides/voice-sip?api=live), [Live delegation guide](https://developers.openai.com/api/docs/guides/live-delegation?delegation-mode=responses), [Live conversation lifecycle](https://developers.openai.com/api/docs/guides/live-conversations), and [Twilio Media Streams](https://www.twilio.com/docs/voice/media-streams).
 
-Live-schema deviations from the original contract are intentional:
-
-- GA Realtime audio formats are objects such as `{"type":"audio/pcmu"}` when used, but SIP accept/session.update payloads must omit `audio.*.format`. OpenAI negotiates G.711 with the carrier; forcing a format has been observed to clobber PCMU into PCM and leave the callee with silence or static while WebSocket transcripts still advance.
-- The current Conference Participants API has no `async_amd` parameter. AMD on Participants is asynchronous by design; the installed SDK uses `machine_detection="DetectMessageEnd"` plus `amd_status_callback` and `amd_status_callback_method`.
-- OpenAI call accept is invoked through the installed typed SDK; hangup has no JSON body. REFER's live request field is `target_uri`, but v1 transfer deliberately does not use REFER.
-- The installed transcription schema permits `INPUT_TRANSCRIPTION_DELAY` only for `gpt-realtime-whisper`, with `minimal|low|medium|high|xhigh` values.
-- The OpenAI SIP agent participant is created with `early_media=false` and receives an explicit unmute when the callee answers, because Twilio mutes legs that join with `start_conference_on_enter=false` until the conference starts.
+- Enable Live SIP for the project and subscribe to `live.transport.incoming`. Keep the key, project and signing secret aligned. Existing Realtime subscriptions do not configure this API.
+- SIP signaling uses TLS and media requires SRTP. The Twilio SIP URI includes `transport=tls;secure=true`. Omit audio formats from Live SIP accept; the carrier negotiates them.
+- Accept uses `POST /v1/live/sessions/{session_id}/accept` with a nested `session`; attach at `/v1/live/sessions/{session_id}/attach`. The installed OpenAI SDK's public raw HTTP method is used because it does not yet expose a typed Live resource.
+- Only delegation Responses configuration is updated at runtime. Voice context uses native instruction appends, never Realtime `response.create` or VAD commands.
+- The current Conference Participants API has no `async_amd` parameter. AMD is asynchronous with `DetectMessageEnd`; only recording-ready results authorize voicemail.
+- The OpenAI SIP participant uses `early_media=false` and explicit unmute after the callee answers.
+- [Migration and validation notes](gpt-live-migration.md) cover accounting, rollout and verification boundaries.
 
 ## Result semantics
 

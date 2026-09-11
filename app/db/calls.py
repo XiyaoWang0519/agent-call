@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.db.protocols import DatabaseAccess
 
+import math
 from collections.abc import Iterable
 from typing import Any
 
@@ -24,6 +25,8 @@ _UPDATE_CALL_ALLOWED_COLUMNS = frozenset(
         "openai_accept_status",
         "transcription_verified",
         "semantic_vad_verified",
+        "live_session_verified",
+        "media_stream_sid",
         "callee_dialed",
         "sideband_open",
         "callee_joined",
@@ -42,6 +45,48 @@ _UPDATE_CALL_ALLOWED_COLUMNS = frozenset(
 
 
 class CallsMixin:
+    async def record_live_usage(
+        self: DatabaseAccess, call_id: str, *, seconds: float, finalized: bool
+    ) -> None:
+        seconds = float(seconds)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("invalid Live duration")
+        # Updates are cumulative snapshots, not increments. A late provisional
+        # event must never change a finalized value or clear finalization.
+        await self.execute(
+            """UPDATE calls SET live_session_seconds=MAX(live_session_seconds, ?),
+               live_usage_finalized=MAX(live_usage_finalized, ?)
+               WHERE call_id=? AND live_usage_finalized=0""",
+            (seconds, int(finalized), call_id),
+        )
+
+    async def record_backend_usage(
+        self: DatabaseAccess,
+        call_id: str,
+        *,
+        response_id: str,
+        input_tokens: int,
+        cached_input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        if (
+            min(input_tokens, cached_input_tokens, output_tokens) < 0
+            or cached_input_tokens > input_tokens
+        ):
+            raise ValueError("invalid delegated token usage")
+        async with self._immediate_transaction() as conn:
+            cursor = await conn.execute(
+                "INSERT OR IGNORE INTO live_backend_usage(call_id, response_id) VALUES (?, ?)",
+                (call_id, response_id),
+            )
+            if cursor.rowcount:
+                await conn.execute(
+                    """UPDATE calls SET backend_input_tokens=backend_input_tokens+?,
+                       backend_cached_input_tokens=backend_cached_input_tokens+?,
+                       backend_output_tokens=backend_output_tokens+? WHERE call_id=?""",
+                    (input_tokens, cached_input_tokens, output_tokens, call_id),
+                )
+
     async def get_call(self: DatabaseAccess, call_id: str) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM calls WHERE call_id=?", (call_id,))
 
@@ -213,6 +258,7 @@ class CallsMixin:
             "opening_sent",
             "voicemail_sent",
             "termination_claimed",
+            "interruption_observed",
         }
         if flag not in allowed:
             raise ValueError(f"invalid call flag: {flag}")

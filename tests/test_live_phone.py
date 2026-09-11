@@ -792,19 +792,27 @@ async def test_tool_audit_records_name_and_failure_without_payloads(service, pac
     from tests.conftest import seed_call, wait_background
 
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
-    await service.handle_realtime_event(
+    await service.handle_live_event(
         call_id,
         {
-            "type": "response.function_call_arguments.done",
-            "name": "send_dtmf",
-            "call_id": "tool_test",
-            "arguments": '{"digits":"invalid-sensitive-value"}',
+            "type": "response.event",
+            "delegation_id": "delegation_test",
+            "event": {
+                "type": "response.output_item.done",
+                "response_id": "resp_test",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "tool_test",
+                    "name": "send_dtmf",
+                    "arguments": '{"digits":"invalid-sensitive-value"}',
+                },
+            },
         },
     )
-    await service.handle_realtime_send(
+    await service.handle_live_send(
         call_id,
         {
-            "type": "conversation.item.create",
+            "type": "response.item.create",
             "item": {
                 "type": "function_call_output",
                 "call_id": "tool_test",

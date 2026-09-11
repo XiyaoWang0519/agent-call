@@ -6,6 +6,20 @@ The [runbook](live-phone-runbook.md) covers all scenarios and provider setup; th
 
 ## What has actually passed
 
+### GPT-Live migration, 2026-09-10
+
+The current voice path is `gpt-live-1` with a `gpt-5.6-terra` backend. The isolated
+`no-outcome-tool` run `run_6d02283a0b00ddad5f29723a` passed all 26 checks, including
+received goodbye, reply window, application hangup, finalized Live usage, and
+provider-verified cleanup without forced hangup. **Basic has not passed on Live:**
+interruption exceeded its 1.2-second allowance. The latest closing-follow-up run
+`run_a44f364dd77835882121ae48` ended without forced cleanup but remains FAIL
+because an ASR mismatch prevented the scenario from finishing. See
+[the migration record](gpt-live-migration.md) for the current limits. The results
+below remain historical Realtime evidence.
+
+### Historical Realtime acceptance
+
 On **2026-09-05**, `basic` passed **24 checks on a real Twilio phone call**, without a
 human answering or speaking. Run ID: `run_dfbdac8eed4a72960587a9b5`.
 
@@ -130,7 +144,7 @@ Quick tunnel URLs change when restarted. Update all of these together, while idl
 | App `PUBLIC_BASE_URL` | Current app HTTPS origin |
 | Harness `LIVE_TEST_APP_URL` | Same app origin |
 | Harness `LIVE_TEST_PUBLIC_URL` | Current harness HTTPS origin |
-| OpenAI **test project** webhook, `realtime.call.incoming` | App origin + `/webhooks/openai` |
+| OpenAI **test project** webhook, `live.transport.incoming` | App origin + `/webhooks/openai` |
 | Twilio automated callee and owner Voice URL, POST | Harness origin + `/incoming` |
 
 Retain signature checks and the existing webhook signing secret when editing the URL.
