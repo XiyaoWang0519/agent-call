@@ -1,3 +1,5 @@
+
+
 # Agent Call
 
 [![CI](https://github.com/XiyaoWang0519/agent-call/actions/workflows/ci.yml/badge.svg)](https://github.com/XiyaoWang0519/agent-call/actions/workflows/ci.yml)
@@ -49,7 +51,7 @@ agent-call smoke-prepare
 
 A successful smoke check prints `OK prepare-only smoke`: it connects, lists the seven tools, and prepares a plan. **It does not make a call.** Evaluation mode blocks starting calls with `live_calls_disabled`.
 
-Contributing from source? Clone this repository, run `uv sync --all-groups --frozen`, and prefix the commands above with `uv run`. For Docker evaluation, run `docker compose up --build` from the checkout and use the same health and smoke checks (`uv run agent-call smoke-prepare`). Docker binds to localhost and keeps SQLite in a named volume. See [troubleshooting](docs/troubleshooting.md) for errors.
+Contributing from source? Clone this repository, run `uv sync --all-groups --frozen`, and prefix the commands above with `uv run`. For Docker evaluation, run `docker compose up --build` from the checkout and use the same health and smoke checks (`uv run agent-call smoke-prepare`). Docker Compose exposes the service on the host's loopback address and keeps SQLite in a named volume. See [troubleshooting](docs/troubleshooting.md) for errors.
 
 ## 2. Start with automatic local setup
 
