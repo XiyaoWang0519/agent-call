@@ -1639,11 +1639,11 @@ wheels = [
 
 [[package]]
 name = "phonenumbers"
-version = "9.0.37"
+version = "9.0.39"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/4c/36/ee5b6d7ccc28cb7848e8dfefce94df9178b6318ed56adab97550b6ba99ec/phonenumbers-9.0.37.tar.gz", hash = "sha256:8923ab413c575b27da2815c9bef48290181aab565398b5e7e23cc7ace212a293", size = 2312364, upload-time = "2026-08-14T05:29:13.533Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/d9/f73babd005dd7569a81789f4db9cc82efaf001af018d5752bf6d7ea14e19/phonenumbers-9.0.39.tar.gz", hash = "sha256:41a7ff0257d5a7a096a8e263da7efc0a96a6162c84ba64af2ebf8972d09e70e1", size = 2310991, upload-time = "2026-09-10T11:26:52.485Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/99/68/544cb901964e8bfc3c8d215d5620e63a009b32437efaec905fdefdf59e26/phonenumbers-9.0.37-py2.py3-none-any.whl", hash = "sha256:55ae8243c1e2fe8ae2548d979e57155d9ae0f6084f8a1d6884050b143aff0a7c", size = 2595712, upload-time = "2026-08-14T05:29:10.464Z" },
+    { url = "https://files.pythonhosted.org/packages/99/53/238c99f028b9c638ceae8218a33904e4b84d60e1c3bd707c0ff231b388cf/phonenumbers-9.0.39-py2.py3-none-any.whl", hash = "sha256:d83b878d0188c81a5f5e8572cedcc7262bd0ea3806eb7c8e35d8666d262a8af0", size = 2594744, upload-time = "2026-09-10T11:26:49.561Z" },
 ]
 
 [[package]]
@@ -2290,8 +2290,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "sys_platform != 'win32'" },
-    { name = "jeepney", marker = "sys_platform != 'win32'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
