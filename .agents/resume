@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This project has no persistent backing services or per-thread authentication.
+# Dependencies are restored from the project snapshot prepared by .agents/setup.
+printf 'Agent Call orb resumed; no services require reconnection.\n'

@@ -16,6 +16,7 @@ htmlcov/
 .playwright-mcp/
 .live-phone/
 .live-phone-results/
+.amp/portals/*
 .tunnel/
 .start.lock
 dist/
