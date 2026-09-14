@@ -54,6 +54,23 @@ async def settle():
     await asyncio.sleep(0.1)
 
 
+async def wait_for_terminal_reason(service, call_id, reason: str, *, budget_seconds: float = 5.0):
+    """Poll for a terminal reason instead of assuming a fixed sleep is enough.
+
+    The reply-window task wakes on a 50ms tick and then runs the full termination
+    pipeline; a loaded CI runner can exceed a single ``settle()``. Polling keeps
+    the assertion about behaviour without encoding runner speed.
+    """
+    deadline = asyncio.get_running_loop().time() + budget_seconds
+    call = await service.db.get_call(call_id)
+    while call is not None and call["termination_reason"] != reason:
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.02)
+        call = await service.db.get_call(call_id)
+    return call
+
+
 async def test_farewell_without_native_delegation_requests_review_once(service, packet):
     call_id = await prepared_goodbye(service, packet)
     frames(service, call_id, start=40, end=400, payload=SILENCE)
@@ -159,8 +176,7 @@ async def test_reply_window_is_three_seconds_of_carrier_silence(service, packet)
     assert service.live.hangups == []
     assert (await service.db.get_call(call_id))["state"] == "active"
     frames(service, call_id, start=3000, end=3060, payload=SILENCE)
-    await settle()
-    call = await service.db.get_call(call_id)
+    call = await wait_for_terminal_reason(service, call_id, "voice_model_end_call")
     assert call["termination_reason"] == "voice_model_end_call"
     assert service.live.hangups == ["rtc_test"]
 
