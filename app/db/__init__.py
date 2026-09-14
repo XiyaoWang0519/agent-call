@@ -4,7 +4,7 @@ from app.db.calls import CallsMixin
 from app.db.deployment import DEPLOYMENT_LOCK_TTL, DeploymentLockedError, DeploymentMixin
 from app.db.engine import DatabaseEngine
 from app.db.oauth import OAuthMixin
-from app.db.plans import PlansMixin
+from app.db.plans import ClaimOutcome, ClaimResult, PlansMixin
 from app.db.questions import QuestionsMixin
 from app.db.telemetry import LatencyMark, LatencyStage, TelemetryMixin
 from app.db.termination import TerminationMixin
@@ -15,6 +15,8 @@ from app.db.webhooks import WebhooksMixin
 __all__ = [
     "DEPLOYMENT_LOCK_TTL",
     "TRANSFER_ELIGIBLE_STATES",
+    "ClaimOutcome",
+    "ClaimResult",
     "Database",
     "DeploymentLockedError",
     "LatencyMark",

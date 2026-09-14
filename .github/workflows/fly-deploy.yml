@@ -37,12 +37,10 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --frozen
 
-      - name: Verify application
-        run: |
-          uv run ruff format --check app tests
-          uv run ruff check app tests
-          uv run mypy app
-          uv run pytest -q
+      - name: Verify application (shared gate)
+        # Same entrypoint as merge CI, including scripts/ lint scope and the
+        # app coverage floor. Do not inline a weaker variant here.
+        run: bash scripts/verify.sh
 
       - name: Install flyctl
         uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1

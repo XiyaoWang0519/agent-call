@@ -44,11 +44,11 @@ async def test_callee_exit_completes_conference_and_hangup_exactly_once(service,
     await service.handle_conference_event(call_id, form)
     await service.handle_conference_event(call_id, form)
     await wait_background()
-    assert len(service._test_twilio.completed) == 1
-    assert service._test_live.hangups == ["rtc_test"]
+    assert len(service.twilio.completed) == 1
+    assert service.live.hangups == ["rtc_test"]
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
-    assert service._test_finalizer.states_seen == [CallState.COMPLETED.value]
+    assert service.finalizer.states_seen == [CallState.COMPLETED.value]
 
 
 @pytest.mark.asyncio
@@ -59,8 +59,8 @@ async def test_transfer_removes_ai_without_completing_owner_callee_conference(se
     result = await service.transfer_to_owner(call_id, "owner needed")
     await wait_background()
     assert result["accepted"] is True
-    assert service._test_twilio.removed == [("CF" + "a" * 32, "CA" + "a" * 32)]
-    assert service._test_twilio.completed == []
+    assert service.twilio.removed == [("CF" + "a" * 32, "CA" + "a" * 32)]
+    assert service.twilio.completed == []
     assert (await service.db.get_call(call_id))["state"] == CallState.TRANSFERRED.value
 
 
@@ -68,18 +68,18 @@ async def test_transfer_removes_ai_without_completing_owner_callee_conference(se
 async def test_agent_completed_race_during_transfer_preserves_conference(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._owner_join_events.setdefault(call_id, __import__("asyncio").Event()).set()
-    original_remove = service._test_twilio.remove_participant
+    original_remove = service.twilio.remove_participant
 
     async def remove_with_racing_callback(conference, participant_call_sid):
         await service.handle_participant_status(call_id, "agent", {"CallStatus": "completed"})
         await original_remove(conference, participant_call_sid)
 
-    service._test_twilio.remove_participant = remove_with_racing_callback
+    service.twilio.remove_participant = remove_with_racing_callback
     result = await service.transfer_to_owner(call_id, "owner needed")
     await wait_background()
 
     assert result["accepted"] is True
-    assert service._test_twilio.completed == []
+    assert service.twilio.completed == []
     assert (await service.db.get_call(call_id))["state"] == CallState.TRANSFERRED.value
 
 
@@ -111,7 +111,7 @@ async def test_restart_recovery_retries_claim_and_finalizes(service, packet):
     assert call["state"] == CallState.FAILED.value
     assert call["termination_reason"] == "startup_recovery"
     assert await service.db.get_result(call_id) is not None
-    assert service._test_finalizer.states_seen == [CallState.FAILED.value]
+    assert service.finalizer.states_seen == [CallState.FAILED.value]
 
 
 @pytest.mark.asyncio
@@ -119,18 +119,18 @@ async def test_restart_recovery_finalizes_terminal_call_missing_result(service, 
     call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
     await service.recover_startup()
     assert await service.db.get_result(call_id) is not None
-    assert service._test_finalizer.states_seen == [CallState.COMPLETED.value]
+    assert service.finalizer.states_seen == [CallState.COMPLETED.value]
 
 
 @pytest.mark.asyncio
 async def test_restart_recovery_resumes_telephony_only_checkpoint(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
-    await service._test_finalizer.finalize(call_id)
-    service._test_finalizer.states_seen.clear()
+    await service.finalizer.finalize(call_id)
+    service.finalizer.states_seen.clear()
 
     await service.recover_startup()
 
-    assert service._test_finalizer.states_seen == [CallState.COMPLETED.value]
+    assert service.finalizer.states_seen == [CallState.COMPLETED.value]
 
 
 @pytest.mark.asyncio
@@ -202,7 +202,7 @@ async def test_failed_compensation_durably_marks_conference_cleanup_pending(
     async def failed_complete(_conference):
         raise RuntimeError("Twilio unavailable")
 
-    monkeypatch.setattr(service._test_twilio, "complete_conference", failed_complete)
+    monkeypatch.setattr(service.twilio, "complete_conference", failed_complete)
 
     result = await service._complete_conference_or_schedule(call)
 
@@ -220,6 +220,6 @@ async def test_recover_startup_completes_pending_conference_cleanup(service, pac
 
     await service.recover_startup()
 
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
     stored = await service.db.get_call(call_id)
     assert stored["conference_cleanup_pending"] == 0

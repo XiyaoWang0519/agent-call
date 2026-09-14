@@ -5,7 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastmcp import FastMCP
 
 from app.call_state import CallService
@@ -156,6 +156,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readyz(response: Response) -> dict[str, str]:
+        # Liveness (/healthz) stays a constant so a platform restart policy is not
+        # coupled to supervision state. Readiness is separate: a live process whose
+        # watchdog is failing must stop accepting new billable calls.
+        service = getattr(app.state, "call_service", None)
+        if service is None or not service.supervision_ready():
+            response.status_code = 503
+            return {"status": "not_ready"}
+        return {"status": "ready"}
 
     app.mount("/mcp", protected_mcp)
     if mcp_oauth_provider is not None and oauth_mcp_app is not None:

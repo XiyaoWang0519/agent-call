@@ -43,14 +43,14 @@ async def test_send_dtmf_happy_path_records_twilio_call_and_result(service, pack
     )
     await wait_background()
 
-    assert service._test_twilio.dtmf == [("CF" + "a" * 32, "CA" + "b" * 32, "1w2")]
-    assert service._test_live.tool_results[-1] == (
+    assert service.twilio.dtmf == [("CF" + "a" * 32, "CA" + "b" * 32, "1w2")]
+    assert service.live.tool_results[-1] == (
         call_id,
         "tool_dtmf",
         {"ok": True, "digits": "1w2"},
     )
-    assert service._test_live.tool_result_continuations[-1] is False
-    assert service._test_live.tool_result_continuation_texts[-1] is None
+    assert service.live.tool_result_continuations[-1] is False
+    assert service.live.tool_result_continuation_texts[-1] is None
     assert call_id in service._dtmf_listen_deadlines_ns
     call = await service.db.get_call(call_id)
     assert call["tool_call_count"] == 1
@@ -97,8 +97,8 @@ async def test_send_dtmf_rejects_invalid_digits(service, packet):
         )
         await wait_background()
 
-        assert service._test_twilio.dtmf == []
-        assert service._test_live.tool_results[-1][2] == {
+        assert service.twilio.dtmf == []
+        assert service.live.tool_results[-1][2] == {
             "ok": False,
             "error": "invalid_dtmf_request",
         }
@@ -113,8 +113,8 @@ async def test_send_dtmf_rejects_when_call_not_ready(service, packet):
     )
     await wait_background()
 
-    assert service._test_twilio.dtmf == []
-    assert service._test_live.tool_results[-1][2] == {
+    assert service.twilio.dtmf == []
+    assert service.live.tool_results[-1][2] == {
         "ok": False,
         "error": "call_not_ready",
     }
@@ -130,8 +130,8 @@ async def test_send_dtmf_rejects_when_callee_sid_missing(service, packet):
     )
     await wait_background()
 
-    assert service._test_twilio.dtmf == []
-    assert service._test_live.tool_results[-1][2] == {
+    assert service.twilio.dtmf == []
+    assert service.live.tool_results[-1][2] == {
         "ok": False,
         "error": "call_not_ready",
     }
@@ -139,7 +139,7 @@ async def test_send_dtmf_rejects_when_callee_sid_missing(service, packet):
 
 async def test_send_dtmf_twilio_failure_reports_error_and_clears_inflight(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
-    service._test_twilio.dtmf_exc = TwilioRestException(500, "https://twilio.test", "boom")
+    service.twilio.dtmf_exc = TwilioRestException(500, "https://twilio.test", "boom")
 
     await service.handle_live_event(
         call_id,
@@ -147,11 +147,11 @@ async def test_send_dtmf_twilio_failure_reports_error_and_clears_inflight(servic
     )
     await wait_background()
 
-    assert service._test_live.tool_results[-1][2] == {
+    assert service.live.tool_results[-1][2] == {
         "ok": False,
         "error": "dtmf_failed",
     }
-    assert service._test_live.tool_result_continuations[-1] is True
+    assert service.live.tool_result_continuations[-1] is True
     assert call_id not in service._inflight_tools
     assert call_id not in service._dtmf_listen_deadlines_ns
 

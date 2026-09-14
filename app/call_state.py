@@ -7,7 +7,7 @@ import re
 import secrets
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -21,6 +21,7 @@ from app.call_activity import CallActivityTracker
 from app.call_audio import CallAudio
 from app.costs import compute_call_cost
 from app.db import (
+    ClaimOutcome,
     Database,
     DeploymentLockedError,
     LatencyMark,
@@ -50,7 +51,7 @@ from app.openai_live import LIVE_SEND_TIMEOUT_SECONDS, LiveBridge
 from app.owner_transfer import OwnerTransferCoordinator
 from app.policy import validate_context
 from app.settings import Settings
-from app.twilio_bridge import TwilioBridge
+from app.twilio_bridge import ParticipantInfo, TwilioBridge
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,12 @@ WATCHDOG_QUESTION_GRACE_SECONDS = 2 * LIVE_SEND_TIMEOUT_SECONDS + 5.0
 # the tones. Bare beeps and silence produce no Realtime sideband frames, so give that
 # wait its own bounded watchdog carve-out instead of treating it as a dead call.
 POST_DTMF_LISTEN_GRACE_SECONDS = 30.0
+
+# Watchdog cadence and the bounded backoff used after a failed supervisory pass.
+# A failed pass marks the service not-ready for new calls but never aborts the
+# loop or tears down an in-flight call.
+WATCHDOG_INTERVAL_SECONDS = 5.0
+WATCHDOG_MAX_BACKOFF_SECONDS = 30.0
 
 # The MCP client is an LLM agent: it reliably follows explicit next_action directives
 # embedded in tool RESULTS, but under-weights static tool descriptions. Optional agent
@@ -138,6 +145,8 @@ class CallService:
         twilio: TwilioBridge | None = None,
         openai: AsyncOpenAI | None = None,
         exa: ExaSearchClient | None = None,
+        live: LiveBridge | None = None,
+        finalizer: Finalizer | None = None,
     ):
         self.settings = settings
         self.db = db
@@ -151,18 +160,31 @@ class CallService:
             is_closing=lambda call_id: call_id in self._voice_end_reply_waits,
             clear_closing=self._cancel_voice_end,
         )
-        self.live = LiveBridge(
-            settings,
-            self.openai,
-            on_event=lambda call_id, event: self.handle_live_event(call_id, event, _observed=True),
-            on_finalized=self._record_final_live_usage,
-            on_open=self.handle_sideband_open,
-            on_fatal=self._handle_sideband_fatal,
-            on_send=self.handle_live_send,
-            on_activity=self._note_call_activity,
-            on_observe=self._observe_live_event,
+        # Live and finalization collaborators are constructor-injected so tests and
+        # future composition roots can supply narrow fakes without monkeypatching
+        # attributes on a fully built service. They stay plain attributes because
+        # a few late-bound callbacks (owner transfer) read them on the current
+        # service instance.
+        self.live = (
+            live
+            if live is not None
+            else LiveBridge(
+                settings,
+                self.openai,
+                on_event=lambda call_id, event: self.handle_live_event(
+                    call_id, event, _observed=True
+                ),
+                on_finalized=self._record_final_live_usage,
+                on_open=self.handle_sideband_open,
+                on_fatal=self._handle_sideband_fatal,
+                on_send=self.handle_live_send,
+                on_activity=self._note_call_activity,
+                on_observe=self._observe_live_event,
+            )
         )
-        self.finalizer = Finalizer(settings, db, self.openai)
+        self.finalizer = (
+            finalizer if finalizer is not None else Finalizer(settings, db, self.openai)
+        )
         self._background: set[asyncio.Task[Any]] = set()
         self._must_finish_background: set[asyncio.Task[Any]] = set()
         self._conference_retry_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
@@ -198,6 +220,11 @@ class CallService:
         self._tool_seen_calls: set[str] = set()
         self._queued_latency_events: dict[tuple[str, LatencyStage, str], LatencyMark] = {}
         self._watchdog_task: asyncio.Task[None] | None = None
+        # Supervision is healthy until a watchdog pass fails. The flag gates new
+        # call admission and /readyz; it never aborts an in-flight call.
+        self._supervision_healthy = True
+        self._watchdog_failures = 0
+        self._watchdog_last_success_monotonic: float | None = None
         self._pending_questions: dict[str, PendingQuestion] = {}
         self._hold_state: dict[str, HoldState] = {}
         # Answered questions whose tool result never reached the sideband; an agent retry
@@ -494,11 +521,141 @@ class CallService:
         )
         return result
 
+    async def _run_cancellation_safe_create(
+        self,
+        call_id: str,
+        step: Callable[[], Coroutine[Any, Any, Any]],
+        *,
+        operation: str,
+        request_stage: LatencyStage | None,
+        completed_stage: LatencyStage | None,
+        failure_log_message: str,
+        failure_reason: str,
+        on_late_success: Callable[[Any], Awaitable[None]],
+        swallow_failure: bool = False,
+        terminate_on_failure: bool = True,
+    ) -> Any | None:
+        """Run an external create that may outlive a caller cancellation.
+
+        Twilio's SDK call executes in a worker thread, so cancelling the awaiting
+        coroutine does not cancel the remote create. This wraps the create in its
+        own task and shields it: on cancellation we wait for the task to settle,
+        recover a late SID, and hand it to a must-finish compensation callback
+        before re-raising, instead of reporting an unknown result as a failure and
+        retrying (which would create a second billable leg). A definite create
+        error is still treated as a failure and terminates the call.
+        """
+        request_mark = LatencyMark.now()
+        task: asyncio.Task[Any] = asyncio.create_task(step(), name=f"{operation}:{call_id}")
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if request_stage is not None:
+                self._queue_latency_batch(call_id, (request_stage, request_mark, ""))
+            late = await self._settle_late_create(task)
+            if late is not None:
+                compensation = self._spawn(
+                    on_late_success(late),
+                    name=f"compensate-{operation}:{call_id}",
+                    must_finish=True,
+                )
+                await self._await_network_task(compensation)
+            raise
+        except Exception:
+            if request_stage is not None:
+                self._queue_latency_batch(call_id, (request_stage, request_mark, ""))
+            logger.exception(failure_log_message)
+            if terminate_on_failure:
+                await self.terminate_call(call_id, failure_reason)
+            if swallow_failure:
+                return None
+            raise
+        if request_stage is not None and completed_stage is not None:
+            completed_mark = LatencyMark.now()
+            self._queue_latency_batch(
+                call_id,
+                (request_stage, request_mark, ""),
+                (completed_stage, completed_mark, ""),
+            )
+        return result
+
+    @staticmethod
+    async def _settle_late_create(task: asyncio.Task[Any]) -> Any | None:
+        """Resolve a shielded external create after the caller was cancelled.
+
+        Returns the created value when the remote call succeeded, or None when it
+        failed definitively (nothing to compensate).
+        """
+        try:
+            return await CallService._await_network_task(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("late remote create failed after caller cancellation", exc_info=True)
+            return None
+
+    @staticmethod
+    def _participant_updates(kind: str, participant: ParticipantInfo) -> dict[str, Any]:
+        updates: dict[str, Any] = {}
+        if kind == "agent":
+            updates["twilio_ai_call_sid"] = participant.call_sid
+        else:
+            updates["twilio_callee_call_sid"] = participant.call_sid
+        if participant.conference_sid:
+            updates["conference_sid"] = participant.conference_sid
+        return updates
+
+    async def _compensate_late_participant(
+        self,
+        call_id: str,
+        reason: str,
+        updates: dict[str, Any],
+    ) -> None:
+        """Persist a late participant SID and terminate so it cannot keep billing."""
+        try:
+            await self.db.update_call(call_id, **updates)
+        except Exception:
+            logger.exception("failed to persist late participant call_id=%s", call_id)
+        # Pass the compensation task explicitly so teardown still runs during
+        # shutdown (terminate_call otherwise refuses work once _stopping is set).
+        terminated = await self.terminate_call(
+            call_id, reason, _initiating_task=asyncio.current_task()
+        )
+        if terminated:
+            return
+        # Termination lost the claim (already terminal or another teardown owns it).
+        # Completing the conference is the DB-independent guarantee that the late
+        # leg cannot keep billing; a successful transfer is the one case that must
+        # keep its owner-callee conference.
+        current = await self.db.get_call(call_id)
+        if current is None or CallState(current["state"]) is CallState.TRANSFERRED:
+            return
+        await self._complete_conference_or_schedule(current)
+
+    async def _persist_late_media_stream(self, call_id: str, stream_sid: Any) -> None:
+        if not isinstance(stream_sid, str):
+            return
+        try:
+            await self.db.update_call(call_id, media_stream_sid=stream_sid)
+        except Exception:
+            logger.exception("failed to persist late media stream call_id=%s", call_id)
+
     async def start(
         self, plan_id: str, *, explicit_confirmation: bool, confirmation_text: str
     ) -> StartPhoneCallOutput:
         if not self.settings.live_calls_enabled:
             raise live_calls_disabled_error()
+        if not self.supervision_ready():
+            raise ValueError(
+                json.dumps(
+                    {
+                        "code": "supervision_unavailable",
+                        "message": (
+                            "Call supervision is not healthy; retry after readiness recovers"
+                        ),
+                    }
+                )
+            )
         if not explicit_confirmation or not confirmation_text.strip():
             raise ValueError(
                 json.dumps(
@@ -540,23 +697,55 @@ class CallService:
                 )
             ) from exc
         if not claimed:
+            if claimed.outcome is ClaimOutcome.BUSY:
+                raise ValueError(
+                    json.dumps(
+                        {
+                            "code": "call_busy",
+                            "message": (
+                                "Another call is already in progress; wait for it to finish "
+                                "before starting a new call"
+                            ),
+                        }
+                    )
+                )
+            if claimed.outcome is ClaimOutcome.CALL_ENDING:
+                raise ValueError(
+                    json.dumps(
+                        {
+                            "code": "call_ending",
+                            "message": (
+                                "The current call is still shutting down; retry the confirmed "
+                                "call shortly"
+                            ),
+                        }
+                    )
+                )
             raise ValueError(
                 json.dumps(
                     {"code": "plan_unavailable", "message": "Plan is expired or already started"}
                 )
             )
-        participant = await self._run_latency_marked_step(
+        participant = await self._run_cancellation_safe_create(
             call_id,
             lambda: self.twilio.create_agent_participant(
                 call_id=call_id,
                 plan_id=plan_id,
                 conference_name=conference_name,
             ),
+            operation="create-agent-participant",
             request_stage=LatencyStage.TWILIO_AGENT_REQUEST,
             completed_stage=LatencyStage.TWILIO_AGENT_CREATED,
             failure_log_message="failed to originate agent leg",
             failure_reason="agent_leg_setup_failed",
+            on_late_success=lambda late: self._compensate_late_participant(
+                call_id,
+                "agent_leg_setup_failed",
+                self._participant_updates("agent", late),
+            ),
         )
+        if participant is None:  # pragma: no cover - swallow_failure is False here
+            raise RuntimeError("agent participant creation returned no participant")
         try:
             await self.db.update_call(
                 call_id,
@@ -660,17 +849,13 @@ class CallService:
             await self.terminate_call(call_id, "live_session_config_mismatch")
             return
         call = await self.db.get_call(call_id)
-        if (
-            call is not None
-            and CallState(call["state"]) not in TERMINAL_STATES
-            and await self.db.set_flag_once(call_id, "callee_dialed")
-        ):
+        if call is not None and await self.db.claim_callee_dial(call_id):
             plan = await self.db.get_plan(call["plan_id"])
             if plan is None:
                 await self.terminate_call(call_id, "plan_missing_after_sideband_open")
                 return
             packet = ContextPacket.model_validate(plan["context"])
-            participant = await self._run_latency_marked_step(
+            participant = await self._run_cancellation_safe_create(
                 call_id,
                 lambda: self.twilio.create_callee_participant(
                     call_id=call_id,
@@ -678,10 +863,16 @@ class CallService:
                     conference_sid_or_name=call.get("conference_sid") or call["conference_name"],
                     packet=packet,
                 ),
+                operation="create-callee-participant",
                 request_stage=LatencyStage.TWILIO_CALLEE_REQUEST,
                 completed_stage=LatencyStage.TWILIO_CALLEE_CREATED,
                 failure_log_message="failed to originate callee leg",
                 failure_reason="callee_leg_setup_failed",
+                on_late_success=lambda late: self._compensate_late_participant(
+                    call_id,
+                    "callee_leg_setup_failed",
+                    self._participant_updates("callee", late),
+                ),
                 swallow_failure=True,
             )
             if participant is None:
@@ -997,11 +1188,21 @@ class CallService:
         self._call_audio[call_id] = CallAudio()
         self._media_tokens[call_id] = secrets.token_urlsafe(32)
         ready = self._media_ready.setdefault(call_id, asyncio.Event())
-        stream_sid = await self.twilio.start_audio_monitor(
-            call_id=call_id,
-            plan_id=call["plan_id"],
-            callee_call_sid=call["twilio_callee_call_sid"],
-            token=self._media_tokens[call_id],
+        stream_sid = await self._run_cancellation_safe_create(
+            call_id,
+            lambda: self.twilio.start_audio_monitor(
+                call_id=call_id,
+                plan_id=call["plan_id"],
+                callee_call_sid=call["twilio_callee_call_sid"],
+                token=self._media_tokens[call_id],
+            ),
+            operation="create-media-stream",
+            request_stage=None,
+            completed_stage=None,
+            failure_log_message="failed to start carrier audio monitor",
+            failure_reason="media_monitor_setup_failed",
+            on_late_success=lambda late: self._persist_late_media_stream(call_id, late),
+            terminate_on_failure=False,
         )
         await self.db.update_call(call_id, media_stream_sid=stream_sid)
         await asyncio.wait_for(ready.wait(), timeout=5)
@@ -3223,9 +3424,40 @@ class CallService:
         await self._recover_pending_conference_cleanup(recovered)
         await self._recover_pending_finalization(recovered)
 
+    def supervision_ready(self) -> bool:
+        """Whether safety-relevant supervision is healthy enough for new calls.
+
+        Distinct from process liveness: a live process can have a dead or failing
+        watchdog, in which case it must stop accepting new billable calls while
+        still servicing existing ones.
+        """
+        return self._supervision_healthy and not self._stopping
+
     async def start_watchdog(self) -> None:
         if not self._stopping and self._watchdog_task is None:
-            self._watchdog_task = asyncio.create_task(self._watchdog(), name="call-watchdog")
+            task = asyncio.create_task(self._watchdog(), name="call-watchdog")
+            task.add_done_callback(self._watchdog_finished)
+            self._watchdog_task = task
+
+    def _watchdog_finished(self, task: asyncio.Task[None]) -> None:
+        if self._watchdog_task is task:
+            self._watchdog_task = None
+        if self._stopping:
+            return
+        # Reaching here means the supervisor loop died without an expected stop:
+        # surface it as not-ready rather than silently losing supervision.
+        self._supervision_healthy = False
+        if task.cancelled():
+            logger.error("call watchdog was cancelled outside of shutdown")
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "call watchdog exited unexpectedly",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        else:  # pragma: no cover - defensive: the loop only returns via cancellation
+            logger.error("call watchdog exited unexpectedly without an exception")
 
     async def stop(self) -> None:
         self._stopping = True
@@ -3283,8 +3515,39 @@ class CallService:
 
     async def _watchdog(self) -> None:
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+            await self._watchdog_iteration()
+            if self._watchdog_failures:
+                # Bounded exponential backoff so a persistent database failure does
+                # not hot-loop, while still recovering as soon as a pass succeeds.
+                delay = min(
+                    WATCHDOG_INTERVAL_SECONDS * (2 ** min(self._watchdog_failures, 4)),
+                    WATCHDOG_MAX_BACKOFF_SECONDS,
+                )
+                await asyncio.sleep(delay)
+
+    async def _watchdog_iteration(self) -> None:
+        """One supervised watchdog pass; never lets a transient failure kill the loop."""
+        try:
             await self._watchdog_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._watchdog_failures += 1
+            self._supervision_healthy = False
+            logger.exception(
+                "call watchdog iteration failed consecutive_failures=%s",
+                self._watchdog_failures,
+            )
+        else:
+            if not self._supervision_healthy:
+                logger.warning(
+                    "call watchdog supervision recovered after %s failure(s)",
+                    self._watchdog_failures,
+                )
+            self._watchdog_failures = 0
+            self._supervision_healthy = True
+            self._watchdog_last_success_monotonic = time.monotonic()
 
     async def _watchdog_once(self) -> None:
         await self._activity.flush()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,49 @@ from app.models import (
 )
 from app.settings import Settings
 from app.twilio_bridge import ParticipantInfo
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "allow_network: opt a test out of the external-network guard (R01). ",
+    )
+
+
+class ExternalNetworkBlocked(RuntimeError):
+    """Raised when a test tries to open a non-loopback TCP connection."""
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0", ""})
+
+
+def _address_is_local(address: object) -> bool:
+    # AF_UNIX paths arrive as str/bytes and are process-local.
+    if isinstance(address, (str, bytes)):
+        return True
+    if isinstance(address, tuple) and address:
+        return address[0] in _LOOPBACK_HOSTS
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _block_external_network(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    # The suite is meant to be fully offline: provider and Twilio SDK calls are
+    # faked, and HTTP is mocked at the transport level. A real outbound socket in
+    # a test is therefore a bug (or an unmocked code path), not a slow test.
+    if request.node.get_closest_marker("allow_network") is not None:
+        return
+    real_connect = socket.socket.connect
+
+    def guarded_connect(self: socket.socket, address: object) -> object:
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not _address_is_local(address):
+            raise ExternalNetworkBlocked(
+                f"test attempted a non-loopback connection to {address!r}; "
+                "mock the transport or mark the test with @pytest.mark.allow_network"
+            )
+        return real_connect(self, address)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
 
 
 @pytest.fixture
@@ -362,6 +406,10 @@ async def seed_call(
         call_id=call_id,
         conference_name=f"conference_{call_id}",
         confirmation_text="Confirmed",
+        # Fixtures seed historical/stranded rows directly and some tests need more
+        # than one live row in one database; production admission goes through
+        # CallService.start, which enforces the capacity policy.
+        enforce_single_call_capacity=False,
     )
     assert claimed
     # Every state past PREWARMING is only reachable in production after the callee has
@@ -380,46 +428,105 @@ async def seed_call(
     return call_id
 
 
-@pytest.fixture
-async def service(settings: Settings):
-    db = Database(settings.database_path)
-    await db.initialize()
-    twilio = FakeTwilio()
-    placeholder_openai = SimpleNamespace()
-    exa = FakeExa()
-    svc = CallService(settings, db, twilio=twilio, openai=placeholder_openai, exa=exa)
-    realtime = FakeLive()
-    finalizer = FakeFinalizer(db)
-    svc.live = realtime
-    svc.finalizer = finalizer
-    svc._test_twilio = twilio
-    svc._test_live = realtime
-    svc._test_finalizer = finalizer
-    svc._test_exa = exa
+class TestHarness:
+    """Explicit holder for the injected doubles and the service under test (R02).
 
-    async def start_audio_monitor(**kwargs):
-        call_id = kwargs["call_id"]
-        accepted = await svc.accept_media_monitor(
-            call_id,
-            kwargs["plan_id"],
-            {
-                "customParameters": {"token": kwargs["token"]},
-                "accountSid": settings.twilio_account_sid,
-                "callSid": kwargs["callee_call_sid"],
-                "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000, "channels": 1},
-                "tracks": ["inbound", "outbound"],
-                "streamSid": "MZ" + "d" * 32,
-            },
+    Tests build the service once through :meth:`build`; the real ``CallService``
+    receives its Live/Finalizer/Telephony/Exa collaborators by constructor instead
+    of having attributes swapped in after construction. Tests that need to see
+    what a double recorded read it off ``harness.live`` (or the equivalent public
+    attribute on the service).
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        db: Database,
+        twilio: FakeTwilio,
+        live: FakeLive,
+        finalizer: FakeFinalizer,
+        exa: FakeExa,
+        service: CallService,
+    ) -> None:
+        self.settings = settings
+        self.db = db
+        self.twilio = twilio
+        self.live = live
+        self.finalizer = finalizer
+        self.exa = exa
+        self.service = service
+
+    @classmethod
+    async def build(cls, settings: Settings) -> TestHarness:
+        db = Database(settings.database_path)
+        await db.initialize()
+        twilio = FakeTwilio()
+        live = FakeLive()
+        finalizer = FakeFinalizer(db)
+        exa = FakeExa()
+        service = CallService(
+            settings,
+            db,
+            twilio=twilio,
+            openai=SimpleNamespace(),
+            exa=exa,
+            live=live,
+            finalizer=finalizer,
         )
-        assert accepted
-        return "MZ" + "d" * 32
+        harness = cls(
+            settings=settings,
+            db=db,
+            twilio=twilio,
+            live=live,
+            finalizer=finalizer,
+            exa=exa,
+            service=service,
+        )
 
-    twilio.start_audio_monitor = start_audio_monitor
-    yield svc
+        async def start_audio_monitor(**kwargs):
+            call_id = kwargs["call_id"]
+            accepted = await service.accept_media_monitor(
+                call_id,
+                kwargs["plan_id"],
+                {
+                    "customParameters": {"token": kwargs["token"]},
+                    "accountSid": settings.twilio_account_sid,
+                    "callSid": kwargs["callee_call_sid"],
+                    "mediaFormat": {
+                        "encoding": "audio/x-mulaw",
+                        "sampleRate": 8000,
+                        "channels": 1,
+                    },
+                    "tracks": ["inbound", "outbound"],
+                    "streamSid": "MZ" + "d" * 32,
+                },
+            )
+            assert accepted
+            return "MZ" + "d" * 32
+
+        twilio.start_audio_monitor = start_audio_monitor
+        return harness
+
+    async def aclose(self) -> None:
+        try:
+            await self.service.stop()
+        finally:
+            await self.db.close()
+
+
+@pytest.fixture
+async def harness(settings: Settings):
+    built = await TestHarness.build(settings)
     try:
-        await svc.stop()
+        yield built
     finally:
-        await db.close()
+        await built.aclose()
+
+
+@pytest.fixture
+async def service(harness: TestHarness) -> CallService:
+    return harness.service
 
 
 async def wait_background() -> None:

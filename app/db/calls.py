@@ -250,6 +250,27 @@ class CallsMixin:
             (replacement.value, _iso_now(), call_id, expected.value),
         )
 
+    async def claim_callee_dial(self: DatabaseAccess, call_id: str) -> bool:
+        """Atomically claim the one-shot right to dial the callee.
+
+        The claim carries its own lifecycle predicate instead of relying on a
+        separate read plus a generic flag toggle: a call that is already
+        terminating (or that lost ``termination_claimed=0``) can never acquire
+        the dial right after termination wins. Setup states are limited to the
+        pre-activation window where the callee leg is legitimately created.
+        """
+        return await self._execute_cas(
+            """UPDATE calls SET callee_dialed=1, last_event_at=?
+               WHERE call_id=? AND callee_dialed=0 AND termination_claimed=0
+                 AND state IN (?, ?)""",
+            (
+                _iso_now(),
+                call_id,
+                CallState.PREWARMING.value,
+                CallState.READY_TO_ACTIVATE.value,
+            ),
+        )
+
     async def set_flag_once(self: DatabaseAccess, call_id: str, flag: str) -> bool:
         allowed = {
             "sideband_open",
