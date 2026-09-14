@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly UV_VERSION="0.9.27"
+readonly PYTHON_VERSION="3.13"
+
+run_step() {
+    local label="$1"
+    shift
+    local started=$SECONDS
+    printf '\n==> %s\n' "$label"
+    "$@"
+    printf '<== %s (%ss)\n' "$label" "$((SECONDS - started))"
+}
+
+install_system_packages() {
+    command -v apt-get >/dev/null 2>&1 || return 0
+
+    local packages=(ca-certificates curl)
+    local missing=()
+    local package
+    for package in "${packages[@]}"; do
+        dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fq 'install ok installed' \
+            || missing+=("$package")
+    done
+    ((${#missing[@]} == 0)) && return 0
+
+    local privilege=()
+    if ((EUID != 0)); then
+        privilege=(sudo)
+    fi
+    "${privilege[@]}" apt-get update
+    "${privilege[@]}" apt-get install -y "${missing[@]}"
+}
+
+install_uv() {
+    export PATH="$HOME/.local/bin:$PATH"
+    if command -v uv >/dev/null 2>&1 && [[ "$(uv --version)" == "uv $UV_VERSION "* ]]; then
+        return 0
+    fi
+
+    curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" \
+        | env UV_INSTALL_DIR="$HOME/.local/bin" sh
+    export PATH="$HOME/.local/bin:$PATH"
+    uv --version
+}
+
+configure_login_path() {
+    local marker="# agent-call orb toolchain"
+    local profile="$HOME/.bash_profile"
+    if ! grep -Fqx "$marker" "$profile" 2>/dev/null; then
+        cat >>"$profile" <<'EOF'
+
+# agent-call orb toolchain
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+EOF
+    fi
+}
+
+install_python() {
+    if uv python find --managed-python --no-python-downloads --no-project \
+        "$PYTHON_VERSION" >/dev/null 2>&1; then
+        return 0
+    fi
+    uv python install "$PYTHON_VERSION"
+}
+
+run_step "Check system packages" install_system_packages
+run_step "Install uv $UV_VERSION" install_uv
+run_step "Configure login PATH" configure_login_path
+run_step "Install Python $PYTHON_VERSION" install_python
+run_step "Sync locked dependencies" \
+    uv sync --all-groups --frozen --python "$PYTHON_VERSION"
+
+printf '\nOrb setup complete. Run checks with uv run pytest -q.\n'
