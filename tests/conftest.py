@@ -57,16 +57,25 @@ def _block_external_network(monkeypatch: pytest.MonkeyPatch, request: pytest.Fix
     if request.node.get_closest_marker("allow_network") is not None:
         return
     real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
 
-    def guarded_connect(self: socket.socket, address: object) -> object:
+    def _guard(self: socket.socket, address: object) -> None:
         if self.family in (socket.AF_INET, socket.AF_INET6) and not _address_is_local(address):
             raise ExternalNetworkBlocked(
                 f"test attempted a non-loopback connection to {address!r}; "
                 "mock the transport or mark the test with @pytest.mark.allow_network"
             )
+
+    def guarded_connect(self: socket.socket, address: object) -> object:
+        _guard(self, address)
         return real_connect(self, address)  # type: ignore[arg-type]
 
+    def guarded_connect_ex(self: socket.socket, address: object) -> int:
+        _guard(self, address)
+        return real_connect_ex(self, address)  # type: ignore[arg-type]
+
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
 
 
 @pytest.fixture
@@ -157,6 +166,7 @@ class FakeTwilio:
         self.removed: list[tuple[str | None, str | None]] = []
         self.unmuted: list[tuple[str | None, str | None]] = []
         self.end_on_exit: list[tuple[str | None, str | None]] = []
+        self.stopped_streams: list[tuple[str, str]] = []
         self.agent_creates = 0
         self.callee_creates = 0
         self.owner_creates = 0
@@ -167,6 +177,7 @@ class FakeTwilio:
         return {"CallSid": call_sid, "CallStatus": "in-progress", "CallDuration": "0"}
 
     async def stop_audio_monitor(self, callee_call_sid, stream_sid):
+        self.stopped_streams.append((callee_call_sid, stream_sid))
         return None
 
     async def create_agent_participant(self, **kwargs) -> ParticipantInfo:

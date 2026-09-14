@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -106,3 +107,67 @@ def test_readyz_separates_liveness_from_readiness(settings):
 
         app.state.call_service._supervision_healthy = True
         assert client.get("/readyz").status_code == 200
+
+        # A stale last-success timestamp (a pass that hung without raising) is also
+        # not-ready, even though the health flag is still set.
+        app.state.call_service._watchdog_last_success_monotonic = time.monotonic() - 10_000
+        assert client.get("/healthz").status_code == 200
+        assert client.get("/readyz").status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_hung_watchdog_pass_stops_new_calls(service, packet):
+    service._watchdog_started = True
+    service._watchdog_last_success_monotonic = time.monotonic() - 10_000
+    assert service.supervision_ready() is False
+
+    prepared = await _prepare(service, packet)
+    with pytest.raises(ValueError) as exc_info:
+        await service.start(
+            prepared.plan_id,
+            explicit_confirmation=True,
+            confirmation_text=prepared.confirmation_summary,
+        )
+    assert json.loads(str(exc_info.value))["code"] == "supervision_unavailable"
+    assert service.twilio.agent_creates == 0
+
+    # The hanging work itself is not cancelled or discarded; recovery is observed
+    # by the next successful pass.
+    service._watchdog_last_success_monotonic = time.monotonic()
+    assert service.supervision_ready() is True
+
+
+@pytest.mark.asyncio
+async def test_watchdog_loop_refreshes_freshness(service, monkeypatch):
+    monkeypatch.setattr("app.call_state.WATCHDOG_INTERVAL_SECONDS", 0.01)
+    before = service._watchdog_last_success_monotonic
+    await service.start_watchdog()
+
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        current = service._watchdog_last_success_monotonic
+        if current is not None and (before is None or current > before):
+            break
+
+    assert service._watchdog_last_success_monotonic is not None
+    assert service.supervision_ready() is True
+
+
+@pytest.mark.asyncio
+async def test_hanging_watchdog_loop_marks_not_ready(service, monkeypatch):
+    monkeypatch.setattr("app.call_state.WATCHDOG_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr("app.call_state.WATCHDOG_READY_STALENESS_SECONDS", 0.02)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hanging_once() -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(service, "_watchdog_once", hanging_once)
+    await service.start_watchdog()
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.sleep(0.1)
+
+    assert service.supervision_ready() is False
+    release.set()

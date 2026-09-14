@@ -1,0 +1,355 @@
+{
+  "answer_call_question": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "answer": {
+          "type": "string"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "question_id": {
+          "type": "string"
+        },
+        "resolution": {
+          "enum": [
+            "found",
+            "not_found"
+          ],
+          "type": "string"
+        },
+        "sources_checked": {
+          "items": {
+            "enum": [
+              "agent_memory",
+              "conversation_history",
+              "email",
+              "calendar",
+              "drive",
+              "other"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "call_id",
+        "question_id",
+        "answer",
+        "resolution",
+        "sources_checked"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  "end_phone_call": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "call_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  "get_call_result": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "call_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  "get_phone_call": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "call_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  "prepare_phone_call": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_basis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "context": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_commitments": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "escalation": {
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "transfer_to_owner",
+                    "end_call"
+                  ],
+                  "type": "string"
+                },
+                "owner_phone": {
+                  "pattern": "^\\+[1-9]\\d{1,14}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "mode",
+                "owner_phone"
+              ],
+              "type": "object"
+            },
+            "hard_constraints": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "objective": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "owner": {
+              "properties": {
+                "callback_number": {
+                  "pattern": "^\\+[1-9]\\d{1,14}$",
+                  "type": "string"
+                },
+                "display_name": {
+                  "maxLength": 120,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "timezone": {
+                  "maxLength": 80,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "display_name",
+                "timezone",
+                "callback_number"
+              ],
+              "type": "object"
+            },
+            "preferences": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "prohibited_actions": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "relevant_facts": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "target": {
+              "properties": {
+                "name": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "organization": {
+                  "anyOf": [
+                    {
+                      "maxLength": 160,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "phone": {
+                  "pattern": "^\\+[1-9]\\d{1,14}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "phone"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "owner",
+            "target",
+            "objective",
+            "escalation"
+          ],
+          "type": "object"
+        },
+        "requested_by_owner": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "context"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  "start_phone_call": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "confirmation_text": {
+          "type": "string"
+        },
+        "explicit_confirmation": {
+          "type": "boolean"
+        },
+        "plan_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan_id",
+        "explicit_confirmation",
+        "confirmation_text"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  },
+  "wait_for_call_event": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "after_sequence": {
+          "default": 0,
+          "type": "integer"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 20.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "call_id"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": true,
+      "type": "object"
+    }
+  }
+}

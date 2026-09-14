@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.call_audio import CallAudio
-from app.models import CallState
+from app.models import TERMINAL_STATES, CallState
 from tests.conftest import seed_call
 from tests.test_call_audio import SILENCE, VOICE
 
@@ -54,16 +54,21 @@ async def settle():
     await asyncio.sleep(0.1)
 
 
-async def wait_for_terminal_reason(service, call_id, reason: str, *, budget_seconds: float = 5.0):
-    """Poll for a terminal reason instead of assuming a fixed sleep is enough.
+async def wait_for_terminal_state(service, call_id, reason: str, *, budget_seconds: float = 5.0):
+    """Wait for the durable terminal state, not just the claim-time reason.
 
-    The reply-window task wakes on a 50ms tick and then runs the full termination
-    pipeline; a loaded CI runner can exceed a single ``settle()``. Polling keeps
-    the assertion about behaviour without encoding runner speed.
+    ``termination_reason`` is written when the termination claim is taken, which is
+    before the remote hangup and the final terminal write. Waiting on the real
+    terminal state means callers can assert provider cleanup (hangup) afterwards
+    without racing the teardown pipeline. Polling replaces a fixed sleep so a
+    loaded CI runner does not turn a slow-but-correct teardown into a failure.
     """
+    terminal_states = {state.value for state in TERMINAL_STATES}
     deadline = asyncio.get_running_loop().time() + budget_seconds
     call = await service.db.get_call(call_id)
-    while call is not None and call["termination_reason"] != reason:
+    while call is not None and not (
+        call["state"] in terminal_states and call["termination_reason"] == reason
+    ):
         if asyncio.get_running_loop().time() >= deadline:
             break
         await asyncio.sleep(0.02)
@@ -176,7 +181,8 @@ async def test_reply_window_is_three_seconds_of_carrier_silence(service, packet)
     assert service.live.hangups == []
     assert (await service.db.get_call(call_id))["state"] == "active"
     frames(service, call_id, start=3000, end=3060, payload=SILENCE)
-    call = await wait_for_terminal_reason(service, call_id, "voice_model_end_call")
+    call = await wait_for_terminal_state(service, call_id, "voice_model_end_call")
+    assert call["state"] in {state.value for state in TERMINAL_STATES}
     assert call["termination_reason"] == "voice_model_end_call"
     assert service.live.hangups == ["rtc_test"]
 

@@ -1,18 +1,22 @@
 """R01: frozen external contracts.
 
-These snapshots make an accidental rename or removal of an MCP tool, HTTP route,
-or tool error code fail loudly. They are intentionally explicit: a genuine change
-requires editing this file, which is the point.
+These snapshots make an accidental rename, route change, schema change, or tool
+error-code removal fail loudly. The MCP tool schemas are stored in
+``tests/snapshots/mcp_tools.json`` so the full input/output schema is compared,
+not just the tool name and annotations. A genuine change requires regenerating
+the snapshot, which is the point.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 
 import pytest
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from app.evaluation import LIVE_CALLS_DISABLED_CODE
@@ -22,51 +26,7 @@ from app.models import AnswerCallQuestionRequest
 from app.settings import Settings
 
 ROOT = Path(__file__).resolve().parents[1]
-
-EXPECTED_TOOLS = {
-    "prepare_phone_call": {
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "openWorldHint": False,
-        "idempotentHint": False,
-    },
-    "start_phone_call": {
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "openWorldHint": True,
-        "idempotentHint": False,
-    },
-    "get_call_result": {
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "openWorldHint": True,
-        "idempotentHint": False,
-    },
-    "end_phone_call": {
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "openWorldHint": True,
-        "idempotentHint": True,
-    },
-    "get_phone_call": {
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "openWorldHint": False,
-        "idempotentHint": True,
-    },
-    "wait_for_call_event": {
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "openWorldHint": False,
-        "idempotentHint": True,
-    },
-    "answer_call_question": {
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "openWorldHint": False,
-        "idempotentHint": False,
-    },
-}
+TOOL_SNAPSHOT = ROOT / "tests" / "snapshots" / "mcp_tools.json"
 
 EXPECTED_HTTP_ROUTES = {
     "/webhooks/openai",
@@ -86,9 +46,6 @@ EXPECTED_HTTP_ROUTES = {
 
 _DOCS_PATHS = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"})
 
-# Tool-facing error codes emitted as {"code": ...}. Kept alongside the
-# unstructured ToolError("unknown question")/ToolError(str(exc)) forms that R06
-# will converge later.
 EXPECTED_ERROR_CODES = {
     "call_busy",
     "call_ending",
@@ -105,19 +62,48 @@ EXPECTED_ERROR_CODES = {
 }
 
 
-def test_mcp_tool_names_and_annotations_are_frozen() -> None:
-    async def collect() -> dict[str, dict[str, object]]:
-        mcp = FastMCP("contract-snapshot")
-        register_tools(mcp, lambda: None)
-        tools = await mcp.list_tools()
-        return {
-            tool.name: {
-                key: value for key, value in dict(tool.annotations or {}).items() if key != "title"
-            }
-            for tool in tools
-        }
+async def _registered_tools(get_service=None):
+    mcp = FastMCP("contract-snapshot")
+    register_tools(mcp, get_service or (lambda: None))
+    return await mcp.list_tools()
 
-    assert asyncio.run(collect()) == EXPECTED_TOOLS
+
+def _tool_snapshot(tools) -> dict[str, dict]:
+    return {
+        tool.name: {
+            "annotations": {
+                key: value for key, value in dict(tool.annotations or {}).items() if key != "title"
+            },
+            "input_schema": tool.parameters,
+            "output_schema": tool.output_schema,
+        }
+        for tool in sorted(tools, key=lambda item: item.name)
+    }
+
+
+def test_mcp_tool_schemas_are_frozen() -> None:
+    current = _tool_snapshot(asyncio.run(_registered_tools()))
+    expected = json.loads(TOOL_SNAPSHOT.read_text(encoding="utf-8"))
+    assert current == expected
+
+
+def test_tool_errors_carry_stable_codes_for_missing_calls() -> None:
+    class MissingService:
+        async def get_result(self, call_id: str):
+            raise LookupError(call_id)
+
+        async def get_snapshot(self, call_id: str):
+            raise LookupError(call_id)
+
+    tools = {tool.name: tool for tool in asyncio.run(_registered_tools(lambda: MissingService()))}
+
+    async def invoke(name: str):
+        return await tools[name].fn(call_id="call_missing")
+
+    for name in ("get_call_result", "get_phone_call"):
+        with pytest.raises(ToolError) as exc_info:
+            asyncio.run(invoke(name))
+        assert json.loads(str(exc_info.value))["code"] == "call_not_found"
 
 
 def _all_route_paths(app) -> set[str]:

@@ -105,6 +105,29 @@ async def test_plan_can_start_after_prior_call_is_terminal(service, packet):
 
 
 @pytest.mark.asyncio
+async def test_transferred_call_does_not_block_new_call(service, packet):
+    await seed_call(service.db, packet, state=CallState.TRANSFERRED)
+    prepared = await _prepare(service, packet)
+
+    started = await _start(service, prepared)
+
+    # A completed handoff is terminal capacity: the owner-callee conference does
+    # not count as an AI-controlled live call.
+    assert started.state is CallState.PREWARMING
+
+
+@pytest.mark.asyncio
+async def test_cleanup_pending_terminal_call_does_not_block_new_call(service, packet):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.set_conference_cleanup_pending(call_id, True)
+    prepared = await _prepare(service, packet)
+
+    started = await _start(service, prepared)
+
+    assert started.state is CallState.PREWARMING
+
+
+@pytest.mark.asyncio
 async def test_claim_callee_dial_denied_once_termination_claimed(service, packet):
     call_id = await seed_call(service.db, packet)
 
