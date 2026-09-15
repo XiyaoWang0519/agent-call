@@ -46,8 +46,8 @@ uv run mypy app                                # pass
 uv run pytest -q --cov=app                     # 662 passed, 2 skipped, 88.43%
 ```
 
-After R00–R05 (including the review passes) the same gate reports **697 passed,
-2 skipped, 88.62%** (floor 85%).
+After R00–R05 (including the review passes) the same gate reports **699 passed,
+2 skipped, 88.63%** (floor 85%).
 
 Added:
 
@@ -78,6 +78,8 @@ batch, so that remains a known risk rather than a masked result.
 | Cancel during media-stream create | stream created after cancel | stream stopped; call terminalized |
 | Late create during shutdown | `_stopping` set, create lands | must-finish cleanup still runs |
 | Real `stop()` with an unreturned create | stop starts while provider create in flight | stop waits (must-finish owned task); late leg removed; caller gets `call_ending` |
+| Valid agent leg lands after `ACTIVE` | initial agent REST result arrives after activation | leg adopted; call stays `ACTIVE`; nothing removed |
+| Termination wins before adoption write | terminate commits while the adoption write is paused | adoption CAS fails; resource abandoned; caller gets `call_ending` |
 | Targeted cleanup fails once | terminal/transferred call, `remove_participant`/`stop_audio_monitor` raises | bounded retry keeps ownership; conference left intact |
 | Duplicate / out-of-order callback | repeated participant-status | single terminal transition |
 | Restart with nonterminal rows | `recover_startup` | no second external create |
@@ -125,10 +127,15 @@ not only the first await:
    provider call**, so `stop()` waits for an unreturned create to reach
    commit-or-abandon; caller cancellation is propagated into the owned task so
    its own cancel path abandons what the provider created;
-2. after the create returns, the call is checked for viability (not stopping, not
-   terminal/terminating) before ownership is taken, so a leg created into a call
-   that was terminated during the provider call is abandoned, not persisted;
-3. the returned value is given to `commit`, which persists the SID; and
+2. after the create returns, the call is checked for viability — "not closed",
+   not "still in setup". A delayed but valid agent leg can legitimately arrive
+   after the call is `ACTIVE`, so only `TERMINATING`/terminal states (or a
+   stopping service) reject it;
+3. the returned value is given to a **conditional** `commit` (`adopt_participant`
+   / `adopt_media_stream`) whose state predicate is the atomic linearization
+   point against termination: if termination commits first, adoption returns
+   false and the resource is abandoned instead of reporting a normal success;
+   and
 4. if any step is interrupted or fails, `abandon` receives the known value
    (or `None` for a definite failure) and removes the specific remote resource
    using identifiers already held.
@@ -155,7 +162,8 @@ Key properties:
 
 Covered by `tests/test_dial_cancellation.py` (cancel + success, cancel + failure,
 cancel while persisting, provider success + DB failure, media cancel, late create
-during shutdown, real `stop()` with an unreturned create, and targeted-cleanup
+during shutdown, real `stop()` with an unreturned create, late valid agent leg
+after `ACTIVE`, adoption losing the race to termination, and targeted-cleanup
 retry after the call is terminal/transferred).
 
 **Known limitation:** the targeted-cleanup retry is bounded and in-process. If the

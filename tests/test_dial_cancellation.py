@@ -139,17 +139,16 @@ async def test_cancelled_agent_create_with_definite_failure_still_terminalizes(s
 @pytest.mark.asyncio
 async def test_cancel_while_persisting_sid_removes_leg(service, packet, monkeypatch):
     prepared = await _prepare(service, packet)
-    original_update = service.db.update_call
+    original_adopt = service.db.adopt_participant
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_update(call_id, **values):
-        if "twilio_ai_call_sid" in values:
-            entered.set()
-            await release.wait()
-        return await original_update(call_id, **values)
+    async def slow_adopt(candidate, **values):
+        entered.set()
+        await release.wait()
+        return await original_adopt(candidate, **values)
 
-    monkeypatch.setattr(service.db, "update_call", slow_update)
+    monkeypatch.setattr(service.db, "adopt_participant", slow_adopt)
     task = asyncio.create_task(_start(service, prepared))
     await asyncio.wait_for(entered.wait(), timeout=1)
     task.cancel()
@@ -175,6 +174,7 @@ async def test_persist_failure_removes_leg_without_database(service, packet, mon
 
     # Both the ownership write and the DB-backed termination path are unavailable;
     # targeted provider cleanup must still run because it only needs the SID.
+    monkeypatch.setattr(service.db, "adopt_participant", db_down)
     monkeypatch.setattr(service.db, "update_call", db_down)
     monkeypatch.setattr(service.db, "claim_termination", db_down)
 
@@ -353,3 +353,94 @@ async def test_failed_targeted_stream_cleanup_keeps_retrying(service, packet, mo
 
     assert len(attempts) == 2
     assert service.twilio.completed == []
+
+
+@pytest.mark.asyncio
+async def test_agent_leg_arriving_after_active_is_adopted(service, packet):
+    """A valid agent leg whose REST result lands after ACTIVE must not be abandoned."""
+    prepared = await _prepare(service, packet)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    late = ParticipantInfo("CA" + "v" * 32, "CF" + "v" * 32)
+
+    async def slow_create(**_kwargs):
+        entered.set()
+        await release.wait()
+        return late
+
+    service.twilio.create_agent_participant = slow_create
+    start_task = asyncio.create_task(_start(service, prepared))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    # The claim row already exists; drive the real callback chain to ACTIVE while
+    # the initial agent REST result is still pending.
+    call_id = (await service.db.list_calls())[0]["call_id"]
+    mapped = await service.handle_openai_incoming(
+        "rtc_incoming",
+        [
+            {"name": "X-Plan-Id", "value": prepared.plan_id},
+            {"name": "X-Bridge-Call-Id", "value": call_id},
+        ],
+    )
+    assert mapped == call_id
+    await service.handle_sideband_open(call_id)
+    await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
+    await wait_background()
+    assert (await service.db.get_call(call_id))["state"] == CallState.ACTIVE.value
+
+    release.set()
+    started = await asyncio.wait_for(start_task, timeout=5)
+
+    stored = await service.db.get_call(call_id)
+    assert stored["state"] == CallState.ACTIVE.value
+    assert stored["twilio_ai_call_sid"] == late.call_sid
+    assert started.call_id == call_id
+    assert service.twilio.removed == []
+    assert service.twilio.completed == []
+
+
+@pytest.mark.asyncio
+async def test_adoption_losing_race_to_stop_is_not_reported_as_success(
+    service, packet, monkeypatch
+):
+    """If termination wins before the adoption write commits, do not report success."""
+    prepared = await _prepare(service, packet)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    adopt_entered = asyncio.Event()
+    adopt_release = asyncio.Event()
+    late = ParticipantInfo("CA" + "u" * 32, "CF" + "u" * 32)
+
+    async def slow_create(**_kwargs):
+        entered.set()
+        await release.wait()
+        return late
+
+    original_adopt = service.db.adopt_participant
+
+    async def slow_adopt(candidate: str, **kwargs):
+        adopt_entered.set()
+        await adopt_release.wait()
+        return await original_adopt(candidate, **kwargs)
+
+    service.twilio.create_agent_participant = slow_create
+    monkeypatch.setattr(service.db, "adopt_participant", slow_adopt)
+
+    start_task = asyncio.create_task(_start(service, prepared))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    call_id = (await service.db.list_calls())[0]["call_id"]
+    release.set()
+    await asyncio.wait_for(adopt_entered.wait(), timeout=1)
+
+    stop_task = asyncio.create_task(service.stop())
+    await asyncio.sleep(0.05)
+    adopt_release.set()
+    await asyncio.wait_for(stop_task, timeout=5)
+
+    with pytest.raises(ValueError) as exc_info:
+        await start_task
+    assert json.loads(str(exc_info.value))["code"] == "call_ending"
+
+    stored = await service.db.get_call(call_id)
+    assert stored["state"] in {state.value for state in TERMINAL_STATES}
+    assert (late.conference_sid, late.call_sid) in service.twilio.removed

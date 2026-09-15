@@ -64,9 +64,10 @@ TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
 # Bounded retry for targeted remote-resource cleanup (one participant leg or one
-# carrier stream). Kept short so shutdown, which awaits must-finish work, is not
-# held up by a provider outage.
-RESOURCE_CLEANUP_MAX_ATTEMPTS = 4
+# carrier stream). ``MAX_RETRIES`` counts retries after the first attempt, so the
+# provider is called at most ``MAX_RETRIES + 1`` times. Kept short so shutdown,
+# which awaits must-finish work, is not held up by a provider outage.
+RESOURCE_CLEANUP_MAX_RETRIES = 4
 RESOURCE_CLEANUP_RETRY_BASE_SECONDS = 0.2
 RESOURCE_CLEANUP_RETRY_MAX_SECONDS = 2.0
 # cancel_response + function_call_output each bound to LIVE_SEND_TIMEOUT_SECONDS; keep
@@ -649,13 +650,15 @@ class CallService:
             await self._run_owned_cleanup(abandon, result, operation=operation, call_id=call_id)
             return None
 
-        # Persisting the SID is part of the protected region: cancellation between
-        # the provider response and the durable write must abandon the leg.
+        # Taking ownership is a conditional write: the state predicate is the atomic
+        # linearization point against termination. If a termination claim commits
+        # between the viability read and this write, adoption fails and we
+        # compensate instead of returning a normal success for a closed call.
         commit_task: asyncio.Task[Any] = asyncio.create_task(
             commit(result), name=f"{operation}-commit:{call_id}"
         )
         try:
-            await self._await_network_task(commit_task, propagate_cancellation=True)
+            adopted = await self._await_network_task(commit_task, propagate_cancellation=True)
         except asyncio.CancelledError:
             await self._run_owned_cleanup(abandon, result, operation=operation, call_id=call_id)
             raise
@@ -665,6 +668,14 @@ class CallService:
             if swallow_failure:
                 return None
             raise
+        if adopted is not True:
+            logger.warning(
+                "remote resource adoption lost the race for an open call operation=%s call_id=%s",
+                operation,
+                call_id,
+            )
+            await self._run_owned_cleanup(abandon, result, operation=operation, call_id=call_id)
+            return None
 
         if request_stage is not None and completed_stage is not None:
             completed_mark = LatencyMark.now()
@@ -676,21 +687,21 @@ class CallService:
         return result
 
     async def _call_still_accepts_leg(self, call_id: str) -> bool:
-        """Whether a freshly created remote resource still belongs to a live call.
+        """Whether a freshly created remote resource still belongs to an open call.
 
-        Covers participant legs created during setup and the carrier media stream
-        created during activation. Terminal and terminating states are excluded.
+        The rule is "the call is not closed", not "the call is still in setup".
+        SIP binding, callee dialing, and activation do not require the initial agent
+        REST result to have been persisted first, so a valid agent-leg response can
+        legitimately arrive after the call is already ACTIVE; rejecting ACTIVE here
+        would abandon a leg the live call still needs. Only TERMINATING/terminal
+        states, or a stopping service, no longer want a newly created resource.
         """
         if self._stopping:
             return False
         call = await self.db.get_call(call_id)
         if call is None:
             return False
-        return CallState(call["state"]) in {
-            CallState.PREWARMING,
-            CallState.READY_TO_ACTIVATE,
-            CallState.ACTIVATING,
-        }
+        return not self._call_activity_is_closed(call)
 
     async def _run_owned_cleanup(
         self,
@@ -834,18 +845,19 @@ class CallService:
             return
 
         async def retry() -> None:
-            for attempt in range(1, RESOURCE_CLEANUP_MAX_ATTEMPTS + 1):
+            for attempt in range(1, RESOURCE_CLEANUP_MAX_RETRIES + 1):
                 try:
                     await cleanup()
                     return
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    if attempt >= RESOURCE_CLEANUP_MAX_ATTEMPTS:
+                    if attempt >= RESOURCE_CLEANUP_MAX_RETRIES:
                         logger.error(
-                            "targeted %s cleanup gave up call_id=%s resource=%s; "
-                            "manual reconciliation required",
+                            "targeted %s cleanup gave up after %s attempt(s) call_id=%s "
+                            "resource=%s; manual reconciliation required",
                             label,
+                            RESOURCE_CLEANUP_MAX_RETRIES + 1,
                             call_id,
                             resource_key,
                             exc_info=True,
@@ -990,9 +1002,10 @@ class CallService:
             completed_stage=LatencyStage.TWILIO_AGENT_CREATED,
             failure_log_message="failed to originate agent leg",
             failure_reason="agent_leg_setup_failed",
-            commit=lambda late: self.db.update_call(
+            commit=lambda late: self.db.adopt_participant(
                 call_id,
-                twilio_ai_call_sid=late.call_sid,
+                kind="agent",
+                call_sid=late.call_sid,
                 conference_sid=late.conference_sid,
             ),
             abandon=lambda late: self._abandon_participant(
@@ -1132,9 +1145,10 @@ class CallService:
                 completed_stage=LatencyStage.TWILIO_CALLEE_CREATED,
                 failure_log_message="failed to originate callee leg",
                 failure_reason="callee_leg_setup_failed",
-                commit=lambda late: self.db.update_call(
+                commit=lambda late: self.db.adopt_participant(
                     call_id,
-                    twilio_callee_call_sid=late.call_sid,
+                    kind="callee",
+                    call_sid=late.call_sid,
                     conference_sid=late.conference_sid or call.get("conference_sid"),
                 ),
                 abandon=lambda late: self._abandon_participant(
@@ -1460,7 +1474,7 @@ class CallService:
             operation="create-media-stream",
             failure_log_message="failed to start carrier audio monitor",
             failure_reason="media_monitor_setup_failed",
-            commit=lambda late: self.db.update_call(call_id, media_stream_sid=late),
+            commit=lambda late: self.db.adopt_media_stream(call_id, late),
             abandon=lambda late: self._abandon_media_stream(
                 call_id,
                 "media_monitor_setup_failed",

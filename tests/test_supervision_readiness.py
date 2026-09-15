@@ -145,8 +145,9 @@ async def test_watchdog_loop_refreshes_freshness(service, monkeypatch):
 
     async def counting_once() -> None:
         nonlocal passes
-        passes += 1
         await original_once()
+        # Count completed passes, not entries, so a hung pass is not credited.
+        passes += 1
 
     monkeypatch.setattr(service, "_watchdog_once", counting_once)
     await service.start_watchdog()
