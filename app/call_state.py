@@ -27,6 +27,11 @@ from app.db import (
     LatencyMark,
     LatencyStage,
 )
+from app.errors import (
+    CALL_ENDING_PARTICIPANT_MESSAGE,
+    CallRefusal,
+    ErrorCode,
+)
 from app.evaluation import live_calls_disabled_error
 from app.exa_search import ExaSearchClient, ExaSearchError
 from app.finalizer import Finalizer
@@ -40,6 +45,7 @@ from app.models import (
     ContextPacket,
     PreparePhoneCallInput,
     PreparePhoneCallOutput,
+    QuestionStatus,
     SendDtmfRequest,
     StartPhoneCallOutput,
     TranscriptTurn,
@@ -50,6 +56,12 @@ from app.openai_client import create_openai_client
 from app.openai_live import LIVE_SEND_TIMEOUT_SECONDS, LiveBridge
 from app.owner_transfer import OwnerTransferCoordinator
 from app.policy import validate_context
+from app.records import (
+    AnswerCommand,
+    LifecycleRecord,
+    QuestionRecord,
+    ToolExecutionResult,
+)
 from app.settings import Settings
 from app.twilio_bridge import ParticipantInfo, TwilioBridge
 
@@ -468,16 +480,10 @@ class CallService:
             missing.append("authority_basis")
         errors = validate_context(request.context, self.settings)
         if errors:
+            # Policy codes (invalid_e164 and friends) are a separate domain registry;
+            # CallRefusal carries them through unchanged.
             first = errors[0]
-            raise ValueError(
-                json.dumps(
-                    {
-                        "code": first.code,
-                        "message": first.message,
-                        "details": first.details,
-                    }
-                )
-            )
+            raise CallRefusal(first.code, first.message, details=first.details)
         summary = self._confirmation_summary(request.context)
         if missing:
             return PreparePhoneCallOutput(
@@ -922,38 +928,15 @@ class CallService:
         if not self.settings.live_calls_enabled:
             raise live_calls_disabled_error()
         if not self.supervision_ready():
-            raise ValueError(
-                json.dumps(
-                    {
-                        "code": "supervision_unavailable",
-                        "message": (
-                            "Call supervision is not healthy; retry after readiness recovers"
-                        ),
-                    }
-                )
-            )
+            raise CallRefusal(ErrorCode.SUPERVISION_UNAVAILABLE)
         if not explicit_confirmation or not confirmation_text.strip():
-            raise ValueError(
-                json.dumps(
-                    {
-                        "code": "confirmation_required",
-                        "message": "Explicit confirmation and the read-back confirmation text are required",
-                    }
-                )
-            )
-        plan = await self.db.get_plan(plan_id)
+            raise CallRefusal(ErrorCode.CONFIRMATION_REQUIRED)
+        plan = await self.db.get_plan_record(plan_id)
         if plan is None:
-            raise ValueError(json.dumps({"code": "plan_not_found", "message": "Unknown plan_id"}))
-        packet = ContextPacket.model_validate(plan["context"])
+            raise CallRefusal(ErrorCode.PLAN_NOT_FOUND)
+        packet = plan.context
         if confirmation_text.strip() != self._confirmation_summary(packet):
-            raise ValueError(
-                json.dumps(
-                    {
-                        "code": "confirmation_mismatch",
-                        "message": "Confirmation text must exactly match the prepared read-back summary",
-                    }
-                )
-            )
+            raise CallRefusal(ErrorCode.CONFIRMATION_MISMATCH)
         call_id = f"call_{secrets.token_urlsafe(18)}"
         conference_name = f"agent-{secrets.token_hex(16)}"
         try:
@@ -964,44 +947,13 @@ class CallService:
                 confirmation_text=confirmation_text,
             )
         except DeploymentLockedError as exc:
-            raise ValueError(
-                json.dumps(
-                    {
-                        "code": "deployment_in_progress",
-                        "message": "A deployment is starting; retry the confirmed call shortly",
-                    }
-                )
-            ) from exc
+            raise CallRefusal(ErrorCode.DEPLOYMENT_IN_PROGRESS) from exc
         if not claimed:
             if claimed.outcome is ClaimOutcome.BUSY:
-                raise ValueError(
-                    json.dumps(
-                        {
-                            "code": "call_busy",
-                            "message": (
-                                "Another call is already in progress; wait for it to finish "
-                                "before starting a new call"
-                            ),
-                        }
-                    )
-                )
+                raise CallRefusal(ErrorCode.CALL_BUSY)
             if claimed.outcome is ClaimOutcome.CALL_ENDING:
-                raise ValueError(
-                    json.dumps(
-                        {
-                            "code": "call_ending",
-                            "message": (
-                                "The current call is still shutting down; retry the confirmed "
-                                "call shortly"
-                            ),
-                        }
-                    )
-                )
-            raise ValueError(
-                json.dumps(
-                    {"code": "plan_unavailable", "message": "Plan is expired or already started"}
-                )
-            )
+                raise CallRefusal(ErrorCode.CALL_ENDING)
+            raise CallRefusal(ErrorCode.PLAN_UNAVAILABLE)
         participant = await self._run_owned_remote_create(
             call_id,
             lambda: self.twilio.create_agent_participant(
@@ -1032,17 +984,7 @@ class CallService:
             # A create that was abandoned (service stopping, or the call was
             # terminalized while the provider call was in flight) is not a usable
             # leg; report the same stable code used for a draining call.
-            raise ValueError(
-                json.dumps(
-                    {
-                        "code": "call_ending",
-                        "message": (
-                            "The call stopped accepting a new participant leg; retry the "
-                            "confirmed call shortly"
-                        ),
-                    }
-                )
-            )
+            raise CallRefusal(ErrorCode.CALL_ENDING, CALL_ENDING_PARTICIPANT_MESSAGE)
         # No await between the owned create and spawning the setup deadline, so a
         # cancellation cannot slip through an undefended persistence window.
         self._spawn(self._setup_deadline(call_id), name=f"setup-deadline:{call_id}")
@@ -1086,11 +1028,11 @@ class CallService:
             await self.live.reject(openai_call_id)
             raise LookupError("incoming SIP call could not be mapped to an approved plan")
         mapped_call_id = call_id
-        plan = await self.db.get_plan(call["plan_id"])
+        plan = await self.db.get_plan_record(call["plan_id"])
         if plan is None:
             await self.live.reject(openai_call_id)
             raise LookupError("incoming SIP call plan is missing")
-        packet = ContextPacket.model_validate(plan["context"])
+        packet = plan.context
         accept_status = await self._run_latency_marked_step(
             mapped_call_id,
             lambda: self.live.accept_and_connect(
@@ -1139,11 +1081,11 @@ class CallService:
             return
         call = await self.db.get_call(call_id)
         if call is not None and await self.db.claim_callee_dial(call_id):
-            plan = await self.db.get_plan(call["plan_id"])
+            plan = await self.db.get_plan_record(call["plan_id"])
             if plan is None:
                 await self.terminate_call(call_id, "plan_missing_after_sideband_open")
                 return
-            packet = ContextPacket.model_validate(plan["context"])
+            packet = plan.context
             participant = await self._run_owned_remote_create(
                 call_id,
                 lambda: self.twilio.create_callee_participant(
@@ -1311,7 +1253,7 @@ class CallService:
             and call.get("twilio_callee_call_sid")
         ):
             return
-        if not await self.db.cas_state(call_id, CallState.PREWARMING, CallState.READY_TO_ACTIVATE):
+        if not await self.db.promote_to_ready_to_activate(call_id):
             return
         await self._activate(call_id)
 
@@ -1565,16 +1507,14 @@ class CallService:
 
     async def _activate(self, call_id: str) -> None:
         async with self._activation_lock(call_id):
-            if not await self.db.cas_state(
-                call_id, CallState.READY_TO_ACTIVATE, CallState.ACTIVATING
-            ):
+            if not await self.db.promote_to_activating(call_id):
                 return
             call = await self.db.get_call(call_id)
             if call is None:
                 return
             try:
                 await self._start_media_monitor(call)
-                if not await self.db.cas_state(call_id, CallState.ACTIVATING, CallState.ACTIVE):
+                if not await self.db.promote_to_active(call_id):
                     return
                 await self._unmute_agent(
                     call_id,
@@ -2234,7 +2174,7 @@ class CallService:
         await self._send_nontransfer_tool_result(
             call_id,
             tool_call_id,
-            {"accepted": False, "error": "unknown tool"},
+            ToolExecutionResult.rejected("unknown tool").to_payload(),
             received=received,
             event_key=event_key,
         )
@@ -2257,7 +2197,7 @@ class CallService:
         await self._send_nontransfer_tool_result(
             call_id,
             tool_call_id,
-            {"status": "error", "error": error},
+            ToolExecutionResult.ask_agent_rejected(error).to_payload(),
             received=received,
             event_key=event_key,
         )
@@ -2267,7 +2207,7 @@ class CallService:
         call_id: str,
         tool_call_id: str,
         request: AskAgentRequest,
-        row: dict[str, Any],
+        question: QuestionRecord,
         *,
         received: LatencyMark,
         event_key: str,
@@ -2278,7 +2218,7 @@ class CallService:
         # awaits, so a concurrent answer or termination sees (and can clear) the entry
         # instead of racing a registration that has not happened yet.
         self._pending_questions[call_id] = PendingQuestion(
-            question_id=row["question_id"],
+            question_id=question.question_id,
             tool_call_id=tool_call_id,
             deadline_monotonic=time.monotonic() + self.settings.ask_agent_answer_timeout_seconds,
         )
@@ -2295,34 +2235,34 @@ class CallService:
             call_id,
             LatencyStage.ASK_AGENT_ASKED,
             LatencyMark.now(),
-            event_key=str(row["question_id"]),
+            event_key=question.question_id,
         )
         logger.info(
             "ask_agent asked call_id=%s question_id=%s tool_call_id=%s sequence=%s "
             "question_chars=%s reason_present=%s",
             call_id,
-            row["question_id"],
+            question.question_id,
             tool_call_id,
-            row["sequence_number"],
+            question.sequence_number,
             len(request.question),
             request.reason is not None,
         )
         if self.settings.agent_push_enabled:
             reason_line = f"\nReason: {request.reason}" if request.reason else ""
             push_text = (
-                f"Mid-call question on call {call_id} (question_id={row['question_id']}, "
-                f"sequence={row['sequence_number']}).\n"
+                f"Mid-call question on call {call_id} (question_id={question.question_id}, "
+                f"sequence={question.sequence_number}).\n"
                 f"Question: {request.question}{reason_line}\n"
                 "Answer via the answer_call_question MCP tool with this call_id and "
                 "question_id, then resume wait_for_call_event."
             )
             self._spawn(
                 push_message_to_agent(self.settings, push_text),
-                name=f"agent-push-question:{call_id}:{row['question_id']}",
+                name=f"agent-push-question:{call_id}:{question.question_id}",
             )
         self._spawn(
-            self._question_deadline(call_id, row["question_id"]),
-            name=f"question-deadline:{call_id}:{row['question_id']}",
+            self._question_deadline(call_id, question.question_id),
+            name=f"question-deadline:{call_id}:{question.question_id}",
             must_finish=False,
         )
 
@@ -2365,7 +2305,7 @@ class CallService:
         # The question quota is enforced inside create_question, after its duplicate
         # tool_call_id check, so a redelivered ask_agent at the limit reuses the pending
         # row instead of closing the still-open function call with question_limit_reached.
-        row, error = await self.db.create_question(
+        question, error = await self.db.create_question_record(
             call_id,
             tool_call_id=tool_call_id,
             question=request.question,
@@ -2373,7 +2313,7 @@ class CallService:
             deadline_at=deadline_at,
             max_questions=self.settings.ask_agent_max_questions_per_call,
         )
-        if error is not None or row is None:
+        if error is not None or question is None:
             await self._reject_ask_agent(
                 call_id,
                 tool_call_id,
@@ -2388,19 +2328,19 @@ class CallService:
         existing_pending = self._pending_questions.get(call_id)
         if (
             existing_pending is not None
-            and existing_pending.question_id == row["question_id"]
+            and existing_pending.question_id == question.question_id
             and existing_pending.tool_call_id == tool_call_id
         ):
             logger.info(
                 "ask_agent redelivered call_id=%s question_id=%s tool_call_id=%s",
                 call_id,
-                row["question_id"],
+                question.question_id,
                 tool_call_id,
             )
             return
 
         await self._register_ask_agent_question(
-            call_id, tool_call_id, request, row, received=received, event_key=event_key
+            call_id, tool_call_id, request, question, received=received, event_key=event_key
         )
         # Leave the OpenAI function call open — answer/timeout deliver out-of-band.
 
@@ -2495,8 +2435,8 @@ class CallService:
         if pending is not None and pending.question_id == question_id:
             pending.delivering = True
 
-    async def _deliver_question_answer(self, call_id: str, question_row: dict[str, Any]) -> None:
-        question_id = question_row["question_id"]
+    async def _deliver_question_answer(self, call_id: str, question: QuestionRecord) -> None:
+        question_id = question.question_id
         if call_id in self._voice_end_pending:
             # The goodbye turn owns the sideband now; do not inject an answer relay.
             logger.info(
@@ -2508,12 +2448,11 @@ class CallService:
             self._notify_call_event(call_id)
             return
         self._mark_question_delivering(call_id, question_id)
-        answer = question_row["answer"] or ""
-        output = {"status": "answered", "answer": answer}
+        answer = question.answer or ""
         delivered = await self._guarded_send_tool_result(
             call_id,
-            question_row["tool_call_id"],
-            output,
+            question.tool_call_id,
+            ToolExecutionResult.ask_agent_answered(answer).to_payload(),
             continuation_instructions=(
                 "The owner's assistant answered your question. Relay the relevant part to "
                 "the callee naturally, in one or two sentences. Do not read metadata or "
@@ -2538,7 +2477,7 @@ class CallService:
                 "answer_chars=%s",
                 call_id,
                 question_id,
-                question_row["tool_call_id"],
+                question.tool_call_id,
                 len(answer),
             )
         else:
@@ -2550,7 +2489,7 @@ class CallService:
                 "ask_agent answer delivery failed call_id=%s question_id=%s tool_call_id=%s",
                 call_id,
                 question_id,
-                question_row["tool_call_id"],
+                question.tool_call_id,
             )
         self._clear_pending_question(call_id, question_id)
         self._notify_call_event(call_id)
@@ -2568,7 +2507,7 @@ class CallService:
             return
         self._mark_question_delivering(call_id, question_id)
         try:
-            row = await self.db.claim_question_expiry(question_id)
+            expired = await self.db.claim_question_expiry_record(question_id)
         except Exception:
             logger.exception(
                 "question expiry claim failed call_id=%s question_id=%s", call_id, question_id
@@ -2576,7 +2515,7 @@ class CallService:
             self._clear_pending_question(call_id, question_id)
             self._notify_call_event(call_id)
             return
-        if row is None:
+        if expired is None:
             # Lost the claim (answered, cancelled, or termination owns the call and
             # will cancel it); drop a stale watchdog carve-out entry left behind if
             # resolution raced our registration. Not a cancellation — the winner
@@ -2591,12 +2530,10 @@ class CallService:
             return
         await self._guarded_send_tool_result(
             call_id,
-            row["tool_call_id"],
-            {
-                "status": "timeout",
-                "error": "no_answer_from_agent",
-                "guidance": "Owner's assistant did not respond in time.",
-            },
+            expired.tool_call_id,
+            ToolExecutionResult.ask_agent_timed_out(
+                "Owner's assistant did not respond in time."
+            ).to_payload(),
             continuation_instructions=(
                 "You could not confirm this information. Tell the callee you cannot confirm it "
                 "right now. Do NOT guess or invent an answer. Offer to take a message or proceed "
@@ -2614,7 +2551,7 @@ class CallService:
             "ask_agent timed out call_id=%s question_id=%s tool_call_id=%s",
             call_id,
             question_id,
-            row["tool_call_id"],
+            expired.tool_call_id,
         )
         self._clear_pending_question(call_id, question_id)
         self._notify_call_event(call_id)
@@ -2652,24 +2589,12 @@ class CallService:
             # TERMINATING is not terminal: get_call_result has no final row yet, so clients
             # must keep long-polling until a durable TERMINAL_STATES transition.
             terminal = state in TERMINAL_STATES
-            questions = await self.db.get_questions_after(call_id, after)
+            questions = await self.db.get_question_records_after(call_id, after)
             remaining = deadline - loop.time()
             if questions or terminal or remaining <= 0:
                 if terminal and self._event_notifiers.get(call_id) is notifier:
                     self._event_notifiers.pop(call_id, None)
-                events = [
-                    {
-                        "sequence": row["sequence_number"],
-                        "type": "question",
-                        "question_id": row["question_id"],
-                        "question": row["question"],
-                        "reason": row.get("reason"),
-                        "status": row["status"],
-                        "asked_at": row["asked_at"],
-                        "deadline_at": row["deadline_at"],
-                    }
-                    for row in questions
-                ]
+                events = [question.to_event() for question in questions]
                 next_after = max(
                     (event["sequence"] for event in events),
                     default=after,
@@ -2743,22 +2668,20 @@ class CallService:
             with suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(notifier.wait(), remaining)
 
-    async def answer_call_question(
-        self,
-        call_id: str,
-        question_id: str,
-        answer: str,
-    ) -> dict[str, Any]:
+    async def answer_call_question(self, command: AnswerCommand) -> dict[str, Any]:
+        call_id = command.call_id
+        question_id = command.question_id
         logger.info(
-            "answer_call_question received call_id=%s question_id=%s answer_chars=%s",
+            "answer_call_question received call_id=%s question_id=%s answer_chars=%s resolution=%s",
             call_id,
             question_id,
-            len(answer),
+            len(command.answer),
+            command.resolution.value,
         )
-        row = await self.db.claim_question_answer(call_id, question_id, answer)
-        if row is not None:
+        answered = await self.db.claim_question_answer_record(call_id, question_id, command.answer)
+        if answered is not None:
             self._spawn(
-                self._deliver_question_answer(call_id, row),
+                self._deliver_question_answer(call_id, answered),
                 name=f"deliver-question:{call_id}:{question_id}",
                 must_finish=True,
             )
@@ -2772,20 +2695,20 @@ class CallService:
                 "question_id": question_id,
                 "next_action": (
                     "Answer accepted. Resume polling: call wait_for_call_event with "
-                    f"after_sequence={row['sequence_number']}. " + ASK_AGENT_POLL_WARNING
+                    f"after_sequence={answered.sequence_number}. " + ASK_AGENT_POLL_WARNING
                 ),
             }
 
-        existing = await self.db.get_question(question_id)
-        if existing is None or existing.get("call_id") != call_id:
+        existing = await self.db.get_question_record(question_id)
+        if existing is None or existing.call_id != call_id:
             logger.info(
                 "answer_call_question unknown question call_id=%s question_id=%s",
                 call_id,
                 question_id,
             )
             raise LookupError("unknown question")
-        status = existing.get("status")
-        if status == "answered":
+        status = existing.status.value
+        if status == QuestionStatus.ANSWERED.value:
             undelivered = self._undelivered_answers.get(call_id)
             if undelivered is not None and question_id in undelivered:
                 # Claim the retry before awaiting so a concurrent retry cannot also
@@ -2805,7 +2728,7 @@ class CallService:
                     # Restore the watchdog carve-out for the re-delivery window.
                     self._pending_questions[call_id] = PendingQuestion(
                         question_id=question_id,
-                        tool_call_id=existing["tool_call_id"],
+                        tool_call_id=existing.tool_call_id,
                         deadline_monotonic=time.monotonic(),
                         delivering=True,
                     )
@@ -2824,7 +2747,7 @@ class CallService:
                     "question_id": question_id,
                     "next_action": (
                         "Answer accepted. Resume polling: call wait_for_call_event with "
-                        f"after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
+                        f"after_sequence={existing.sequence_number}. " + ASK_AGENT_POLL_WARNING
                     ),
                 }
             logger.info(
@@ -2836,10 +2759,10 @@ class CallService:
                 "status": "already_answered",
                 "next_action": (
                     "Question already answered. Resume polling: call wait_for_call_event "
-                    f"with after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
+                    f"with after_sequence={existing.sequence_number}. " + ASK_AGENT_POLL_WARNING
                 ),
             }
-        if status == "expired":
+        if status == QuestionStatus.EXPIRED.value:
             logger.info(
                 "answer_call_question expired call_id=%s question_id=%s",
                 call_id,
@@ -2850,10 +2773,10 @@ class CallService:
                 "detail": "timeout already sent to the agent",
                 "next_action": (
                     "Answer window already expired. Resume polling: call wait_for_call_event "
-                    f"with after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
+                    f"with after_sequence={existing.sequence_number}. " + ASK_AGENT_POLL_WARNING
                 ),
             }
-        if status == "cancelled":
+        if status == QuestionStatus.CANCELLED.value:
             logger.info(
                 "answer_call_question call_ended call_id=%s question_id=%s status=%s",
                 call_id,
@@ -2881,7 +2804,7 @@ class CallService:
             "status": "already_answered",
             "next_action": (
                 "Question already handled. Resume polling: call wait_for_call_event "
-                f"with after_sequence={existing['sequence_number']}. " + ASK_AGENT_POLL_WARNING
+                f"with after_sequence={existing.sequence_number}. " + ASK_AGENT_POLL_WARNING
             ),
         }
 
@@ -3165,16 +3088,11 @@ class CallService:
                 call = None
                 claim_error = exc
             if call is None and claim_error is not None:
-                current = await self.db.get_call(call_id)
-                exact_claim = bool(
-                    current
-                    and current.get("state") == CallState.TERMINATING.value
-                    and current.get("termination_claimed")
-                    and current.get("termination_reason") == reason
-                )
-                if not exact_claim:
+                row = await self.db.get_call(call_id)
+                current = LifecycleRecord.from_row(row) if row is not None else None
+                if current is None or not current.claimed_terminating(reason):
                     raise claim_error
-                call = current
+                call = row
                 logger.warning("reconciled ambiguous termination claim call_id=%s", call_id)
             if call is not None:
                 transfer_task = self._owner_transfer_tasks.get(call_id)
@@ -3182,13 +3100,13 @@ class CallService:
                 # teardown and mark a question answered after the call left ACTIVE.
                 self._pending_questions.pop(call_id, None)
                 try:
-                    cancelled = await self.db.cancel_pending_questions(call_id)
-                    for cancelled_row in cancelled:
+                    cancelled = await self.db.cancel_pending_question_records(call_id)
+                    for cancelled_question in cancelled:
                         logger.info(
                             "ask_agent question cancelled call_id=%s question_id=%s "
                             "reason=termination_claim reason_code=%s",
                             call_id,
-                            cancelled_row["question_id"],
+                            cancelled_question.question_id,
                             reason,
                         )
                 except Exception:
@@ -3199,12 +3117,10 @@ class CallService:
                     )
                 self._notify_call_event(call_id)
         if call is None:
-            current = await self.db.get_call(call_id)
+            current = await self.db.get_lifecycle_record(call_id)
             if current is None:
                 self._activity.clear(call_id)
-            elif CallState(current["state"]) in TERMINAL_STATES or current.get(
-                "termination_claimed"
-            ):
+            elif current.is_terminal or current.termination_claimed:
                 self._activity.tombstone(call_id)
             return False
 
@@ -3397,13 +3313,11 @@ class CallService:
             terminalized = False
             terminal_error = exc
         if not terminalized:
-            current = await self.db.get_call(call_id)
-            exact_terminal = bool(
-                current
-                and current.get("state") == terminal.value
-                and current.get("termination_claimed")
-                and current.get("termination_reason") == reason
-                and current.get("transfer_outcome") == expected_transfer_outcome
+            current = await self.db.get_lifecycle_record(call_id)
+            exact_terminal = current is not None and current.is_finished_termination(
+                state=terminal,
+                reason=reason,
+                transfer_outcome=expected_transfer_outcome,
             )
             if not exact_terminal:
                 if schedule_conference_retry and not preserve_conference:
@@ -3421,9 +3335,6 @@ class CallService:
                     reason,
                 )
                 return False
-            if current is None:
-                return False
-            call = current
             logger.warning(
                 "reconciled ambiguous terminal transition call_id=%s state=%s",
                 call_id,
@@ -3431,13 +3342,13 @@ class CallService:
             )
         self._clear_call_runtime_state(call_id)
         try:
-            cancelled = await self.db.cancel_pending_questions(call_id)
-            for cancelled_row in cancelled:
+            cancelled = await self.db.cancel_pending_question_records(call_id)
+            for cancelled_question in cancelled:
                 logger.info(
                     "ask_agent question cancelled call_id=%s question_id=%s "
                     "reason=termination_finished reason_code=%s",
                     call_id,
-                    cancelled_row["question_id"],
+                    cancelled_question.question_id,
                     reason,
                 )
         except Exception:

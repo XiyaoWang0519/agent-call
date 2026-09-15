@@ -19,7 +19,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
-from app.evaluation import LIVE_CALLS_DISABLED_CODE
+from app.errors import ERROR_MESSAGES, ErrorCode
 from app.main import create_app
 from app.mcp_tools import register_tools
 from app.models import AnswerCallQuestionRequest
@@ -59,7 +59,13 @@ EXPECTED_ERROR_CODES = {
     "plan_not_found",
     "plan_unavailable",
     "supervision_unavailable",
+    "unknown_question",
 }
+
+# A lifecycle transition must go through a named promote/claim/finish method. The
+# generic updater still accepts `state` for historical fixtures, so this scan is what
+# keeps new production code from growing another anonymous state write.
+_RAW_STATE_UPDATE = re.compile(r"update_call\([^)]*\bstate\s*=")
 
 
 async def _registered_tools(get_service=None):
@@ -124,12 +130,28 @@ def test_http_route_paths_are_frozen(settings: Settings) -> None:
 
 
 def test_tool_error_codes_are_frozen() -> None:
+    # The registry is the contract: adding or renaming a code means editing both the
+    # enum and this set, which is the point.
+    assert {code.value for code in ErrorCode} == EXPECTED_ERROR_CODES
+    assert set(ERROR_MESSAGES) == set(ErrorCode)
+
+
+def test_no_adhoc_error_code_literals_outside_the_registry() -> None:
     code_pattern = re.compile(r'"code":\s*"([a-z_]+)"')
     found: set[str] = set()
     for path in (ROOT / "app").rglob("*.py"):
+        if path.name == "errors.py":
+            continue
         found.update(code_pattern.findall(path.read_text(encoding="utf-8")))
-    found.add(LIVE_CALLS_DISABLED_CODE)
-    assert found == EXPECTED_ERROR_CODES
+    assert found == set()
+
+
+def test_app_code_never_writes_call_state_through_generic_update() -> None:
+    assert [
+        path
+        for path in (ROOT / "app").rglob("*.py")
+        if _RAW_STATE_UPDATE.search(path.read_text(encoding="utf-8"))
+    ] == []
 
 
 def test_answer_source_declarations_are_required_by_the_request_model() -> None:

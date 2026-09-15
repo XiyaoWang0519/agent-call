@@ -152,10 +152,10 @@ class OwnerTransferCoordinator:
         call = await self._db.get_call(call_id)
         if call is None:
             return None, "call not found"
-        plan = await self._db.get_plan(call["plan_id"])
+        plan = await self._db.get_plan_record(call["plan_id"])
         if plan is None:
             return None, "call plan not found"
-        packet = ContextPacket.model_validate(plan["context"])
+        packet = plan.context
         if packet.escalation.mode != "transfer_to_owner":
             return None, "owner transfer is not authorized"
 

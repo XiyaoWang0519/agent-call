@@ -14,6 +14,7 @@ from typing import Any
 from app.db.deployment import DeploymentLockedError, _lock_is_active
 from app.db.engine import _iso_now
 from app.models import TERMINAL_STATES, CallState
+from app.records import PlanRecord
 
 
 class ClaimOutcome(StrEnum):
@@ -59,6 +60,12 @@ class PlansMixin:
 
     async def get_plan(self: DatabaseAccess, plan_id: str) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM plans WHERE plan_id = ?", (plan_id,))
+
+    async def get_plan_record(self: DatabaseAccess, plan_id: str) -> PlanRecord | None:
+        """Typed adapter over the same read used by :meth:`get_plan`."""
+
+        row = await self.get_plan(plan_id)
+        return PlanRecord.from_row(row) if row is not None else None
 
     async def claim_plan_and_create_call(
         self: DatabaseAccess,
