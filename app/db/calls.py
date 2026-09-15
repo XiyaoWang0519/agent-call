@@ -250,6 +250,76 @@ class CallsMixin:
             (replacement.value, _iso_now(), call_id, expected.value),
         )
 
+    async def adopt_participant(
+        self: DatabaseAccess,
+        call_id: str,
+        *,
+        kind: str,
+        call_sid: str,
+        conference_sid: str | None,
+    ) -> bool:
+        """Take ownership of a freshly created participant leg only while the call is open.
+
+        The state predicate is the linearization point against termination: if a
+        termination claim commits first, adoption fails and the caller compensates
+        instead of reporting a successful leg on a closed call. ``COALESCE`` keeps an
+        existing conference SID when the provider omits it.
+        """
+        if kind == "agent":
+            column = "twilio_ai_call_sid"
+        elif kind == "callee":
+            column = "twilio_callee_call_sid"
+        else:
+            raise ValueError(f"invalid participant kind: {kind}")
+        placeholders, terminal_params = self._in_clause(
+            sorted(state.value for state in TERMINAL_STATES)
+        )
+        return await self._execute_cas(
+            f"""UPDATE calls
+                SET {column}=?, conference_sid=COALESCE(?, conference_sid), last_event_at=?
+                WHERE call_id=? AND state NOT IN ({placeholders}) AND state != ?""",  # noqa: S608
+            (
+                call_sid,
+                conference_sid,
+                _iso_now(),
+                call_id,
+                *terminal_params,
+                CallState.TERMINATING.value,
+            ),
+        )
+
+    async def adopt_media_stream(self: DatabaseAccess, call_id: str, stream_sid: str) -> bool:
+        """Persist a carrier stream SID only while the call is still open."""
+        placeholders, terminal_params = self._in_clause(
+            sorted(state.value for state in TERMINAL_STATES)
+        )
+        return await self._execute_cas(
+            f"""UPDATE calls SET media_stream_sid=?, last_event_at=?
+                WHERE call_id=? AND state NOT IN ({placeholders}) AND state != ?""",  # noqa: S608
+            (stream_sid, _iso_now(), call_id, *terminal_params, CallState.TERMINATING.value),
+        )
+
+    async def claim_callee_dial(self: DatabaseAccess, call_id: str) -> bool:
+        """Atomically claim the one-shot right to dial the callee.
+
+        The claim carries its own lifecycle predicate instead of relying on a
+        separate read plus a generic flag toggle: a call that is already
+        terminating (or that lost ``termination_claimed=0``) can never acquire
+        the dial right after termination wins. Setup states are limited to the
+        pre-activation window where the callee leg is legitimately created.
+        """
+        return await self._execute_cas(
+            """UPDATE calls SET callee_dialed=1, last_event_at=?
+               WHERE call_id=? AND callee_dialed=0 AND termination_claimed=0
+                 AND state IN (?, ?)""",
+            (
+                _iso_now(),
+                call_id,
+                CallState.PREWARMING.value,
+                CallState.READY_TO_ACTIVATE.value,
+            ),
+        )
+
     async def set_flag_once(self: DatabaseAccess, call_id: str, flag: str) -> bool:
         allowed = {
             "sideband_open",

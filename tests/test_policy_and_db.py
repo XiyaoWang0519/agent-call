@@ -449,7 +449,7 @@ async def test_prepare_requires_authority_and_owner_request(service, packet):
     )
     assert output.plan_id is None
     assert output.missing_fields == ["requested_by_owner", "authority_basis"]
-    assert service._test_twilio.agent_creates == 0
+    assert service.twilio.agent_creates == 0
 
 
 @pytest.mark.asyncio
@@ -473,7 +473,7 @@ async def test_plan_can_only_be_claimed_once(service, packet):
             confirmation_text=prepared.confirmation_summary,
         )
     assert first.state.value == "prewarming"
-    assert service._test_twilio.agent_creates == 1
+    assert service.twilio.agent_creates == 1
 
 
 @pytest.mark.asyncio
@@ -491,7 +491,7 @@ async def test_start_rejects_confirmation_text_from_another_plan(service, packet
             explicit_confirmation=True,
             confirmation_text="Yes, make some call.",
         )
-    assert service._test_twilio.agent_creates == 0
+    assert service.twilio.agent_creates == 0
     assert (await service.db.get_plan(prepared.plan_id))["state"] == "prepared"
 
 

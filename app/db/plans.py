@@ -6,12 +6,39 @@ if TYPE_CHECKING:
     from app.db.protocols import DatabaseAccess
 
 import json
+from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from app.db.deployment import DeploymentLockedError, _lock_is_active
 from app.db.engine import _iso_now
-from app.models import CallState
+from app.models import TERMINAL_STATES, CallState
+
+
+class ClaimOutcome(StrEnum):
+    """Why a confirmed plan was or was not turned into a call.
+
+    ``busy``/``call_ending`` are distinct from ``plan_unavailable`` so callers can
+    return a stable error code instead of reporting an unconsumed plan as expired.
+    """
+
+    CLAIMED = "claimed"
+    PLAN_UNAVAILABLE = "plan_unavailable"
+    BUSY = "call_busy"
+    CALL_ENDING = "call_ending"
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimResult:
+    outcome: ClaimOutcome
+
+    @property
+    def claimed(self) -> bool:
+        return self.outcome is ClaimOutcome.CLAIMED
+
+    def __bool__(self) -> bool:
+        return self.claimed
 
 
 class PlansMixin:
@@ -40,7 +67,21 @@ class PlansMixin:
         call_id: str,
         conference_name: str,
         confirmation_text: str,
-    ) -> bool:
+        enforce_single_call_capacity: bool = True,
+    ) -> ClaimResult:
+        """Atomically consume a plan and create its call, or explain why not.
+
+        Deployment-lock check, single-use plan consumption, single-live-call
+        capacity, and the ``calls`` INSERT all run in one ``BEGIN IMMEDIATE``
+        transaction. A rejected claim leaves the plan ``prepared`` (rollback), so a
+        transient ``busy``/``call_ending`` does not burn the confirmation.
+
+        Capacity is checked only when ``enforce_single_call_capacity`` is true; the
+        production entry point leaves it on, while multi-call historical fixtures
+        that seed stranded rows explicitly opt out. This claim is a local admission
+        decision, not a distributed exactly-once guarantee: a remote participant is
+        not created until the caller observes ``CLAIMED``.
+        """
         now = _iso_now()
         async with self._write_connection() as conn:
             await conn.execute("BEGIN IMMEDIATE")
@@ -62,7 +103,21 @@ class PlansMixin:
             )
             if cursor.rowcount != 1:
                 await conn.rollback()
-                return False
+                return ClaimResult(ClaimOutcome.PLAN_UNAVAILABLE)
+            if enforce_single_call_capacity:
+                placeholders, terminal_params = self._in_clause(
+                    state.value for state in TERMINAL_STATES
+                )
+                cursor = await conn.execute(
+                    f"SELECT state FROM calls WHERE state NOT IN ({placeholders}) LIMIT 1",  # noqa: S608
+                    terminal_params,
+                )
+                active = await cursor.fetchone()
+                if active is not None:
+                    await conn.rollback()
+                    if CallState(active["state"]) is CallState.TERMINATING:
+                        return ClaimResult(ClaimOutcome.CALL_ENDING)
+                    return ClaimResult(ClaimOutcome.BUSY)
             await conn.execute(
                 """INSERT INTO calls
                    (call_id, plan_id, state, conference_name, last_event_at, created_at, started_at)
@@ -78,4 +133,4 @@ class PlansMixin:
                 ),
             )
             await conn.commit()
-            return True
+            return ClaimResult(ClaimOutcome.CLAIMED)

@@ -57,7 +57,7 @@ async def test_hold_detection_disabled_ignores_hold_phrase(service, packet):
     await wait_background()
 
     assert call_id not in service._hold_state
-    assert service._test_live.suspend_calls == []
+    assert service.live.suspend_calls == []
 
 
 @pytest.mark.asyncio
@@ -101,8 +101,8 @@ async def test_hold_reannouncement_stays_on_hold(hold_service, packet):
     await wait_background()
 
     assert call_id in hold_service._hold_state
-    assert hold_service._test_live.request_response_calls == []
-    assert ("session.update", call_id) not in hold_service._test_live.events
+    assert hold_service.live.request_response_calls == []
+    assert ("session.update", call_id) not in hold_service.live.events
 
 
 @pytest.mark.asyncio
@@ -115,14 +115,14 @@ async def test_report_hold_tool_enters_hold_and_suppresses_continuation(hold_ser
     await wait_background()
 
     assert call_id in hold_service._hold_state
-    assert call_id in hold_service._test_live.suspend_calls
+    assert call_id in hold_service.live.suspend_calls
     result_index = next(
         index
-        for index, result in enumerate(hold_service._test_live.tool_results)
+        for index, result in enumerate(hold_service.live.tool_results)
         if result[1] == "tc_hold"
     )
-    assert hold_service._test_live.tool_results[result_index][2] == {"status": "holding"}
-    assert hold_service._test_live.tool_result_continuations[result_index] is False
+    assert hold_service.live.tool_results[result_index][2] == {"status": "holding"}
+    assert hold_service.live.tool_result_continuations[result_index] is False
 
 
 @pytest.mark.asyncio
@@ -135,11 +135,11 @@ async def test_report_hold_tool_when_not_active_leaves_model_talking(hold_servic
     assert call_id not in hold_service._hold_state
     result_index = next(
         index
-        for index, result in enumerate(hold_service._test_live.tool_results)
+        for index, result in enumerate(hold_service.live.tool_results)
         if result[1] == "tc_hold_2"
     )
-    assert hold_service._test_live.tool_results[result_index][2] == {"status": "not_on_hold"}
-    assert hold_service._test_live.tool_result_continuations[result_index] is False
+    assert hold_service.live.tool_results[result_index][2] == {"status": "not_on_hold"}
+    assert hold_service.live.tool_result_continuations[result_index] is False
 
 
 @pytest.mark.asyncio
@@ -156,7 +156,7 @@ async def test_termination_while_on_hold_clears_hold_state(hold_service, packet)
 @pytest.mark.asyncio
 async def test_enter_hold_returns_false_when_suspend_fails(hold_service, packet):
     call_id = await seed_call(hold_service.db, packet, state=CallState.ACTIVE)
-    hold_service._test_live.suspend_failures_remaining = 1
+    hold_service.live.suspend_failures_remaining = 1
 
     entered = await hold_service._enter_hold(call_id, trigger="test")
 
@@ -185,8 +185,8 @@ async def test_menu_or_question_does_not_suspend_responses(hold_service, packet,
     await hold_service.handle_live_event(call_id, _transcript_event(text))
 
     assert call_id not in hold_service._hold_state
-    assert hold_service._test_live.suspend_calls == []
-    assert ("cancel_response", call_id) not in hold_service._test_live.events
+    assert hold_service.live.suspend_calls == []
+    assert ("cancel_response", call_id) not in hold_service.live.events
     assert hold_service._active_response_ids[call_id] == "first_reply"
 
 
@@ -200,10 +200,10 @@ async def test_backend_resumes_hold_without_a_separate_voice_turn(hold_service, 
         call_id, _tool_event("resume", "report_hold", '{"holding":false}')
     )
     assert call_id not in hold_service._hold_state
-    assert ("session.instructions.append", call_id) in hold_service._test_live.events
-    assert not hold_service._test_live.request_response_calls
-    assert hold_service._test_live.tool_results[-1][2] == {"status": "resumed"}
-    assert hold_service._test_live.tool_result_continuations[-1] is False
+    assert ("session.instructions.append", call_id) in hold_service.live.events
+    assert not hold_service.live.request_response_calls
+    assert hold_service.live.tool_results[-1][2] == {"status": "resumed"}
+    assert hold_service.live.tool_result_continuations[-1] is False
 
 
 async def test_partial_transcript_cannot_mute_menu_mid_sentence(hold_service, packet):
@@ -211,7 +211,7 @@ async def test_partial_transcript_cannot_mute_menu_mid_sentence(hold_service, pa
     for i, text in enumerate(["Please hold", ", or press one", " for a callback."]):
         await hold_service.handle_live_event(call_id, _transcript_event(text, str(i)))
     assert call_id not in hold_service._hold_state
-    assert not hold_service._test_live.suspend_calls
+    assert not hold_service.live.suspend_calls
 
 
 async def test_invalid_hold_state_does_not_change_conversation(hold_service, packet):
@@ -220,4 +220,4 @@ async def test_invalid_hold_state_does_not_change_conversation(hold_service, pac
         call_id, _tool_event("bad", "report_hold", '{"holding":"false"}')
     )
     assert call_id not in hold_service._hold_state
-    assert hold_service._test_live.tool_results[-1][2]["error"] == "invalid_hold_request"
+    assert hold_service.live.tool_results[-1][2]["error"] == "invalid_hold_request"

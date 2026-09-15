@@ -32,9 +32,7 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --all-groups --frozen
 
-      - name: Verify application
-        run: |
-          uv run ruff format --check app tests scripts
-          uv run ruff check app tests scripts
-          uv run mypy app
-          uv run pytest -q --cov=app
+      - name: Verify application (shared gate)
+        # Keep this identical to the deploy workflow's gate: both call
+        # scripts/verify.sh so the lint scope and coverage floor cannot drift.
+        run: bash scripts/verify.sh

@@ -47,11 +47,11 @@ async def test_search_web_returns_compact_evidence_and_records_latency(service, 
     )
     await wait_background()
 
-    assert service._test_exa.queries == ["latest Example Clinic hours"]
-    assert service._test_live.tool_results[-1] == (
+    assert service.exa.queries == ["latest Example Clinic hours"]
+    assert service.live.tool_results[-1] == (
         call_id,
         "tool_search",
-        service._test_exa.result.output,
+        service.exa.result.output,
     )
     call = await service.db.get_call(call_id)
     assert call["tool_call_count"] == 1
@@ -66,14 +66,14 @@ async def test_search_web_returns_compact_evidence_and_records_latency(service, 
 @pytest.mark.asyncio
 async def test_search_web_failure_continues_call_with_safe_error(service, packet):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
-    service._test_exa.error = ExaSearchError("search_rate_limited")
+    service.exa.error = ExaSearchError("search_rate_limited")
 
     await service.handle_live_event(
         call_id,
         _tool_event("tool_search", "search_web", '{"query":"current opening hours"}'),
     )
 
-    assert service._test_live.tool_results[-1][2] == {
+    assert service.live.tool_results[-1][2] == {
         "ok": False,
         "error": "search_rate_limited",
     }
@@ -95,8 +95,8 @@ async def test_search_web_rejects_model_control_of_provider_parameters(service, 
         ),
     )
 
-    assert service._test_exa.queries == []
-    assert service._test_live.tool_results[-1][2] == {
+    assert service.exa.queries == []
+    assert service.live.tool_results[-1][2] == {
         "ok": False,
         "error": "invalid_search_request",
     }
@@ -133,7 +133,7 @@ async def test_invalid_tool_result_is_sent_before_single_fused_write_finishes(
 
     await asyncio.wait_for(write_started.wait(), timeout=2)
     await asyncio.sleep(0)
-    assert service._test_live.tool_results[-1][1] == "tool_fast"
+    assert service.live.tool_results[-1][1] == "tool_fast"
     assert not handling.done()
 
     release_write.set()
@@ -170,13 +170,13 @@ async def test_valid_advisory_is_durable_before_accepted_output(service, packet,
 
     await asyncio.wait_for(write_started.wait(), timeout=2)
     await asyncio.sleep(0)
-    assert service._test_live.tool_results == []
+    assert service.live.tool_results == []
 
     release_write.set()
     await asyncio.wait_for(handling, timeout=2)
     call = await service.db.get_call(call_id)
     assert call["advisory_outcome"]["summary"] == "Done"
-    assert service._test_live.tool_results[-1][2] == {"accepted": True}
+    assert service.live.tool_results[-1][2] == {"accepted": True}
 
 
 @pytest.mark.asyncio
@@ -249,7 +249,7 @@ async def test_advisory_persistence_failure_sends_rejection_and_propagates(
         )
 
     # The model must still receive a tool result even though its outcome was lost.
-    assert service._test_live.tool_results[-1] == (
+    assert service.live.tool_results[-1] == (
         call_id,
         "tool_advisory_fail",
         {"accepted": False, "error": "outcome could not be persisted"},
@@ -320,12 +320,12 @@ async def test_transfer_runs_in_background_and_duplicate_creates_one_owner(
 
     async def blocked_create(**kwargs):
         del kwargs
-        service._test_twilio.owner_creates += 1
+        service.twilio.owner_creates += 1
         create_started.set()
         await release_create.wait()
         return ParticipantInfo("CA" + "c" * 32, "CF" + "a" * 32)
 
-    monkeypatch.setattr(service._test_twilio, "create_owner_participant", blocked_create)
+    monkeypatch.setattr(service.twilio, "create_owner_participant", blocked_create)
     await service._handle_tool_call(
         call_id,
         _tool_event("tool_transfer_1", "transfer_to_owner", '{"reason":"owner needed"}')["event"][
@@ -340,8 +340,8 @@ async def test_transfer_runs_in_background_and_duplicate_creates_one_owner(
         call_id,
         _tool_event("tool_transfer_2", "transfer_to_owner", '{"reason":"again"}')["event"]["item"],
     )
-    assert service._test_twilio.owner_creates == 1
-    assert service._test_live.tool_results[-1][2]["accepted"] is False
+    assert service.twilio.owner_creates == 1
+    assert service.live.tool_results[-1][2]["accepted"] is False
 
     service._owner_join_events[call_id].set()
     release_create.set()
@@ -392,11 +392,11 @@ async def test_cancel_after_termination_claim_still_finishes_media_and_terminal_
     release_hangup = asyncio.Event()
 
     async def blocked_hangup(openai_call_id):
-        service._test_live.hangups.append(openai_call_id)
+        service.live.hangups.append(openai_call_id)
         hangup_started.set()
         await release_hangup.wait()
 
-    monkeypatch.setattr(service._test_live, "hangup", blocked_hangup)
+    monkeypatch.setattr(service.live, "hangup", blocked_hangup)
     terminating = asyncio.create_task(service.terminate_call(call_id, "owner_request"))
     await asyncio.wait_for(hangup_started.wait(), timeout=2)
     claimed = await service.db.get_call(call_id)
@@ -411,8 +411,8 @@ async def test_cancel_after_termination_claim_still_finishes_media_and_terminal_
 
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
-    assert service._test_live.closed == [call_id]
+    assert service.twilio.completed == ["CF" + "a" * 32]
+    assert service.live.closed == [call_id]
 
 
 @pytest.mark.asyncio
@@ -430,7 +430,7 @@ async def test_termination_claim_commit_then_raise_is_reconciled(service, packet
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
     assert call["termination_reason"] == "owner_request"
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -449,7 +449,7 @@ async def test_joining_claim_commit_then_raise_spawns_one_transfer_worker(
     result = await service.transfer_to_owner(call_id, "owner needed")
 
     assert result["accepted"] is True
-    assert service._test_twilio.owner_creates == 1
+    assert service.twilio.owner_creates == 1
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.TRANSFERRED.value
     assert call["twilio_owner_call_sid"] == "CA" + "c" * 32
@@ -465,12 +465,12 @@ async def test_termination_waits_for_late_owner_create_and_cleans_sid_once(
 
     async def late_create(**kwargs):
         del kwargs
-        service._test_twilio.owner_creates += 1
+        service.twilio.owner_creates += 1
         create_started.set()
         await release_create.wait()
         return ParticipantInfo("CA" + "c" * 32, "CF" + "a" * 32)
 
-    monkeypatch.setattr(service._test_twilio, "create_owner_participant", late_create)
+    monkeypatch.setattr(service.twilio, "create_owner_participant", late_create)
     await service._handle_tool_call(
         call_id,
         _tool_event("tool_transfer", "transfer_to_owner", '{"reason":"owner needed"}')["event"][
@@ -487,8 +487,8 @@ async def test_termination_waits_for_late_owner_create_and_cleans_sid_once(
 
     owner_sid = "CA" + "c" * 32
     conference = "CF" + "a" * 32
-    assert service._test_twilio.removed.count((conference, owner_sid)) == 1
-    assert service._test_twilio.completed == [conference]
+    assert service.twilio.removed.count((conference, owner_sid)) == 1
+    assert service.twilio.completed == [conference]
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
     assert call["transfer_outcome"] == "failed:termination_won"
@@ -508,12 +508,12 @@ async def test_owner_join_timeout_cleanup_failure_completes_conference(
         raise RuntimeError("Twilio cleanup failed")
 
     monkeypatch.setattr(owner_transfer_module, "OWNER_JOIN_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(service._test_twilio, "remove_participant", failed_remove)
+    monkeypatch.setattr(service.twilio, "remove_participant", failed_remove)
     result = await service.transfer_to_owner(call_id, "owner needed")
 
     assert result["accepted"] is False
     assert attempts == ["CA" + "c" * 32]
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert call["termination_reason"] == "transfer_cleanup_failed"
@@ -525,7 +525,7 @@ async def test_required_conference_completion_failure_stays_recoverable(
 ):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     attempts = 0
-    original_complete = service._test_twilio.complete_conference
+    original_complete = service.twilio.complete_conference
 
     async def failed_complete(_conference):
         nonlocal attempts
@@ -533,21 +533,21 @@ async def test_required_conference_completion_failure_stays_recoverable(
         raise RuntimeError("Twilio unavailable")
 
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_RETRY_DELAY_SECONDS", 0)
-    monkeypatch.setattr(service._test_twilio, "complete_conference", failed_complete)
+    monkeypatch.setattr(service.twilio, "complete_conference", failed_complete)
     assert await service.terminate_call(call_id, "owner_request") is False
 
     stranded = await service.db.get_call(call_id)
     assert attempts == 2
     assert stranded["state"] == CallState.TERMINATING.value
     assert stranded["termination_claimed"] == 1
-    assert service._test_finalizer.states_seen == []
+    assert service.finalizer.states_seen == []
 
-    monkeypatch.setattr(service._test_twilio, "complete_conference", original_complete)
+    monkeypatch.setattr(service.twilio, "complete_conference", original_complete)
     await service.recover_startup()
     recovered = await service.db.get_call(call_id)
     assert recovered["state"] == CallState.FAILED.value
     assert recovered["termination_reason"] == "startup_recovery"
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -557,7 +557,7 @@ async def test_required_conference_completion_succeeds_via_live_background_retry
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     attempts = 0
     recovered = asyncio.Event()
-    original_complete = service._test_twilio.complete_conference
+    original_complete = service.twilio.complete_conference
 
     async def transient_complete(conference):
         nonlocal attempts
@@ -569,7 +569,7 @@ async def test_required_conference_completion_succeeds_via_live_background_retry
 
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS", 0)
-    monkeypatch.setattr(service._test_twilio, "complete_conference", transient_complete)
+    monkeypatch.setattr(service.twilio, "complete_conference", transient_complete)
 
     assert await service.terminate_call(call_id, "owner_request") is False
     await asyncio.wait_for(recovered.wait(), timeout=2)
@@ -580,7 +580,7 @@ async def test_required_conference_completion_succeeds_via_live_background_retry
 
     assert attempts == 3
     assert (await service.db.get_call(call_id))["state"] == CallState.COMPLETED.value
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -602,7 +602,7 @@ async def test_shutdown_cancels_failed_background_retry_after_current_attempt(
 
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS", 0)
-    monkeypatch.setattr(service._test_twilio, "complete_conference", fail_with_blocked_background)
+    monkeypatch.setattr(service.twilio, "complete_conference", fail_with_blocked_background)
 
     assert await service.terminate_call(call_id, "owner_request") is False
     await asyncio.wait_for(background_attempt_started.wait(), timeout=2)
@@ -641,7 +641,7 @@ async def test_startup_recovery_continues_other_rows_during_sustained_twilio_fai
     healthy_conference = "CF" + "h" * 32
     await service.db.update_call(failing_call, conference_sid=failing_conference)
     await service.db.update_call(healthy_call, conference_sid=healthy_conference)
-    original_complete = service._test_twilio.complete_conference
+    original_complete = service.twilio.complete_conference
 
     async def selectively_fail(conference):
         if conference == failing_conference:
@@ -652,13 +652,13 @@ async def test_startup_recovery_continues_other_rows_during_sustained_twilio_fai
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS", 0.01)
     monkeypatch.setattr(call_state_module, "TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS", 0.01)
-    monkeypatch.setattr(service._test_twilio, "complete_conference", selectively_fail)
+    monkeypatch.setattr(service.twilio, "complete_conference", selectively_fail)
 
     await asyncio.wait_for(service.recover_startup(), timeout=2)
 
     assert (await service.db.get_call(failing_call))["state"] == CallState.TERMINATING.value
     assert (await service.db.get_call(healthy_call))["state"] == CallState.FAILED.value
-    assert healthy_conference in service._test_twilio.completed
+    assert healthy_conference in service.twilio.completed
 
 
 @pytest.mark.asyncio
@@ -668,8 +668,8 @@ async def test_db_outage_after_owner_create_cleans_owner_before_conference(
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._owner_join_events.setdefault(call_id, asyncio.Event()).set()
     order: list[str] = []
-    original_remove = service._test_twilio.remove_participant
-    original_complete = service._test_twilio.complete_conference
+    original_remove = service.twilio.remove_participant
+    original_complete = service.twilio.complete_conference
 
     async def tracked_remove(conference, participant_call_sid):
         order.append("remove_owner")
@@ -683,8 +683,8 @@ async def test_db_outage_after_owner_create_cleans_owner_before_conference(
         del args, kwargs
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr(service._test_twilio, "remove_participant", tracked_remove)
-    monkeypatch.setattr(service._test_twilio, "complete_conference", tracked_complete)
+    monkeypatch.setattr(service.twilio, "remove_participant", tracked_remove)
+    monkeypatch.setattr(service.twilio, "complete_conference", tracked_complete)
     monkeypatch.setattr(service.db, "promote_transfer", db_unavailable)
     monkeypatch.setattr(service.db, "fail_joining_transfer", db_unavailable)
 
@@ -692,8 +692,8 @@ async def test_db_outage_after_owner_create_cleans_owner_before_conference(
 
     assert result["accepted"] is False
     assert order == ["remove_owner", "complete_conference"]
-    assert service._test_twilio.removed == [("CF" + "a" * 32, "CA" + "c" * 32)]
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.removed == [("CF" + "a" * 32, "CA" + "c" * 32)]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -704,7 +704,7 @@ async def test_failed_direct_compensation_is_owned_by_background_retry(
     service._owner_join_events.setdefault(call_id, asyncio.Event()).set()
     attempts = 0
     compensated = asyncio.Event()
-    original_complete = service._test_twilio.complete_conference
+    original_complete = service.twilio.complete_conference
 
     async def db_unavailable(*args, **kwargs):
         del args, kwargs
@@ -722,14 +722,14 @@ async def test_failed_direct_compensation_is_owned_by_background_retry(
     monkeypatch.setattr(service.db, "promote_transfer", db_unavailable)
     monkeypatch.setattr(service.db, "fail_joining_transfer", db_unavailable)
     monkeypatch.setattr(service.db, "fail_promoted_transfer", db_unavailable)
-    monkeypatch.setattr(service._test_twilio, "complete_conference", transient_complete)
+    monkeypatch.setattr(service.twilio, "complete_conference", transient_complete)
 
     result = await service.transfer_to_owner(call_id, "owner needed")
     await asyncio.wait_for(compensated.wait(), timeout=2)
 
     assert result["accepted"] is False
     assert attempts == 2
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -751,8 +751,8 @@ async def test_promotion_commit_then_exception_is_adopted_and_torn_down(
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert call["transfer_outcome"] == "failed:RuntimeError"
-    assert service._test_twilio.removed == [("CF" + "a" * 32, "CA" + "c" * 32)]
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.removed == [("CF" + "a" * 32, "CA" + "c" * 32)]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -775,7 +775,7 @@ async def test_completion_commit_then_exception_cannot_recover_as_transferred(
     assert call["state"] == CallState.FAILED.value
     assert call["transfer_outcome"] == "failed:RuntimeError"
     assert call["termination_reason"] == "transfer_failed:RuntimeError"
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -797,12 +797,12 @@ async def test_terminal_cas_failure_never_returns_success_and_ends_conference(
     assert call["state"] == CallState.TERMINATING.value
     assert call["transfer_outcome"] == "failed:terminal_cas"
     assert call["termination_reason"] == "transfer_failed:terminal_cas"
-    assert service._test_twilio.removed == [
+    assert service.twilio.removed == [
         ("CF" + "a" * 32, "CA" + "a" * 32),
         ("CF" + "a" * 32, "CA" + "c" * 32),
     ]
-    assert service._test_twilio.completed
-    assert service._test_finalizer.states_seen == []
+    assert service.twilio.completed
+    assert service.finalizer.states_seen == []
 
 
 @pytest.mark.asyncio
@@ -828,8 +828,8 @@ async def test_transferred_terminal_commit_ambiguity_preserves_handoff(
     assert call["state"] == CallState.TRANSFERRED.value
     assert call["termination_reason"] == "transfer_completed"
     assert call["transfer_outcome"] == "completed:owner needed"
-    assert service._test_twilio.completed == []
-    assert service._test_twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
+    assert service.twilio.completed == []
+    assert service.twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
 
 
 @pytest.mark.asyncio
@@ -848,8 +848,8 @@ async def test_terminal_transcript_failure_cannot_undo_transferred_call(
 
     assert result["accepted"] is True
     assert (await service.db.get_call(call_id))["state"] == CallState.TRANSFERRED.value
-    assert service._test_twilio.completed == []
-    assert service._test_twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
+    assert service.twilio.completed == []
+    assert service.twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
 
 
 @pytest.mark.asyncio
@@ -879,8 +879,8 @@ async def test_shutdown_cannot_cancel_transfer_after_terminal_commit(service, pa
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.TRANSFERRED.value
     assert call["transfer_outcome"] == "completed:owner needed"
-    assert service._test_twilio.completed == []
-    assert ("CF" + "a" * 32, "CA" + "c" * 32) not in service._test_twilio.removed
+    assert service.twilio.completed == []
+    assert ("CF" + "a" * 32, "CA" + "c" * 32) not in service.twilio.removed
 
 
 @pytest.mark.asyncio
@@ -927,15 +927,15 @@ async def test_owner_leave_after_join_aborts_before_ai_handoff(service, packet, 
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert call["transfer_outcome"] == "failed:OwnerTransferDeparted"
-    assert ("CF" + "a" * 32, "CA" + "a" * 32) not in service._test_twilio.removed
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert ("CF" + "a" * 32, "CA" + "a" * 32) not in service.twilio.removed
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
 async def test_ai_removal_failure_rolls_back_owner_and_fails_call(service, packet, monkeypatch):
     call_id = await seed_call(service.db, packet, state=CallState.ACTIVE)
     service._owner_join_events.setdefault(call_id, asyncio.Event()).set()
-    original_remove = service._test_twilio.remove_participant
+    original_remove = service.twilio.remove_participant
     ai_sid = "CA" + "a" * 32
 
     async def fail_ai_only(conference, participant_call_sid):
@@ -943,13 +943,13 @@ async def test_ai_removal_failure_rolls_back_owner_and_fails_call(service, packe
             raise RuntimeError("AI removal failed")
         await original_remove(conference, participant_call_sid)
 
-    monkeypatch.setattr(service._test_twilio, "remove_participant", fail_ai_only)
+    monkeypatch.setattr(service.twilio, "remove_participant", fail_ai_only)
     result = await service.transfer_to_owner(call_id, "owner needed")
 
     assert result["accepted"] is False
     conference = "CF" + "a" * 32
-    assert service._test_twilio.removed == [(conference, "CA" + "c" * 32)]
-    assert service._test_twilio.completed == [conference]
+    assert service.twilio.removed == [(conference, "CA" + "c" * 32)]
+    assert service.twilio.completed == [conference]
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert call["transfer_outcome"] == "failed:RuntimeError"
@@ -957,7 +957,7 @@ async def test_ai_removal_failure_rolls_back_owner_and_fails_call(service, packe
 
     retry = await service.transfer_to_owner(call_id, "retry")
     assert retry["accepted"] is False
-    assert service._test_twilio.owner_creates == 1
+    assert service.twilio.owner_creates == 1
 
 
 @pytest.mark.asyncio
@@ -993,12 +993,12 @@ async def test_startup_recovery_is_conservative_until_transfer_completed(
 
     call = await service.db.get_call(call_id)
     assert call["state"] == expected_state.value
-    assert bool(service._test_twilio.completed) is conference_completed
+    assert bool(service.twilio.completed) is conference_completed
     if expected_state == CallState.FAILED:
         assert call["transfer_outcome"] == "failed:startup_recovery"
     else:
         assert call["transfer_outcome"] == transfer_outcome
-        assert service._test_twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
+        assert service.twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1021,7 @@ async def test_completed_transfer_without_persisted_owner_sid_fails_closed_on_re
     assert call["state"] == CallState.FAILED.value
     assert call["transfer_outcome"] == "failed:owner_exit_unarmed"
     assert call["termination_reason"] == "transfer_failed:owner_exit_unarmed"
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
+    assert service.twilio.completed == ["CF" + "a" * 32]
 
 
 @pytest.mark.asyncio
@@ -1033,7 +1033,7 @@ async def test_transferred_owner_is_armed_to_end_conference_after_process_state_
     result = await service.transfer_to_owner(call_id, "owner needed")
 
     assert result["accepted"] is True
-    assert service._test_twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
+    assert service.twilio.end_on_exit == [("CF" + "a" * 32, "CA" + "c" * 32)]
     assert call_id not in service._owner_join_events
     await service.handle_participant_status(
         call_id,
@@ -1061,7 +1061,7 @@ async def test_shutdown_cancellation_cannot_interrupt_transfer_compensation(
         return await original_fail(*args, **kwargs)
 
     monkeypatch.setattr(owner_transfer_module, "OWNER_JOIN_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(service._test_twilio, "remove_participant", failed_owner_remove)
+    monkeypatch.setattr(service.twilio, "remove_participant", failed_owner_remove)
     monkeypatch.setattr(service.db, "fail_joining_transfer", blocked_failure_write)
 
     transferring = asyncio.create_task(service.transfer_to_owner(call_id, "owner needed"))
@@ -1076,8 +1076,8 @@ async def test_shutdown_cancellation_cannot_interrupt_transfer_compensation(
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert call["termination_reason"] == "service_shutdown"
-    assert service._test_twilio.completed
-    assert set(service._test_twilio.completed) == {"CF" + "a" * 32}
+    assert service.twilio.completed
+    assert set(service.twilio.completed) == {"CF" + "a" * 32}
 
 
 @pytest.mark.asyncio
@@ -1108,7 +1108,7 @@ async def test_stop_drains_joining_claim_committed_after_shutdown_snapshot(
     transfer_task, error = await asyncio.wait_for(starting, timeout=2)
     assert transfer_task is None
     assert error == "service is stopping"
-    assert service._test_twilio.owner_creates == 0
+    assert service.twilio.owner_creates == 0
     call = await service.db.get_call(call_id)
     assert call["transfer_outcome"] == "failed:service_stopping"
     assert service._background == set()
@@ -1123,9 +1123,9 @@ async def test_stop_fails_closed_for_an_unexpected_active_call(service, packet):
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert call["termination_reason"] == "service_shutdown"
-    assert service._test_live.hangups == ["rtc_test"]
-    assert service._test_twilio.completed == ["CF" + "a" * 32]
-    assert service._test_live.close_all_calls == 1
+    assert service.live.hangups == ["rtc_test"]
+    assert service.twilio.completed == ["CF" + "a" * 32]
+    assert service.live.close_all_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1142,7 +1142,7 @@ async def test_shutdown_cleans_owner_created_after_transfer_task_cancellation(
         await release_create.wait()
         return ParticipantInfo("CA" + "c" * 32, "CF" + "a" * 32)
 
-    monkeypatch.setattr(service._test_twilio, "create_owner_participant", late_create)
+    monkeypatch.setattr(service.twilio, "create_owner_participant", late_create)
     await service._handle_tool_call(
         call_id,
         _tool_event("tool_transfer", "transfer_to_owner", '{"reason":"owner needed"}')["event"][
@@ -1157,7 +1157,7 @@ async def test_shutdown_cleans_owner_created_after_transfer_task_cancellation(
     release_create.set()
     await asyncio.wait_for(stopping, timeout=2)
 
-    assert service._test_twilio.removed == [("CF" + "a" * 32, "CA" + "c" * 32)]
+    assert service.twilio.removed == [("CF" + "a" * 32, "CA" + "c" * 32)]
     assert call_id not in service._owner_transfer_tasks
 
 
@@ -1203,7 +1203,7 @@ async def test_transfer_claim_before_callee_joined_is_rejected(service, packet):
     assert result["error"] == "owner transfer already attempted or call is ending"
     call = await service.db.get_call(call_id)
     assert call["transfer_outcome"] is None
-    assert service._test_twilio.owner_creates == 0
+    assert service.twilio.owner_creates == 0
 
 
 @pytest.mark.asyncio

@@ -24,8 +24,8 @@ async def test_callee_is_not_dialed_until_accept_and_sideband_open(service, pack
         explicit_confirmation=True,
         confirmation_text=prepared.confirmation_summary,
     )
-    assert service._test_twilio.agent_creates == 1
-    assert service._test_twilio.callee_creates == 0
+    assert service.twilio.agent_creates == 1
+    assert service.twilio.callee_creates == 0
 
     mapped = await service.handle_openai_incoming(
         "rtc_incoming",
@@ -35,12 +35,12 @@ async def test_callee_is_not_dialed_until_accept_and_sideband_open(service, pack
         ],
     )
     assert mapped == started.call_id
-    assert service._test_live.accepts == [(started.call_id, "rtc_incoming")]
-    assert service._test_twilio.callee_creates == 0
+    assert service.live.accepts == [(started.call_id, "rtc_incoming")]
+    assert service.twilio.callee_creates == 0
 
     await service.handle_sideband_open(started.call_id)
-    assert service._test_twilio.callee_creates == 1
-    assert service._test_live.initial_updates == [started.call_id]
+    assert service.twilio.callee_creates == 1
+    assert service.live.initial_updates == [started.call_id]
     await wait_background()
     latency = await service.db.get_latency_events(started.call_id)
     assert [event["stage"] for event in latency] == [
@@ -70,7 +70,7 @@ async def test_unmapped_incoming_sip_call_is_explicitly_rejected(service):
                 {"name": "X-Bridge-Call-Id", "value": "call_unknown"},
             ],
         )
-    assert service._test_live.rejects == ["rtc_unknown"]
+    assert service.live.rejects == ["rtc_unknown"]
 
 
 @pytest.mark.asyncio
@@ -109,7 +109,7 @@ async def test_incoming_sip_requires_exact_call_and_plan_headers(service, packet
             ],
         )
 
-    assert service._test_live.rejects == [
+    assert service.live.rejects == [
         "rtc_missing_call_header",
         "rtc_missing_plan_header",
         "rtc_duplicate_header",
@@ -136,8 +136,8 @@ async def test_incoming_sip_binding_is_atomic(service, packet):
     assert sum(isinstance(result, RuntimeError) for result in results) == 1
     call = await service.db.get_call(call_id)
     assert call["openai_call_id"] in {"rtc_first", "rtc_second"}
-    assert len(service._test_live.accepts) == 1
-    assert len(service._test_live.rejects) == 1
+    assert len(service.live.accepts) == 1
+    assert len(service.live.rejects) == 1
 
 
 @pytest.mark.asyncio
@@ -240,24 +240,24 @@ async def test_conflicting_duplicate_amd_cannot_override_first_result(service, p
     assert call["answered_by"] == "human"
     assert call["answer_handling"] == "human"
     assert call["state"] == CallState.ACTIVE.value
-    assert service._test_live.hangups == []
+    assert service.live.hangups == []
 
 
 @pytest.mark.parametrize("bad_session", [{}, {"model": "gpt-realtime-2.1"}])
 async def test_mismatched_session_fails_before_dialing(service, packet, bad_session):
     call_id = await seed_call(service.db, packet)
-    service._test_live.initial_update_event = {"type": "session.updated", "session": bad_session}
+    service.live.initial_update_event = {"type": "session.updated", "session": bad_session}
     await service.handle_sideband_open(call_id)
     call = await service.db.get_call(call_id)
     assert call["termination_reason"] == "live_session_config_mismatch"
-    assert service._test_twilio.callee_creates == 0
+    assert service.twilio.callee_creates == 0
 
 
 async def test_activation_requires_callee_answer_and_monitor_before_unmute(service, packet):
     call_id = await seed_call(service.db, packet)
     await service.handle_sideband_open(call_id)
     await service.handle_conference_event(call_id, {"StatusCallbackEvent": "conference-start"})
-    assert not service._test_twilio.unmuted
+    assert not service.twilio.unmuted
     assert (await service.db.get_call(call_id))["state"] == "prewarming"
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
     call = await service.db.get_call(call_id)
@@ -265,12 +265,12 @@ async def test_activation_requires_callee_answer_and_monitor_before_unmute(servi
     assert call["live_session_verified"] == 1
     assert call["media_stream_sid"] == "MZ" + "d" * 32
     assert service._call_audio[call_id].connected
-    assert len(service._test_twilio.unmuted) == 1
-    assert service._test_live.events == [("session.instructions.append", call_id)]
+    assert len(service.twilio.unmuted) == 1
+    assert service.live.events == [("session.instructions.append", call_id)]
     # Duplicate callbacks cannot create a second monitor or introduction.
     await service.handle_participant_status(call_id, "callee", {"CallStatus": "in-progress"})
-    assert len(service._test_twilio.unmuted) == 1
-    assert len(service._test_live.events) == 1
+    assert len(service.twilio.unmuted) == 1
+    assert len(service.live.events) == 1
 
 
 async def test_agent_is_unmuted_before_conversation_is_enabled(service, packet, monkeypatch):
@@ -279,7 +279,7 @@ async def test_agent_is_unmuted_before_conversation_is_enabled(service, packet, 
 
     async def enable(candidate):
         assert candidate == call_id
-        assert service._test_twilio.unmuted
+        assert service.twilio.unmuted
 
     monkeypatch.setattr(service.live, "enable_conversation", enable)
     await service._check_activation_gate(call_id)
@@ -296,8 +296,8 @@ async def test_monitor_failure_prevents_conversation(service, packet, monkeypatc
     monkeypatch.setattr(service.twilio, "start_audio_monitor", fail)
     await service._check_activation_gate(call_id)
     assert (await service.db.get_call(call_id))["termination_reason"] == "live_activation_failed"
-    assert not service._test_twilio.unmuted
-    assert not service._test_live.events
+    assert not service.twilio.unmuted
+    assert not service.live.events
 
 
 @pytest.mark.parametrize("amd", ["human", "unknown", "machine_start", "machine_end_other"])
@@ -306,18 +306,18 @@ async def test_ambiguous_amd_does_not_authorize_voicemail(service, packet, amd):
     await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
     await service.handle_amd(call_id, amd)
     assert (await service.db.get_call(call_id))["state"] == "active"
-    assert ("voicemail", call_id) not in service._test_live.events
+    assert ("voicemail", call_id) not in service.live.events
 
 
 @pytest.mark.parametrize("amd", ["machine_end_beep", "machine_end_silence"])
 async def test_recording_ready_amd_authorizes_one_voicemail(service, packet, amd):
     call_id = await seed_call(service.db, packet)
     await service.handle_amd(call_id, amd)
-    assert not service._test_live.events
+    assert not service.live.events
     await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
     await service._check_activation_gate(call_id)
     await service.handle_amd(call_id, amd)
-    assert service._test_live.events.count(("voicemail", call_id)) == 1
+    assert service.live.events.count(("voicemail", call_id)) == 1
     assert (await service.db.get_call(call_id))["voicemail_sent"] == 1
 
 
@@ -326,8 +326,8 @@ async def test_late_recording_ready_uses_live_instruction_after_active(service, 
     await service.db.update_call(call_id, sideband_open=1, callee_joined=1)
     await service._check_activation_gate(call_id)
     await service.handle_amd(call_id, "machine_end_beep")
-    assert service._test_live.events[-1] == ("voicemail", call_id)
-    assert service._test_live.hangups == []
+    assert service.live.events[-1] == ("voicemail", call_id)
+    assert service.live.hangups == []
 
 
 async def test_native_transcript_fragments_are_persisted_exactly(service, packet):
@@ -345,4 +345,4 @@ async def test_native_transcript_fragments_are_persisted_exactly(service, packet
         )
     transcript = await service.db.get_transcript(call_id)
     assert "".join(turn.text for turn in transcript) == "Thanks, I will call tomorrow."
-    assert service._test_live.hangups == []
+    assert service.live.hangups == []
