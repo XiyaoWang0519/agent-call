@@ -271,7 +271,8 @@ async def test_stale_farewell_cannot_close_a_followup(service, packet):
     await service.handle_live_event(call_id, tool_event("end_2"))
     assert service.live.tool_results[-1][2]["accepted"] is True
     frames(service, call_id, start=80, end=3100, payload=SILENCE)
-    await settle()
+    call = await wait_for_terminal_state(service, call_id, "voice_model_end_call")
+    assert call["state"] in {state.value for state in TERMINAL_STATES}
     assert service.live.hangups == ["rtc_test"]
 
 
