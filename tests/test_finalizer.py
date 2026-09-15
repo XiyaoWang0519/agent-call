@@ -613,3 +613,67 @@ async def test_extractor_does_not_retry_nontransient_client_error(settings, serv
 
     assert responses.calls == 1
     assert result.finalization_status == "failed"
+
+
+async def _store_legacy_plan_context(service, call_id: str) -> None:
+    """Rewrite the plan context into decodable JSON that ContextPacket rejects.
+
+    Simulates a stored plan whose context predates a currently required field: the
+    row is readable, but adapting it to a typed record raises.
+    """
+
+    await service.db.execute(
+        "UPDATE plans SET context_json = ? WHERE plan_id = ?",
+        (json.dumps({"objective": "Legacy objective without owner or target."}), f"plan_{call_id}"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_unreadable_plan_context_still_saves_failure_result_for_spoken_call(
+    settings, service, packet
+):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await service.db.add_transcript_turn(
+        call_id=call_id,
+        turn_id="turn_1",
+        speaker="callee",
+        text="Reference ABC-123.",
+        source_event_type="transcription.completed",
+        source_event_id="evt_1",
+    )
+    await _store_legacy_plan_context(service, call_id)
+    responses = FakeResponses()
+
+    result = await Finalizer(settings, service.db, SimpleNamespace(responses=responses)).finalize(
+        call_id
+    )
+
+    assert responses.calls == 0
+    assert result.call_status == "completed"
+    assert result.finalization_status == "failed"
+    assert result.result_source == "extraction_failed"
+    assert result.raw_transcript_available is True
+    stored = await service.db.get_result(call_id)
+    assert stored.finalization_status == "failed"
+    assert (await service.db.get_transcript(call_id))[0].text == "Reference ABC-123."
+
+
+@pytest.mark.asyncio
+async def test_unreadable_plan_context_still_saves_failure_result_without_transcript(
+    settings, service, packet
+):
+    call_id = await seed_call(service.db, packet, state=CallState.COMPLETED)
+    await _store_legacy_plan_context(service, call_id)
+    responses = FakeResponses()
+
+    result = await Finalizer(settings, service.db, SimpleNamespace(responses=responses)).finalize(
+        call_id
+    )
+
+    assert responses.calls == 0
+    assert result.finalization_status == "failed"
+    assert result.result_source == "extraction_failed"
+    stored = await service.db.get_result(call_id)
+    assert stored.finalization_status == "failed"
+    transcript = await service.db.get_transcript(call_id)
+    assert transcript[0].speaker == "system"

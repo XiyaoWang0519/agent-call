@@ -12,6 +12,7 @@ import aiosqlite
 
 from app.db.engine import _iso_now
 from app.models import CallState
+from app.records import QuestionRecord
 
 # call_questions has no JSON columns, so rows below are returned as plain dict(row) without
 # running them through _decode_json_columns (unlike calls-table RETURNING * rows elsewhere).
@@ -207,6 +208,61 @@ class QuestionsMixin:
             "SELECT * FROM call_questions WHERE question_id=?",
             (question_id,),
         )
+
+    # -- Typed adapters (R06) -------------------------------------------------
+    # Each wraps the dict method above/below without duplicating SQL or opening a
+    # second transaction, so the historical API and the typed view can never drift.
+
+    async def create_question_record(
+        self: DatabaseAccess,
+        call_id: str,
+        *,
+        tool_call_id: str,
+        question: str,
+        reason: str | None,
+        deadline_at: str,
+        max_questions: int,
+    ) -> tuple[QuestionRecord | None, str | None]:
+        row, error = await self.create_question(
+            call_id,
+            tool_call_id=tool_call_id,
+            question=question,
+            reason=reason,
+            deadline_at=deadline_at,
+            max_questions=max_questions,
+        )
+        return (QuestionRecord.from_row(row) if row is not None else None), error
+
+    async def claim_question_answer_record(
+        self: DatabaseAccess,
+        call_id: str,
+        question_id: str,
+        answer: str,
+    ) -> QuestionRecord | None:
+        row = await self.claim_question_answer(call_id, question_id, answer)
+        return QuestionRecord.from_row(row) if row is not None else None
+
+    async def claim_question_expiry_record(
+        self: DatabaseAccess, question_id: str
+    ) -> QuestionRecord | None:
+        row = await self.claim_question_expiry(question_id)
+        return QuestionRecord.from_row(row) if row is not None else None
+
+    async def get_question_record(self: DatabaseAccess, question_id: str) -> QuestionRecord | None:
+        row = await self.get_question(question_id)
+        return QuestionRecord.from_row(row) if row is not None else None
+
+    async def get_question_records_after(
+        self: DatabaseAccess, call_id: str, after_sequence: int
+    ) -> list[QuestionRecord]:
+        rows = await self.get_questions_after(call_id, after_sequence)
+        return [QuestionRecord.from_row(row) for row in rows]
+
+    async def cancel_pending_question_records(
+        self: DatabaseAccess, call_id: str
+    ) -> list[QuestionRecord]:
+        rows = await self.cancel_pending_questions(call_id)
+        return [QuestionRecord.from_row(row) for row in rows]
 
     async def get_questions_after(
         self: DatabaseAccess, call_id: str, after_sequence: int

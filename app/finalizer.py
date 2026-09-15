@@ -16,12 +16,12 @@ from app.agent_push import push_message_to_agent
 from app.db import Database
 from app.models import (
     CallState,
-    ContextPacket,
     ExtractedCallResult,
     FollowUp,
     StoredCallResult,
 )
 from app.prompts import EXTRACTOR_INSTRUCTIONS
+from app.records import PlanRecord
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -111,8 +111,12 @@ class Finalizer:
         call = await self.db.get_call(call_id)
         if call is None:
             raise LookupError(call_id)
-        plan = await self.db.get_plan(call["plan_id"])
-        if plan is None:
+        # Read the raw row here and adapt it to a PlanRecord inside the extraction
+        # guard below. Adapting here would validate the stored context before the
+        # fallback result is saved, so a plan that no longer satisfies ContextPacket
+        # would abort finalization and leave the call with no queryable result at all.
+        plan_row = await self.db.get_plan(call["plan_id"])
+        if plan_row is None:
             raise LookupError(call["plan_id"])
         transcript = await self.db.get_transcript(call_id)
         if not transcript:
@@ -168,6 +172,7 @@ class Finalizer:
         await self.db.save_result_with_transcript(call_id, fallback, transcript)
 
         try:
+            plan = PlanRecord.from_row(plan_row)
             extracted, (extractor_input_tokens, extractor_output_tokens) = await self._extract(
                 call, plan, transcript
             )
@@ -233,14 +238,14 @@ class Finalizer:
         return result
 
     async def _extract(
-        self, call: dict[str, Any], plan: dict[str, Any], transcript: list[Any]
+        self, call: dict[str, Any], plan: PlanRecord, transcript: list[Any]
     ) -> tuple[ExtractedCallResult, tuple[int, int]]:
         # Normalize (but do not case-fold) turn_ids so an extractor citation padded with
         # incidental whitespace still validates; a matching stripped id is canonicalized
         # back to the exact transcript turn_id before being persisted.
         evidence_ids_by_stripped = {turn.turn_id.strip(): turn.turn_id for turn in transcript}
         payload = {
-            "approved_plan": ContextPacket.model_validate(plan["context"]).model_dump(mode="json"),
+            "approved_plan": plan.context.model_dump(mode="json"),
             "termination_reason": call.get("termination_reason"),
             "answered_by": call.get("answered_by"),
             "duration_seconds": call.get("duration_seconds"),

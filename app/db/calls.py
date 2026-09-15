@@ -11,6 +11,7 @@ from typing import Any
 
 from app.db.engine import _iso_now
 from app.models import TERMINAL_STATES, CallState
+from app.records import LifecycleRecord
 
 # Schema columns of `calls` that current callers actually pass to update_call(). Anything
 # outside this set is rejected up front instead of failing later as a SQL error.
@@ -89,6 +90,12 @@ class CallsMixin:
 
     async def get_call(self: DatabaseAccess, call_id: str) -> dict[str, Any] | None:
         return await self.fetch_one("SELECT * FROM calls WHERE call_id=?", (call_id,))
+
+    async def get_lifecycle_record(self: DatabaseAccess, call_id: str) -> LifecycleRecord | None:
+        """Typed adapter over the same read used by :meth:`get_call`."""
+
+        row = await self.get_call(call_id)
+        return LifecycleRecord.from_row(row) if row is not None else None
 
     async def get_call_by_openai_id(
         self: DatabaseAccess, openai_call_id: str
@@ -241,14 +248,36 @@ class CallsMixin:
             (cost_dollars, call_id),
         )
 
-    async def cas_state(
+    async def _promote_call_state(
         self: DatabaseAccess, call_id: str, expected: CallState, replacement: CallState
     ) -> bool:
+        """Compare-and-set one lifecycle transition. Business callers use the named
+        ``promote_to_*`` wrappers so a state change reads as the decision it encodes."""
+
         return await self._execute_cas(
             """UPDATE calls SET state=?, last_event_at=?
                WHERE call_id=? AND state=?""",
             (replacement.value, _iso_now(), call_id, expected.value),
         )
+
+    async def promote_to_ready_to_activate(self: DatabaseAccess, call_id: str) -> bool:
+        """PREWARMING -> READY_TO_ACTIVATE once the setup preconditions hold."""
+
+        return await self._promote_call_state(
+            call_id, CallState.PREWARMING, CallState.READY_TO_ACTIVATE
+        )
+
+    async def promote_to_activating(self: DatabaseAccess, call_id: str) -> bool:
+        """Claim the one-shot right to promote a ready call into ACTIVATING."""
+
+        return await self._promote_call_state(
+            call_id, CallState.READY_TO_ACTIVATE, CallState.ACTIVATING
+        )
+
+    async def promote_to_active(self: DatabaseAccess, call_id: str) -> bool:
+        """ACTIVATING -> ACTIVE once media monitoring is live."""
+
+        return await self._promote_call_state(call_id, CallState.ACTIVATING, CallState.ACTIVE)
 
     async def adopt_participant(
         self: DatabaseAccess,

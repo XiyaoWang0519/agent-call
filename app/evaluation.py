@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import json
-
+from app.errors import ERROR_MESSAGES, CallRefusal, ErrorCode
 from app.models import ContextPacket, EscalationContext, OwnerContext, TargetContext
 
-LIVE_CALLS_DISABLED_CODE = "live_calls_disabled"
-LIVE_CALLS_DISABLED_MESSAGE = (
-    "Live calls are disabled in evaluation mode. prepare_phone_call is available; "
-    "start_phone_call cannot originate provider legs. Set AGENT_CALL_PROFILE=live "
-    "with real credentials to place a call."
-)
+LIVE_CALLS_DISABLED_CODE = ErrorCode.LIVE_CALLS_DISABLED.value
+LIVE_CALLS_DISABLED_MESSAGE = ERROR_MESSAGES[ErrorCode.LIVE_CALLS_DISABLED]
 
 EVALUATION_PUBLIC_BASE_URL = "https://127.0.0.1"
 EVALUATION_TWILIO_ACCOUNT_SID = "ACeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
@@ -54,8 +49,8 @@ def live_calls_disabled_payload() -> dict[str, str]:
     return {"code": LIVE_CALLS_DISABLED_CODE, "message": LIVE_CALLS_DISABLED_MESSAGE}
 
 
-def live_calls_disabled_error() -> ValueError:
-    return ValueError(json.dumps(live_calls_disabled_payload()))
+def live_calls_disabled_error() -> CallRefusal:
+    return CallRefusal(ErrorCode.LIVE_CALLS_DISABLED, LIVE_CALLS_DISABLED_MESSAGE)
 
 
 def evaluation_prepare_packet(

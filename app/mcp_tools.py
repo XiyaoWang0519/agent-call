@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -10,6 +9,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from app.call_state import CallService
+from app.errors import ErrorCode, error_json
 from app.mcp_oauth.constants import MCP_OAUTH_SCOPE
 from app.models import (
     AnswerCallQuestionRequest,
@@ -18,6 +18,7 @@ from app.models import (
     QuestionResolution,
     QuestionSource,
 )
+from app.records import AnswerCommand
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ def register_tools(
         try:
             return await get_service().get_result(call_id)
         except LookupError as exc:
-            raise ToolError(json.dumps({"code": "call_not_found", "message": str(exc)})) from exc
+            raise ToolError(error_json(ErrorCode.CALL_NOT_FOUND, str(exc))) from exc
 
     @mcp.tool(
         name="end_phone_call",
@@ -161,7 +162,7 @@ def register_tools(
         try:
             snapshot = await get_service().get_snapshot(call_id)
         except LookupError as exc:
-            raise ToolError(json.dumps({"code": "call_not_found", "message": str(exc)})) from exc
+            raise ToolError(error_json(ErrorCode.CALL_NOT_FOUND, str(exc))) from exc
         data = snapshot.model_dump(mode="json", exclude={"result"})
         return data
 
@@ -209,16 +210,14 @@ def register_tools(
                 "mcp tool wait_for_call_event call_not_found call_id=%s",
                 call_id,
             )
-            raise ToolError(json.dumps({"code": "call_not_found", "message": str(exc)})) from exc
+            raise ToolError(error_json(ErrorCode.CALL_NOT_FOUND, str(exc))) from exc
         except ValueError as exc:
             logger.info(
                 "mcp tool wait_for_call_event invalid_call_state call_id=%s error=%s",
                 call_id,
                 exc,
             )
-            raise ToolError(
-                json.dumps({"code": "invalid_call_state", "message": str(exc)})
-            ) from exc
+            raise ToolError(error_json(ErrorCode.INVALID_CALL_STATE, str(exc))) from exc
         logger.info(
             "mcp tool wait_for_call_event completed call_id=%s state=%s terminal=%s "
             "event_count=%s next_after_sequence=%s",
@@ -294,31 +293,24 @@ def register_tools(
                 for error in exc.errors(include_input=False, include_url=False)
             ]
             raise ToolError(
-                json.dumps(
-                    {
-                        "code": "invalid_answer_submission",
-                        "message": "Answer rejected; the question remains pending.",
-                        "issues": issues,
-                        "next_action": (
-                            "Complete the missing source checks and retry "
-                            "answer_call_question before the original deadline."
-                        ),
-                    }
+                error_json(
+                    ErrorCode.INVALID_ANSWER_SUBMISSION,
+                    issues=issues,
+                    next_action=(
+                        "Complete the missing source checks and retry "
+                        "answer_call_question before the original deadline."
+                    ),
                 )
             ) from exc
         try:
-            result = await get_service().answer_call_question(
-                request.call_id,
-                request.question_id,
-                request.answer,
-            )
+            result = await get_service().answer_call_question(AnswerCommand.from_request(request))
         except LookupError as exc:
             logger.info(
                 "mcp tool answer_call_question unknown_question call_id=%s question_id=%s",
                 call_id,
                 question_id,
             )
-            raise ToolError("unknown question") from exc
+            raise ToolError(error_json(ErrorCode.UNKNOWN_QUESTION, "unknown question")) from exc
         except ValueError as exc:
             logger.info(
                 "mcp tool answer_call_question invalid_call_state call_id=%s "
@@ -327,9 +319,7 @@ def register_tools(
                 question_id,
                 exc,
             )
-            raise ToolError(
-                json.dumps({"code": "invalid_call_state", "message": str(exc)})
-            ) from exc
+            raise ToolError(error_json(ErrorCode.INVALID_CALL_STATE, str(exc))) from exc
         logger.info(
             "mcp tool answer_call_question completed call_id=%s question_id=%s status=%s",
             call_id,
