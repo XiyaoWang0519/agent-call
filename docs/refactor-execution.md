@@ -16,7 +16,7 @@ See [refactoring_plan.md](refactoring_plan.md) for the R00–R23 work packages.
 | R01 | Partial | Full tool schemas frozen; subprocess network isolation not claimed; sleep-based race tests not fully migrated |
 | R02 | Partial | Narrow `Protocol` ports and fake clock deferred (R06) |
 | R03 | Implemented | Boundary tests added; no schema change |
-| R04 | Implemented (review pass) | No distributed exactly-once claim |
+| R04 | Implemented (review pass) | No distributed exactly-once claim; targeted-cleanup retry is in-process only (durable ledger needs R07) |
 | R05 | Implemented (review pass) | Readiness freshness budget is process-local |
 
 ## R00 — Release boundary
@@ -46,8 +46,8 @@ uv run mypy app                                # pass
 uv run pytest -q --cov=app                     # 662 passed, 2 skipped, 88.43%
 ```
 
-After R00–R05 (including the review pass) the same gate reports **694 passed,
-2 skipped, 88.73%** (floor 85%).
+After R00–R05 (including the review passes) the same gate reports **697 passed,
+2 skipped, 88.62%** (floor 85%).
 
 Added:
 
@@ -77,6 +77,8 @@ batch, so that remains a known risk rather than a masked result.
 | Definite create failure (no cancel) | provider rejects | no SID, terminal reason set, no retry-create |
 | Cancel during media-stream create | stream created after cancel | stream stopped; call terminalized |
 | Late create during shutdown | `_stopping` set, create lands | must-finish cleanup still runs |
+| Real `stop()` with an unreturned create | stop starts while provider create in flight | stop waits (must-finish owned task); late leg removed; caller gets `call_ending` |
+| Targeted cleanup fails once | terminal/transferred call, `remove_participant`/`stop_audio_monitor` raises | bounded retry keeps ownership; conference left intact |
 | Duplicate / out-of-order callback | repeated participant-status | single terminal transition |
 | Restart with nonterminal rows | `recover_startup` | no second external create |
 | Watchdog pass failure | `list_nonterminal_calls` raises | not-ready, new calls rejected, loop survives |
@@ -119,9 +121,15 @@ remote participant is created after the local claim.
 `_run_owned_remote_create` protects the whole create → persist-or-cleanup window,
 not only the first await:
 
-1. the create runs in a shielded task; a late result is recovered on cancel;
-2. the returned value is given to `commit`, which persists the SID; and
-3. if either step is interrupted or fails, `abandon` receives the known value
+1. the operation runs as a **must-finish background task registered before the
+   provider call**, so `stop()` waits for an unreturned create to reach
+   commit-or-abandon; caller cancellation is propagated into the owned task so
+   its own cancel path abandons what the provider created;
+2. after the create returns, the call is checked for viability (not stopping, not
+   terminal/terminating) before ownership is taken, so a leg created into a call
+   that was terminated during the provider call is abandoned, not persisted;
+3. the returned value is given to `commit`, which persists the SID; and
+4. if any step is interrupted or fails, `abandon` receives the known value
    (or `None` for a definite failure) and removes the specific remote resource
    using identifiers already held.
 
@@ -131,6 +139,10 @@ Key properties:
   `remove_participant` for that exact leg. This works even when the database —
   and therefore `terminate_call` — is unavailable, and it does not complete the
   whole conference (which could disturb an owner handoff).
+- `_cleanup_resource` retries a failed targeted cleanup with a short bounded
+  backoff as must-finish work, so one provider hiccup does not silently end
+  responsibility for a leg or stream. A terminal or already-`TRANSFERRED` call
+  keeps its owner-callee conference; only the named resource is touched.
 - A cancelled create whose remote call then fails definitively still
   terminalizes the already-created call row instead of leaving it in
   `prewarming`.
@@ -143,7 +155,16 @@ Key properties:
 
 Covered by `tests/test_dial_cancellation.py` (cancel + success, cancel + failure,
 cancel while persisting, provider success + DB failure, media cancel, late create
-during shutdown, definite failure without cancel).
+during shutdown, real `stop()` with an unreturned create, and targeted-cleanup
+retry after the call is terminal/transferred).
+
+**Known limitation:** the targeted-cleanup retry is bounded and in-process. If the
+process dies during the retry window (all attempts exhausted or the process exits
+mid-retry), the specific leg/stream is not retried by startup recovery, because
+the recovery queries cover nonterminal calls, conference completion, and pending
+finalization — not a named participant SID on an already-terminal call. The SID is
+logged for manual reconciliation. A durable per-resource cleanup ledger requires
+the R07 migration work; until then this is an explicit, operator-visible gap.
 
 ## R05 — Supervision and readiness (review pass)
 
@@ -172,3 +193,6 @@ during shutdown, definite failure without cancel).
 - R06+ structural extraction of `CallService` is not started.
 - Narrow `Protocol` ports, fake clock, and full migration of sleep-based race
   tests to event barriers remain for later packages.
+- R04 targeted-cleanup responsibility is a bounded in-process retry; a durable
+  per-resource cleanup ledger (surviving process death) needs the R07 migration
+  work. Until then an exhausted retry is logged for manual reconciliation.

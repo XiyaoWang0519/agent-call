@@ -17,10 +17,11 @@ combinations, not just the happy cancellation path:
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
-from app.models import CallState, PreparePhoneCallInput
+from app.models import TERMINAL_STATES, CallState, PreparePhoneCallInput
 from app.twilio_bridge import ParticipantInfo
 from tests.conftest import seed_call, wait_background
 
@@ -262,3 +263,93 @@ async def test_late_creation_during_shutdown_is_still_cleaned_up(service, packet
     call = await service.db.get_call(call_id)
     assert call["state"] == CallState.FAILED.value
     assert (late.conference_sid, late.call_sid) in service.twilio.removed
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_inflight_create_and_abandons_late_leg(service, packet):
+    """A real stop() must not return while an owned create is still unreturned."""
+    prepared = await _prepare(service, packet)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    late = ParticipantInfo("CA" + "w" * 32, "CF" + "w" * 32)
+
+    async def slow_create(**_kwargs):
+        entered.set()
+        await release.wait()
+        return late
+
+    service.twilio.create_agent_participant = slow_create
+    start_task = asyncio.create_task(_start(service, prepared))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    stop_task = asyncio.create_task(service.stop())
+    await asyncio.sleep(0.05)
+    # stop() has terminated the call and is draining the must-finish owned create.
+    assert not stop_task.done()
+
+    release.set()
+    await asyncio.wait_for(stop_task, timeout=5)
+
+    # The caller was not cancelled; it learns the call stopped accepting a leg.
+    with pytest.raises(ValueError) as exc_info:
+        await start_task
+    assert json.loads(str(exc_info.value))["code"] == "call_ending"
+
+    assert (late.conference_sid, late.call_sid) in service.twilio.removed
+    stored = await service.db.get_call((await service.db.list_calls())[0]["call_id"])
+    assert stored["state"] in {state.value for state in TERMINAL_STATES}
+
+
+@pytest.mark.asyncio
+async def test_failed_targeted_leg_cleanup_keeps_retrying(service, packet, monkeypatch):
+    """A terminal/transferred call with one cleanup failure must stay owned."""
+    monkeypatch.setattr("app.call_state.RESOURCE_CLEANUP_RETRY_BASE_SECONDS", 0.01)
+    monkeypatch.setattr("app.call_state.RESOURCE_CLEANUP_RETRY_MAX_SECONDS", 0.02)
+    call_id = await seed_call(service.db, packet, state=CallState.TRANSFERRED)
+    attempts: list[str] = []
+    succeeded = asyncio.Event()
+    late = ParticipantInfo("CA" + "c" * 32, "CF" + "c" * 32)
+
+    async def flaky_remove(_conference, sid):
+        attempts.append(sid)
+        if len(attempts) == 1:
+            raise RuntimeError("twilio hiccup")
+        succeeded.set()
+
+    service.twilio.remove_participant = flaky_remove
+    await service._abandon_participant(
+        call_id, "callee", "callee_leg_setup_failed", late, conference_hint=late.conference_sid
+    )
+    await asyncio.wait_for(succeeded.wait(), timeout=2)
+
+    assert len(attempts) == 2
+    # Cleanup is scoped to the named leg; the transferred conference is untouched.
+    assert service.twilio.completed == []
+
+
+@pytest.mark.asyncio
+async def test_failed_targeted_stream_cleanup_keeps_retrying(service, packet, monkeypatch):
+    monkeypatch.setattr("app.call_state.RESOURCE_CLEANUP_RETRY_BASE_SECONDS", 0.01)
+    monkeypatch.setattr("app.call_state.RESOURCE_CLEANUP_RETRY_MAX_SECONDS", 0.02)
+    call_id = await seed_call(service.db, packet, state=CallState.TRANSFERRED)
+    stream_sid = "MZ" + "s" * 32
+    attempts: list[str] = []
+    succeeded = asyncio.Event()
+
+    async def flaky_stop(_callee, sid):
+        attempts.append(sid)
+        if len(attempts) == 1:
+            raise RuntimeError("twilio hiccup")
+        succeeded.set()
+
+    service.twilio.stop_audio_monitor = flaky_stop
+    await service._abandon_media_stream(
+        call_id,
+        "media_monitor_setup_failed",
+        stream_sid,
+        callee_call_sid="CA" + "b" * 32,
+    )
+    await asyncio.wait_for(succeeded.wait(), timeout=2)
+
+    assert len(attempts) == 2
+    assert service.twilio.completed == []

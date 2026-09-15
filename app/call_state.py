@@ -63,6 +63,12 @@ VOICE_END_REPLY_GRACE_SECONDS = 3.0
 TERMINATION_MEDIA_RETRY_DELAY_SECONDS = 0.1
 TERMINATION_MEDIA_BACKGROUND_RETRY_BASE_SECONDS = 0.5
 TERMINATION_MEDIA_BACKGROUND_RETRY_MAX_SECONDS = 15.0
+# Bounded retry for targeted remote-resource cleanup (one participant leg or one
+# carrier stream). Kept short so shutdown, which awaits must-finish work, is not
+# held up by a provider outage.
+RESOURCE_CLEANUP_MAX_ATTEMPTS = 4
+RESOURCE_CLEANUP_RETRY_BASE_SECONDS = 0.2
+RESOURCE_CLEANUP_RETRY_MAX_SECONDS = 2.0
 # cancel_response + function_call_output each bound to LIVE_SEND_TIMEOUT_SECONDS; keep
 # the stale-call carve-out long enough for both sends after the answer deadline fires.
 WATCHDOG_QUESTION_GRACE_SECONDS = 2 * LIVE_SEND_TIMEOUT_SECONDS + 5.0
@@ -193,6 +199,7 @@ class CallService:
         self._background: set[asyncio.Task[Any]] = set()
         self._must_finish_background: set[asyncio.Task[Any]] = set()
         self._conference_retry_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self._resource_cleanup_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         self._stopping = False
         self._owner_transfer = OwnerTransferCoordinator(
             self.db,
@@ -542,18 +549,66 @@ class CallService:
         swallow_failure: bool = False,
         terminate_on_failure: bool = True,
     ) -> Any | None:
-        """Own the whole create -> persist-or-cleanup window for one remote resource.
+        """Own one remote create from before it starts until it is persisted or cleaned.
 
-        Twilio's SDK call executes in a worker thread, so cancelling the awaiting
-        coroutine does not cancel the remote create. The protected region therefore
-        covers three steps, not just the first await:
+        The operation runs as a must-finish background task so ``stop()`` waits for
+        it: a remote request that is still in flight when shutdown starts must reach
+        commit-or-abandon before the service is considered drained. Registering the
+        task *before* the provider call (not when compensation starts) is what makes
+        the shutdown protocol cover the unreturned window.
 
-        1. run the create in a shielded task and recover a late result on cancel;
-        2. hand the created value to ``commit`` so the SID becomes durable; and
-        3. if either step is interrupted or fails, invoke ``abandon`` with the known
-           value (or ``None`` for a definite failure) so the remote resource is
-           removed using identifiers we already hold -- never re-created, and never
-           dependent on the database that may also be failing.
+        Caller cancellation is propagated into the owned task (rather than merely
+        detaching it) so the operation's own cancel path abandons whatever the
+        provider created.
+        """
+        operation_task = self._spawn(
+            self._execute_owned_remote_create(
+                call_id,
+                step,
+                operation=operation,
+                failure_log_message=failure_log_message,
+                failure_reason=failure_reason,
+                commit=commit,
+                abandon=abandon,
+                request_stage=request_stage,
+                completed_stage=completed_stage,
+                swallow_failure=swallow_failure,
+                terminate_on_failure=terminate_on_failure,
+            ),
+            name=f"owned-create:{operation}:{call_id}",
+            must_finish=True,
+        )
+        try:
+            return await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            # Deliver the cancel into the owned task so its cancel path abandons the
+            # resource, then wait for that cleanup before unwinding. stop() also
+            # awaits this task through the must-finish background set.
+            operation_task.cancel()
+            await self._await_network_task(operation_task)
+            raise
+
+    async def _execute_owned_remote_create(
+        self,
+        call_id: str,
+        step: Callable[[], Coroutine[Any, Any, Any]],
+        *,
+        operation: str,
+        failure_log_message: str,
+        failure_reason: str,
+        commit: Callable[[Any], Coroutine[Any, Any, Any]],
+        abandon: Callable[[Any | None], Awaitable[None]],
+        request_stage: LatencyStage | None,
+        completed_stage: LatencyStage | None,
+        swallow_failure: bool,
+        terminate_on_failure: bool,
+    ) -> Any | None:
+        """Body of an owned create: create -> verify the call still wants it -> persist.
+
+        Every step that can be interrupted falls back to ``abandon`` with the known
+        value, so a remote resource is never left without an owner. A definite
+        create error is not retried; an unknown result is treated as possibly
+        billable rather than re-created.
         """
         request_mark = LatencyMark.now()
         task: asyncio.Task[Any] = asyncio.create_task(step(), name=f"{operation}:{call_id}")
@@ -575,9 +630,27 @@ class CallService:
                 return None
             raise
 
-        # The remote leg exists now. Persisting its SID is part of the protected
-        # region: cancellation between the provider response and the durable write
-        # must abandon the leg rather than leave it unowned.
+        # The remote leg exists now. Before taking ownership, confirm the call can
+        # still use it: the service may have started stopping, or the call may have
+        # been terminalized while the provider call was in flight. A leg persisted
+        # onto a dead call would be orphaned.
+        try:
+            viable = await self._call_still_accepts_leg(call_id)
+        except asyncio.CancelledError:
+            await self._run_owned_cleanup(abandon, result, operation=operation, call_id=call_id)
+            raise
+        except Exception:
+            logger.exception(failure_log_message)
+            await self._run_owned_cleanup(abandon, result, operation=operation, call_id=call_id)
+            if swallow_failure:
+                return None
+            raise
+        if not viable:
+            await self._run_owned_cleanup(abandon, result, operation=operation, call_id=call_id)
+            return None
+
+        # Persisting the SID is part of the protected region: cancellation between
+        # the provider response and the durable write must abandon the leg.
         commit_task: asyncio.Task[Any] = asyncio.create_task(
             commit(result), name=f"{operation}-commit:{call_id}"
         )
@@ -601,6 +674,23 @@ class CallService:
                 (completed_stage, completed_mark, ""),
             )
         return result
+
+    async def _call_still_accepts_leg(self, call_id: str) -> bool:
+        """Whether a freshly created remote resource still belongs to a live call.
+
+        Covers participant legs created during setup and the carrier media stream
+        created during activation. Terminal and terminating states are excluded.
+        """
+        if self._stopping:
+            return False
+        call = await self.db.get_call(call_id)
+        if call is None:
+            return False
+        return CallState(call["state"]) in {
+            CallState.PREWARMING,
+            CallState.READY_TO_ACTIVATE,
+            CallState.ACTIVATING,
+        }
 
     async def _run_owned_cleanup(
         self,
@@ -676,15 +766,14 @@ class CallService:
                 )
             conference = participant.conference_sid or conference_hint
             if conference:
-                try:
-                    await self.twilio.remove_participant(conference, participant.call_sid)
-                except Exception:
-                    logger.warning(
-                        "targeted %s leg cleanup failed call_id=%s",
-                        kind,
-                        call_id,
-                        exc_info=True,
-                    )
+                await self._cleanup_resource(
+                    call_id,
+                    resource_key=f"{kind}-leg:{participant.call_sid}",
+                    label=f"{kind}-leg",
+                    cleanup=lambda: self.twilio.remove_participant(
+                        conference, participant.call_sid
+                    ),
+                )
         await self._terminalize_abandoned_call(call_id, failure_reason, operation=kind)
 
     async def _abandon_media_stream(
@@ -702,15 +791,80 @@ class CallService:
             except Exception:
                 logger.exception("failed to persist abandoned media stream call_id=%s", call_id)
             if callee_call_sid:
-                try:
-                    await self.twilio.stop_audio_monitor(callee_call_sid, stream_sid)
-                except Exception:
-                    logger.warning(
-                        "failed to stop abandoned media stream call_id=%s",
-                        call_id,
-                        exc_info=True,
-                    )
+                await self._cleanup_resource(
+                    call_id,
+                    resource_key=f"stream:{stream_sid}",
+                    label="media-stream",
+                    cleanup=lambda: self.twilio.stop_audio_monitor(callee_call_sid, stream_sid),
+                )
         await self._terminalize_abandoned_call(call_id, failure_reason, operation="media-stream")
+
+    async def _cleanup_resource(
+        self,
+        call_id: str,
+        *,
+        resource_key: str,
+        label: str,
+        cleanup: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Remove one specific remote resource, retrying with a bounded budget.
+
+        A single provider hiccup must not silently end responsibility for a leg or
+        stream that may still exist. On failure a must-finish retry task keeps
+        ownership of that exact resource until it succeeds or the bounded budget is
+        exhausted (which is logged for manual reconciliation). Deliberately scoped
+        to the named resource: it never completes the conference, so a handoff that
+        already belongs to the owner is not torn down.
+        """
+        try:
+            await cleanup()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "targeted %s cleanup failed; scheduling retry call_id=%s",
+                label,
+                call_id,
+                exc_info=True,
+            )
+        key = (call_id, resource_key)
+        existing = self._resource_cleanup_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+
+        async def retry() -> None:
+            for attempt in range(1, RESOURCE_CLEANUP_MAX_ATTEMPTS + 1):
+                try:
+                    await cleanup()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if attempt >= RESOURCE_CLEANUP_MAX_ATTEMPTS:
+                        logger.error(
+                            "targeted %s cleanup gave up call_id=%s resource=%s; "
+                            "manual reconciliation required",
+                            label,
+                            call_id,
+                            resource_key,
+                            exc_info=True,
+                        )
+                        return
+                    delay = min(
+                        RESOURCE_CLEANUP_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                        RESOURCE_CLEANUP_RETRY_MAX_SECONDS,
+                    )
+                    await asyncio.sleep(delay)
+
+        task = self._spawn(retry(), name=f"resource-cleanup:{label}:{call_id}", must_finish=True)
+        self._resource_cleanup_tasks[key] = task
+
+        def clear(completed: asyncio.Task[Any]) -> None:
+            if self._resource_cleanup_tasks.get(key) is completed:
+                self._resource_cleanup_tasks.pop(key, None)
+
+        task.add_done_callback(clear)
 
     async def _terminalize_abandoned_call(
         self, call_id: str, failure_reason: str, *, operation: str
@@ -720,14 +874,23 @@ class CallService:
         The call row (with its conference name) already exists before any remote
         create, so it is the durable recovery anchor if this best-effort teardown
         cannot run. ``_initiating_task`` bypasses the shutdown gate so a create that
-        lands during shutdown is still cleaned up.
+        lands during shutdown is still cleaned up. A ``False`` result means the call
+        was already terminal or another teardown owns it; targeted resource cleanup
+        above is then the guarantee, so this is logged rather than retried here.
         """
         try:
-            await self.terminate_call(
+            terminated = await self.terminate_call(
                 call_id, failure_reason, _initiating_task=asyncio.current_task()
             )
         except Exception:
             logger.exception("failed to terminalize abandoned %s call_id=%s", operation, call_id)
+            return
+        if not terminated:
+            logger.info(
+                "abandoned %s did not re-terminalize call_id=%s (already terminal or owned)",
+                operation,
+                call_id,
+            )
 
     async def start(
         self, plan_id: str, *, explicit_confirmation: bool, confirmation_text: str
@@ -840,8 +1003,21 @@ class CallService:
                 conference_hint=conference_name,
             ),
         )
-        if participant is None:  # pragma: no cover - swallow_failure is False here
-            raise RuntimeError("agent participant creation returned no participant")
+        if participant is None:
+            # A create that was abandoned (service stopping, or the call was
+            # terminalized while the provider call was in flight) is not a usable
+            # leg; report the same stable code used for a draining call.
+            raise ValueError(
+                json.dumps(
+                    {
+                        "code": "call_ending",
+                        "message": (
+                            "The call stopped accepting a new participant leg; retry the "
+                            "confirmed call shortly"
+                        ),
+                    }
+                )
+            )
         # No await between the owned create and spawning the setup deadline, so a
         # cancellation cannot slip through an undefended persistence window.
         self._spawn(self._setup_deadline(call_id), name=f"setup-deadline:{call_id}")
@@ -1293,6 +1469,10 @@ class CallService:
             ),
             terminate_on_failure=False,
         )
+        if stream_sid is None:
+            # The stream was abandoned (service stopping or call terminalized while
+            # the provider call was in flight); activation must not continue.
+            return
         await asyncio.wait_for(ready.wait(), timeout=5)
         if self._call_audio[call_id].stream_sid != stream_sid:
             raise RuntimeError("carrier stream identity mismatch")

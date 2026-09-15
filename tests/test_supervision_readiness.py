@@ -140,16 +140,24 @@ async def test_hung_watchdog_pass_stops_new_calls(service, packet):
 @pytest.mark.asyncio
 async def test_watchdog_loop_refreshes_freshness(service, monkeypatch):
     monkeypatch.setattr("app.call_state.WATCHDOG_INTERVAL_SECONDS", 0.01)
-    before = service._watchdog_last_success_monotonic
+    original_once = service._watchdog_once
+    passes = 0
+
+    async def counting_once() -> None:
+        nonlocal passes
+        passes += 1
+        await original_once()
+
+    monkeypatch.setattr(service, "_watchdog_once", counting_once)
     await service.start_watchdog()
 
-    for _ in range(200):
+    for _ in range(300):
         await asyncio.sleep(0.01)
-        current = service._watchdog_last_success_monotonic
-        if current is not None and (before is None or current > before):
+        if passes >= 2:
             break
 
-    assert service._watchdog_last_success_monotonic is not None
+    # Require real completed passes, not just the timestamp start_watchdog writes.
+    assert passes >= 2
     assert service.supervision_ready() is True
 
 
