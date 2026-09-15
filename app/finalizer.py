@@ -111,8 +111,12 @@ class Finalizer:
         call = await self.db.get_call(call_id)
         if call is None:
             raise LookupError(call_id)
-        plan = await self.db.get_plan_record(call["plan_id"])
-        if plan is None:
+        # Read the raw row here and adapt it to a PlanRecord inside the extraction
+        # guard below. Adapting here would validate the stored context before the
+        # fallback result is saved, so a plan that no longer satisfies ContextPacket
+        # would abort finalization and leave the call with no queryable result at all.
+        plan_row = await self.db.get_plan(call["plan_id"])
+        if plan_row is None:
             raise LookupError(call["plan_id"])
         transcript = await self.db.get_transcript(call_id)
         if not transcript:
@@ -168,6 +172,7 @@ class Finalizer:
         await self.db.save_result_with_transcript(call_id, fallback, transcript)
 
         try:
+            plan = PlanRecord.from_row(plan_row)
             extracted, (extractor_input_tokens, extractor_output_tokens) = await self._extract(
                 call, plan, transcript
             )
