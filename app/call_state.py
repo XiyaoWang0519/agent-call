@@ -585,8 +585,20 @@ class CallService:
             # Deliver the cancel into the owned task so its cancel path abandons the
             # resource, then wait for that cleanup before unwinding. stop() also
             # awaits this task through the must-finish background set.
-            operation_task.cancel()
-            await self._await_network_task(operation_task)
+            if operation_task.done():
+                # The operation may have finished (and committed ownership) in the
+                # same scheduler turn the cancellation was delivered, so cancel()
+                # would be a no-op. Abandon any committed resource explicitly rather
+                # than unwinding with a leg no caller will manage.
+                if not operation_task.cancelled() and operation_task.exception() is None:
+                    completed = operation_task.result()
+                    if completed is not None:
+                        await self._run_owned_cleanup(
+                            abandon, completed, operation=operation, call_id=call_id
+                        )
+            else:
+                operation_task.cancel()
+                await self._await_network_task(operation_task)
             raise
 
     async def _execute_owned_remote_create(
