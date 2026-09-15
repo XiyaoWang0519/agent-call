@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.models import CallState
-from tests.conftest import seed_call, wait_background
+from tests.conftest import seed_call, wait_background, wait_for_terminal_call
 
 
 async def test_carrier_hangup_does_not_wait_for_live_usage(service, packet, monkeypatch):
@@ -43,10 +43,9 @@ async def test_callee_exit_completes_conference_and_hangup_exactly_once(service,
     }
     await service.handle_conference_event(call_id, form)
     await service.handle_conference_event(call_id, form)
-    await wait_background()
+    call = await wait_for_terminal_call(service.db, call_id)
     assert len(service.twilio.completed) == 1
     assert service.live.hangups == ["rtc_test"]
-    call = await service.db.get_call(call_id)
     assert call["state"] == CallState.COMPLETED.value
     assert service.finalizer.states_seen == [CallState.COMPLETED.value]
 

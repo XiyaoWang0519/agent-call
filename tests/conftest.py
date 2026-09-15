@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import socket
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from app.call_state import CallService
 from app.db import Database
 from app.exa_search import ExaSearchResult
 from app.models import (
+    TERMINAL_STATES,
     CallState,
     ContextPacket,
     EscalationContext,
@@ -543,3 +545,20 @@ async def service(harness: TestHarness) -> CallService:
 async def wait_background() -> None:
     for _ in range(50):
         await asyncio.sleep(0.01)
+
+
+async def wait_for_terminal_call(db, call_id: str, *, budget_seconds: float = 5.0):
+    """Poll until a call reaches a terminal state (or the budget expires).
+
+    Termination runs through several database writes and provider calls; a fixed
+    sleep is not enough on a loaded runner. Polling keeps assertions about the
+    outcome without encoding runner speed.
+    """
+    deadline = time.monotonic() + budget_seconds
+    call = await db.get_call(call_id)
+    while call is not None and CallState(call["state"]) not in TERMINAL_STATES:
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.02)
+        call = await db.get_call(call_id)
+    return call
