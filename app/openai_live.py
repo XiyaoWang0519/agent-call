@@ -724,6 +724,21 @@ class LiveBridge:
         if instructions:
             await self.append_instructions(call_id, instructions)
 
+    async def yield_to_callee(self, call_id: str) -> None:
+        await self.send(
+            call_id,
+            {
+                "type": "session.instructions.append",
+                "delegation_id": None,
+                "content": (
+                    "Carrier audio indicates a possible interruption over your current answer. "
+                    "Pause that answer immediately and listen. This signal does not establish words "
+                    "or intent. Stay silent while they speak; do not acknowledge this signal. "
+                    "Respond only to words actually heard; if it was only noise, resume naturally."
+                ),
+            },
+        )
+
     async def notify_call_resumed(self, call_id: str) -> None:
         await self.append_instructions(
             call_id,

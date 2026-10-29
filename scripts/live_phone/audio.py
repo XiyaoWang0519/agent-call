@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+import random
 import struct
 import wave
 from collections import deque
@@ -48,6 +49,26 @@ def wav_bytes(pcm: bytes) -> bytes:
 def rms(pcm: bytes) -> float:
     samples = [v[0] for v in struct.iter_unpack("<h", pcm)]
     return math.sqrt(sum(v * v for v in samples) / len(samples)) if samples else 0.0
+
+
+def speech_bounds(pcm: bytes) -> tuple[float, float] | None:
+    frames = [(i / (RATE * 2), pcm[i : i + 320]) for i in range(0, len(pcm), 320)]
+    voiced = [(t, len(frame) / (RATE * 2)) for t, frame in frames if rms(frame) > 350]
+    return (voiced[0][0], voiced[-1][0] + voiced[-1][1]) if voiced else None
+
+
+def add_speech_noise(pcm: bytes, snr_db: float) -> bytes:
+    """Seeded broadband noise during speech only; preserve source silence and timing."""
+    bounds = speech_bounds(pcm)
+    if bounds is None:
+        return pcm
+    start, end = (round(t * RATE) for t in bounds)
+    samples = [v[0] for v in struct.iter_unpack("<h", pcm)]
+    rng = random.Random(109)
+    amplitude = rms(pcm[start * 2 : end * 2]) / (10 ** (snr_db / 20)) * math.sqrt(3)
+    for i in range(start, min(end, len(samples))):
+        samples[i] = max(-32768, min(32767, round(samples[i] + rng.uniform(-amplitude, amplitude))))
+    return struct.pack(f"<{len(samples)}h", *samples)
 
 
 def tone(seconds: float, frequencies: tuple[int, ...] = (440,)) -> bytes:

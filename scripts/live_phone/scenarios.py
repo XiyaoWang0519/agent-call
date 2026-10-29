@@ -32,6 +32,9 @@ class Scenario:
     audit: dict[str, Any] = field(default_factory=dict)
     advisory: Literal["present", "absent"] | None = None
     spoken_closing: bool = False
+    spoken_facts: tuple[str, ...] = ()
+    noise_snr_db: float | None = None
+    latency_steps: tuple[int, ...] = ()
 
     def public(self) -> dict[str, Any]:
         return asdict(self)
@@ -44,10 +47,56 @@ OBJECTIVE = "Have a short technical test conversation with the automated test de
 FACT = Step("say", "Please remember these words: {nonce}. Repeat those exact words back to me.")
 FACT_CHECK = Step("expect", "{nonce_pattern}")
 
+APPROVED_FACTS = (
+    "The party size is four people.",
+    "The requested date is November second, twenty twenty-six.",
+    "The preferred arrival time is six PM.",
+    "The reservation name is Alex Morgan.",
+    "The preferred seating is indoors.",
+    "The preferred drink is sparkling water.",
+    "The preferred table shape is round.",
+    "The preferred napkin color is blue.",
+)
+FACT_QUESTIONS = (
+    ("How many people are in the party?", r"four|\b4\b"),
+    ("What date would you like?", r"November|second"),
+    ("What arrival time do you prefer?", r"six|\b6\b"),
+    ("What is the reservation name?", r"Alex Morgan"),
+    ("Would you like indoor or outdoor seating?", r"indoor"),
+    ("What drink do you prefer?", r"sparkling"),
+    ("What shape of table do you prefer?", r"round"),
+    ("What color napkins do you prefer?", r"blue"),
+)
+
 
 SCENARIOS = {
     s.name: s
     for s in (
+        *(
+            Scenario(
+                name,
+                "Answer the automated desk's questions from the approved spoken facts. "
+                "Wait for each question; do not volunteer the fact list in your introduction. "
+                "This is a simulated reservation inquiry only; do not make a real booking. "
+                "Say goodbye and end the call when requested.",
+                (HELLO, Step("expect", r".+"))
+                + tuple(
+                    step
+                    for question, pattern in FACT_QUESTIONS
+                    for step in (
+                        Step("say", question),
+                        Step("expect", pattern),
+                    )
+                )
+                + (GOODBYE, END),
+                seconds=240,
+                spoken_facts=APPROVED_FACTS,
+                noise_snr_db=noise,
+                latency_steps=tuple(range(2, 18, 2)),
+                spoken_closing=True,
+            )
+            for name, noise in (("approved-facts-clean", None), ("approved-facts-noisy", 20.0))
+        ),
         Scenario(
             "basic",
             "Follow the automated test desk through a short English conversation: use search_web "

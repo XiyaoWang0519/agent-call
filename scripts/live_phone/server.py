@@ -162,6 +162,8 @@ def create_app(config: Config) -> FastAPI:
                             config.asr_model,
                             provider.hangup,
                             {"transferred": asyncio.Event()},
+                            noise_snr_db=scenario.noise_snr_db,
+                            latency_steps=scenario.latency_steps if role == "callee" else (),
                         )
                         sessions[run_id, role] = session
                         tickets[run_id, role] = secrets.token_urlsafe(32)

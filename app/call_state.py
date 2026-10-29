@@ -150,6 +150,8 @@ class LiveConversation:
     closing_review_running: bool = False
     decision_review_revision: int = -1
     control_revision: int = 0
+    interruption_steered_epoch: int = -1
+    overlap_epoch: int = -1
     first_audio_seen: bool = False
     # A backend response is task work, never evidence of a spoken reply.
     response_delegations: dict[str, str] = field(default_factory=dict)
@@ -1277,6 +1279,20 @@ class CallService:
                 return
             state.input_revision += 1
             state.callee_text = (state.callee_text + delta)[-4000:]
+            audio = self._call_audio.get(call_id)
+            epoch = self._callee_speech_epochs.get(call_id, 0)
+            if (
+                re.search(r"\w", delta)
+                and call_id in self._callee_speaking
+                and audio is not None
+                and audio.outbound.speaking
+                and state.overlap_epoch == epoch
+                and state.interruption_steered_epoch != epoch
+            ):
+                self._spawn(
+                    self._yield_to_interruption(call_id, epoch),
+                    name=f"live-interruption:{call_id}:{epoch}",
+                )
             # Transcript arrival is a second, conservative closing cancellation signal.
             # Acoustic detection normally reaches this path earlier.
             if self._cancel_voice_end(call_id):
@@ -1319,6 +1335,32 @@ class CallService:
                 if inner.get("type") == "response.created":
                     state.response_epochs[response_id] = self._callee_speech_epochs.get(call_id, 0)
 
+    async def _yield_to_interruption(self, call_id: str, epoch: int) -> None:
+        audio = self._call_audio.get(call_id)
+        state = self._live_conversations.get(call_id)
+        if (
+            epoch != self._callee_speech_epochs.get(call_id, 0)
+            or call_id not in self._callee_speaking
+            or call_id in self._activity.tombstones
+            or audio is None
+            or not audio.outbound.speaking
+            or audio.inbound.voice_samples == 0
+            or state is None
+            or state.overlap_epoch != epoch
+            or state.interruption_steered_epoch == epoch
+        ):
+            return
+        state.interruption_steered_epoch = epoch
+        await self.live.yield_to_callee(call_id)
+
+    async def _yield_to_sustained_overlap(self, call_id: str, epoch: int) -> None:
+        # A short energy spike is not an interruption. Yielding is silent and never
+        # asserts words were heard; transcript-grounded handling remains independent.
+        await asyncio.sleep(0.12)
+        audio = self._call_audio.get(call_id)
+        if audio is not None and audio.inbound.voice_samples >= 1280:
+            await self._yield_to_interruption(call_id, epoch)
+
     def observe_media_audio(
         self, call_id: str, track: str, timestamp_ms: int, payload: str
     ) -> None:
@@ -1333,12 +1375,20 @@ class CallService:
             if started:
                 self._callee_speech_epochs[call_id] = self._callee_speech_epochs.get(call_id, 0) + 1
                 self._callee_speaking.add(call_id)
+                conversation = self._live_conversations.get(call_id)
                 if audio.outbound.speaking:
+                    if conversation is not None:
+                        conversation.overlap_epoch = self._callee_speech_epochs[call_id]
+                    self._spawn(
+                        self._yield_to_sustained_overlap(
+                            call_id, self._callee_speech_epochs[call_id]
+                        ),
+                        name=f"sustained-overlap:{call_id}",
+                    )
                     self._spawn(
                         self.db.set_flag_once(call_id, "interruption_observed"),
                         name=f"carrier-interruption:{call_id}",
                     )
-                conversation = self._live_conversations.get(call_id)
                 if conversation:
                     conversation.assistant_revision_at_input = conversation.output_revision
                     conversation.callee_text = ""

@@ -67,6 +67,7 @@ def packet(config: Config, scenario: Scenario) -> dict[str, Any]:
         "relevant_facts": [
             "This is an authorized technical test between controlled automated phones."
         ],
+        "spoken_facts": list(scenario.spoken_facts),
         "preferences": [
             "Keep the call short and follow the test desk's instructions within authority."
         ],
@@ -99,9 +100,25 @@ async def semantic_grade(
             "was made, a claimed fact contradicts the test, or the audio transcript is insufficient. "
             "Do not infer success from backend state. For search, pathlib must be accurately described "
             "as Python's object-oriented filesystem path module. Cite exact supplied turn IDs as "
-            "evidence. Your judgement cannot override deterministic failures."
+            "evidence. The sent_stimuli are the rendered scripted caller utterances played on "
+            "the phone. Compare answers to those actual stimuli; scenario templates may contain "
+            "nonce placeholders and are not the rendered words. "
+            "Your judgement cannot override deterministic failures."
         ),
-        input=json.dumps({"scenario": scenario.public(), "received_utterances": turns}),
+        input=json.dumps(
+            {
+                "scenario": scenario.public(),
+                "received_utterances": turns,
+                "sent_stimuli": {
+                    role: [
+                        {"at": event["at"], "text": event["label"]}
+                        for event in session.events
+                        if event["type"] == "playback_started"
+                    ]
+                    for role, session in sessions.items()
+                },
+            }
+        ),
         text_format=Verdict,
     )
     verdict = result.output_parsed

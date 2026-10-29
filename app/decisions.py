@@ -119,9 +119,14 @@ class ClosingDecisions:
                 if isinstance(answer, ClosingAnswer):
                     status = answer.choice
                     return answer
-        except Exception:
+        except Exception as exc:
             # Do not log provider bodies or validation exceptions: they may contain transcripts.
             status = "error_or_timeout"
+            logger.info(
+                "closing_decision_failure error_type=%s status_code=%s",
+                type(exc).__name__,
+                getattr(exc, "status_code", None),
+            )
         finally:
             logger.info(
                 "closing_decision status=%s duration_ms=%.1f",

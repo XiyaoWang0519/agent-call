@@ -112,10 +112,10 @@ uv run python -m scripts.live_phone --env-file .env.live-phone run \
   --scenario transfer --scenario transfer-busy --confirm-instance YOUR_TEST_INSTANCE_ID
 ```
 
-The full suite currently contains 22 scenarios covering all seven in-call tools and all
+The full suite currently contains 25 scenarios covering all seven in-call tools and all
 seven public MCP tools. Smoke selects conversation, interruption, IVR, and MCP termination.
 Each scenario has a deadline. The full configured worst-case reservation budget is
-4,230 seconds, below the default 5,400-second suite limit. Typical runs can finish sooner.
+4,965 seconds, below the default 5,400-second suite limit. Typical runs can finish sooner.
 This is a duration authorization, not a dollar cap: conference participants, inbound and
 outbound legs, OpenAI speech/transcription/grading, and Exa can incur separate charges.
 Configure provider-side budgets as well. Run serially; Agent Call allows one active call.
@@ -164,7 +164,7 @@ This suite does not yet automate a genuinely unanswered ringing endpoint, destru
 process/network fault injection, maximum-duration/maximum-hold calls, or every failure
 permutation in the design matrix. Signature/replay protection, OAuth, duplicate/late
 answers, extraction failure, and recovery have existing deterministic integration tests.
-These are separate evidence from real-phone coverage. A full suite pass means the 22
+These are separate evidence from real-phone coverage. A full suite pass means the 25
 listed scenarios passed, not that every proposed matrix row ran live.
 
 Twilio-to-Twilio calls exercise real provider audio but do not prove a mobile carrier

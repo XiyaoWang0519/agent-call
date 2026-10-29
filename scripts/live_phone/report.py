@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import re
+import statistics
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -80,6 +82,17 @@ def grade(scenario: Scenario, evidence: dict[str, Any]) -> dict[str, bool]:
         )
         checks["no_receiver_hangup"] = not any(
             event.get("type") == "receiver_hangup" for event in events
+        )
+    if scenario.latency_steps:
+        samples = sorted(
+            e["seconds"]
+            for e in evidence.get("sessions", {}).get("callee", {}).get("events", [])
+            if e["type"] == "reply_audio_latency"
+        )
+        checks["reply_latency_samples_complete"] = len(samples) == len(scenario.latency_steps)
+        checks["reply_latency_median_le_1s"] = bool(samples) and statistics.median(samples) <= 1
+        checks["reply_latency_p95_le_2s"] = (
+            bool(samples) and samples[math.ceil(len(samples) * 0.95) - 1] <= 2
         )
     if any(step.action == "interrupt" for step in scenario.steps):
         checks["interruption_audio_verified"] = any(

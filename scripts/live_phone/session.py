@@ -14,9 +14,11 @@ from openai import AsyncOpenAI
 from scripts.live_phone.audio import (
     RATE,
     DigitDetector,
+    add_speech_noise,
     decode_mulaw,
     encode_mulaw,
     rms,
+    speech_bounds,
     tone,
     wav_bytes,
 )
@@ -36,8 +38,12 @@ class Session:
         asr_model: str,
         hangup: Any,
         signals: dict[str, asyncio.Event],
+        noise_snr_db: float | None = None,
+        latency_steps: tuple[int, ...] = (),
     ):
         self.role = role
+        self.noise_snr_db = noise_snr_db
+        self.latency_steps = latency_steps
         self.root = root
         self.speech = speech
         self.replacements = replacements
@@ -194,6 +200,9 @@ class Session:
             raise RuntimeError("phone disconnected before playback")
         if len(pcm) > RATE * 2 * 60:
             raise ValueError("fixture exceeds 60 seconds")
+        bounds = speech_bounds(pcm)
+        if self.noise_snr_db is not None:
+            pcm = add_speech_noise(pcm, self.noise_snr_db)
         name = f"play-{len(self.marks)}"
         self.marks[name] = asyncio.Event()
         start = self.now()
@@ -203,6 +212,8 @@ class Session:
             self.tx.extend(bytes(offset - len(self.tx)))
         self.tx.extend(pcm)
         self.event("playback_started", name=name, label=label, duration=len(pcm) / (RATE * 2))
+        if bounds:
+            self.event("source_speech", name=name, start=start + bounds[0], end=start + bounds[1])
         mulaw = encode_mulaw(pcm)
         # Pace small packets to bound Twilio's queue and make interruption timing meaningful.
         for offset in range(0, len(mulaw), 160):
@@ -250,7 +261,29 @@ class Session:
                         await self.until(lambda: self.now() - self.voiced[-1][0] >= 1.0, 30)
                     await self.play(self.speech[text], text)
                 elif step.action == "expect":
-                    await self.until(lambda text=text: self.heard(text), step.seconds)
+                    if index - 1 in self.latency_steps:
+                        source = next(
+                            e for e in reversed(self.events) if e["type"] == "source_speech"
+                        )
+                        await self.until(
+                            lambda source=source, text=text: any(
+                                t["start"] >= source["end"] and re.search(text, t["text"], re.I)
+                                for t in self.transcripts
+                            ),
+                            step.seconds,
+                        )
+                        # Match independently transcribed speech, not generated text or a backend result.
+                        turn = next(
+                            t
+                            for t in self.transcripts
+                            if t["start"] >= source["end"] and re.search(text, t["text"], re.I)
+                        )
+                        first = next(t for t, _ in self.voiced if turn["start"] <= t <= turn["end"])
+                        self.event(
+                            "reply_audio_latency", step=index - 1, seconds=first - source["end"]
+                        )
+                    else:
+                        await self.until(lambda text=text: self.heard(text), step.seconds)
                 elif step.action == "digits":
                     await self.until(
                         lambda text=text: (
@@ -280,6 +313,9 @@ class Session:
                     start, end = await self.play(self.speech[text], text)
                     overlap = sum(d for t, d in self.voiced if start <= t <= start + step.seconds)
                     tail = sum(d for t, d in self.voiced if start + step.seconds < t < end - 0.2)
+                    self.event(
+                        "interruption_measured", overlap=overlap, tail=tail, budget=step.seconds
+                    )
                     if overlap < 0.06 or tail > 0.2 or end - start < step.seconds + 1:
                         raise AssertionError("interruption lacks overlap or speech did not stop")
                     self.event(
@@ -310,6 +346,7 @@ class Session:
             "media_gaps": self.gaps,
             "received_seconds": len(self.rx) / (RATE * 2),
             "voiced_seconds": sum(d for _, d in self.voiced),
+            "received_voice_frames": self.voiced,
             "digits": self.digits,
             "transcripts": self.transcripts,
             "events": self.events,
