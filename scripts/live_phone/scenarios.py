@@ -60,7 +60,7 @@ APPROVED_FACTS = (
 FACT_QUESTIONS = (
     ("How many people are in the party?", r"four|\b4\b"),
     ("What date would you like?", r"November|second"),
-    ("What arrival time do you prefer?", r"six|\b6\b"),
+    ("What arrival time do you prefer?", r"six|\b6(?:\b|p\.?m\.?)"),
     ("What is the reservation name?", r"Alex Morgan"),
     ("Would you like indoor or outdoor seating?", r"indoor"),
     ("What drink do you prefer?", r"sparkling"),

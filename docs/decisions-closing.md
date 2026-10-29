@@ -2,8 +2,10 @@
 
 This implements the first recommended experiment: give Live selected facts directly and
 evaluate bounded closing readiness without replacing the Responses delegation. The changes
-have offline regression coverage. No new real-phone latency or classification evidence is
-claimed. Active mode is experimental and disabled by default.
+have offline regression coverage and partial isolated real-phone evidence. Basic and
+closing-follow-up passed, but ordinary latency and positive Decisions acceptance remain
+unresolved; see [the phone acceptance record](decisions-live-acceptance.md). Active mode
+is experimental and disabled by default.
 
 ## Explicit spoken facts
 

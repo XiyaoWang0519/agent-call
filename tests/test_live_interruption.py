@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -20,7 +21,7 @@ from scripts.live_phone.audio import (
 )
 from scripts.live_phone.report import grade
 from scripts.live_phone.runner import semantic_grade
-from scripts.live_phone.scenarios import SCENARIOS, Step
+from scripts.live_phone.scenarios import FACT_QUESTIONS, SCENARIOS, Step
 from scripts.live_phone.session import Session
 from tests.test_call_audio import SILENCE
 from tests.test_voice_closing import frames, prepared_goodbye, settle
@@ -159,6 +160,14 @@ def test_asr_pre_roll_does_not_move_received_answer_latency(tmp_path):
     assert session.answer_audio_after("four", 10.0) == 10.1
     session.voiced.insert(0, (9.9, 0.02))
     assert session.answer_audio_after("four", 10.0) is None
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [("6pm.", True), ("6 p.m.", True), ("six PM", True), ("16pm", False), ("7pm", False)],
+)
+def test_arrival_time_accepts_numeric_asr_without_accepting_other_hours(text, expected):
+    assert bool(re.search(FACT_QUESTIONS[2][1], text, re.I)) == expected
 
 
 async def test_semantic_grader_receives_rendered_caller_stimuli():
