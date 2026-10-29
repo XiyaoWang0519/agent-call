@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app.openai_live import LiveBridge
-from scripts.live_phone.audio import add_speech_noise, rms, speech_bounds, tone
+from scripts.live_phone.audio import (
+    add_speech_noise,
+    decode_mulaw,
+    encode_mulaw,
+    rms,
+    speech_bounds,
+    tone,
+)
 from scripts.live_phone.report import grade
 from scripts.live_phone.runner import semantic_grade
 from scripts.live_phone.scenarios import SCENARIOS, Step
@@ -131,6 +140,25 @@ async def test_latency_waits_for_answer_after_question_not_earlier_matching_word
     await session.execute((Step("say", "question"), Step("expect", "four")))
     assert session.error is None
     assert next(e["seconds"] for e in session.events if e["type"] == "reply_audio_latency") == 1.0
+
+
+def test_asr_preserves_quiet_consonant_onsets(tmp_path):
+    session = Session("callee", tmp_path, {}, {}, SimpleNamespace(), "test", AsyncMock(), {})
+    quiet = encode_mulaw(struct.pack("<160h", *([100] * 160)))
+    loud = encode_mulaw(struct.pack("<160h", *([3000] * 160)))
+    session.ingest(base64.b64encode(quiet).decode(), 0)
+    assert not session.segment
+    session.ingest(base64.b64encode(loud).decode(), 20)
+    assert session.segment == decode_mulaw(quiet) + decode_mulaw(loud)
+
+
+def test_asr_pre_roll_does_not_move_received_answer_latency(tmp_path):
+    session = Session("callee", tmp_path, {}, {}, SimpleNamespace(), "test", AsyncMock(), {})
+    session.transcripts = [{"start": 9.8, "end": 11, "text": "four"}]
+    session.voiced = [(10.1, 0.02)]
+    assert session.answer_audio_after("four", 10.0) == 10.1
+    session.voiced.insert(0, (9.9, 0.02))
+    assert session.answer_audio_after("four", 10.0) is None
 
 
 async def test_semantic_grader_receives_rendered_caller_stimuli():

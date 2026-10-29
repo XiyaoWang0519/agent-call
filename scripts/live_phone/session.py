@@ -115,7 +115,12 @@ class Session:
         if voiced:
             self.voiced.append((now, duration))
             if not self.segment:
-                self.segment_start = now
+                # Preserve quiet word onsets (for example the /f/ in "four").
+                # The energy threshold marks voiced audio, not the start of all speech.
+                previous_end = len(self.rx) - len(pcm)
+                pre_roll = self.rx[max(0, previous_end - 3200) : previous_end]
+                self.segment.extend(pre_roll)
+                self.segment_start = max(0, now - len(pre_roll) / (RATE * 2))
             self.silence_bytes = 0
         elif self.segment:
             self.silence_bytes += len(pcm)
@@ -249,6 +254,15 @@ class Session:
         text = " ".join(t["text"] for t in self.transcripts if t["end"] >= self.last_text_boundary)
         return re.search(pattern, text, flags=re.I) is not None
 
+    def answer_audio_after(self, pattern: str, speech_end: float) -> float | None:
+        for turn in self.transcripts:
+            if not re.search(pattern, turn["text"], re.I):
+                continue
+            first = next((t for t, _ in self.voiced if turn["start"] <= t <= turn["end"]), None)
+            if first is not None and first >= speech_end:
+                return first
+        return None
+
     async def execute(self, steps: tuple[Step, ...]) -> None:
         try:
             await asyncio.wait_for(self.ready.wait(), timeout=70)
@@ -266,19 +280,15 @@ class Session:
                             e for e in reversed(self.events) if e["type"] == "source_speech"
                         )
                         await self.until(
-                            lambda source=source, text=text: any(
-                                t["start"] >= source["end"] and re.search(text, t["text"], re.I)
-                                for t in self.transcripts
+                            lambda source=source, text=text: (
+                                self.answer_audio_after(text, source["end"]) is not None
                             ),
                             step.seconds,
                         )
                         # Match independently transcribed speech, not generated text or a backend result.
-                        turn = next(
-                            t
-                            for t in self.transcripts
-                            if t["start"] >= source["end"] and re.search(text, t["text"], re.I)
-                        )
-                        first = next(t for t, _ in self.voiced if turn["start"] <= t <= turn["end"])
+                        first = self.answer_audio_after(text, source["end"])
+                        if first is None:
+                            raise AssertionError("missing received answer audio")
                         self.event(
                             "reply_audio_latency", step=index - 1, seconds=first - source["end"]
                         )
