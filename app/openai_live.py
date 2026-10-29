@@ -595,22 +595,26 @@ class LiveBridge:
                 await self.send(runtime.call_id, {"type": "response.create"})
                 runtime.continued_responses.add(response_id)
 
+    def closing_review_available(self, call_id: str) -> bool:
+        runtime = self._runtime.get(call_id)
+        return runtime is not None and not (
+            runtime.closing
+            or any(
+                not required <= runtime.emitted_results
+                for required in runtime.pending_tools.values()
+            )
+            or any(
+                response_id not in runtime.completed_responses
+                for response_id in runtime.response_ids.values()
+            )
+        )
+
     async def review_closing(self, call_id: str, *, assistant_text: str = "") -> bool:
         runtime = self._runtime.get(call_id)
         if runtime is None:
             return False
         async with runtime.tool_lock:
-            if (
-                runtime.closing
-                or any(
-                    not required <= runtime.emitted_results
-                    for required in runtime.pending_tools.values()
-                )
-                or any(
-                    response_id not in runtime.completed_responses
-                    for response_id in runtime.response_ids.values()
-                )
-            ):
+            if not self.closing_review_available(call_id):
                 return False
             # Live permits response.create to initiate configured backend work.
             # The backend sees the conversation and decides whether a close is justified.

@@ -274,6 +274,9 @@ class FakeLive:
         self.request_response_calls.append((call_id, instructions))
         self.events.append(("opening", call_id))
 
+    def closing_review_available(self, call_id: str) -> bool:
+        return True
+
     async def review_closing(self, call_id: str, *, assistant_text: str = "") -> bool:
         self.events.append(("closing_review", call_id))
         return True

@@ -11,6 +11,10 @@ Agent Call lets an AI assistant make phone calls on your behalf. Give it a task,
 
 Developed with Codex, Agent Call uses OpenAI GPT-Live SIP (`gpt-live-1`) with a delegated `gpt-5.6-terra` task backend for the phone conversation and Twilio to reach the recipient. You run the service yourself, using your own OpenAI and Twilio accounts.
 
+Call plans can supply compact `context.spoken_facts` for direct factual replies. An optional
+Decisions closing-review experiment supports observation before activation; see
+[configuration, examples, and verification limits](docs/decisions-closing.md).
+
 **Works with ChatGPT Work and Claude web, verified with real question-and-answer calls. It does not work in regular ChatGPT mode.** See [client setup, test results, and verification limits](docs/browser-clients.md).
 
 ## What you need

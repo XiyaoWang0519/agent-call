@@ -68,11 +68,27 @@ class ContextPacket(BaseModel):
     target: TargetContext
     objective: str = Field(min_length=1, max_length=4000)
     relevant_facts: list[str] = Field(default_factory=list, max_length=100)
+    spoken_facts: list[Annotated[str, StringConstraints(min_length=1, max_length=240)]] = Field(
+        default_factory=list,
+        max_length=8,
+        exclude_if=lambda value: not value,
+        description=(
+            "Compact facts explicitly approved for direct disclosure by the voice frontend. "
+            "Exclude secrets and facts requiring an authority check; omitted facts stay with the backend."
+        ),
+    )
     preferences: list[str] = Field(default_factory=list, max_length=100)
     hard_constraints: list[str] = Field(default_factory=list, max_length=100)
     allowed_commitments: list[str] = Field(default_factory=list, max_length=100)
     prohibited_actions: list[str] = Field(default_factory=list, max_length=100)
     escalation: EscalationContext
+
+    @field_validator("spoken_facts")
+    @classmethod
+    def bound_spoken_facts(cls, facts: list[str]) -> list[str]:
+        if len(json.dumps(facts, ensure_ascii=False).encode("utf-8")) > 2048:
+            raise ValueError("spoken_facts exceeds 2048 UTF-8 bytes")
+        return facts
 
     def approved_context_json(self) -> str:
         approved = json.dumps(
