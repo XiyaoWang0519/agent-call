@@ -234,6 +234,16 @@
               "maxItems": 100,
               "type": "array"
             },
+            "spoken_facts": {
+              "description": "Compact facts explicitly approved for direct disclosure by the voice frontend. Exclude secrets and facts requiring an authority check; omitted facts stay with the backend.",
+              "items": {
+                "maxLength": 240,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 8,
+              "type": "array"
+            },
             "target": {
               "properties": {
                 "name": {

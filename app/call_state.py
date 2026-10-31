@@ -27,6 +27,7 @@ from app.db import (
     LatencyMark,
     LatencyStage,
 )
+from app.decisions import ClosingDecisions
 from app.errors import (
     CALL_ENDING_PARTICIPANT_MESSAGE,
     CallRefusal,
@@ -147,6 +148,10 @@ class LiveConversation:
     closing_candidate_revision: int = 0
     assistant_revision_at_input: int = -1
     closing_review_running: bool = False
+    decision_review_revision: int = -1
+    control_revision: int = 0
+    interruption_steered_epoch: int = -1
+    overlap_epoch: int = -1
     first_audio_seen: bool = False
     # A backend response is task work, never evidence of a spoken reply.
     response_delegations: dict[str, str] = field(default_factory=dict)
@@ -176,6 +181,7 @@ class CallService:
         self.db = db
         self._owns_openai_client = openai is None
         self.openai = openai if openai is not None else create_openai_client(settings)
+        self.closing_decisions = ClosingDecisions(self.openai, settings)
         self._owns_exa_client = exa is None
         self.exa = exa if exa is not None else ExaSearchClient(settings)
         self.twilio = twilio or TwilioBridge(settings)
@@ -1262,6 +1268,8 @@ class CallService:
             return
         state = self._live_conversations.setdefault(call_id, LiveConversation())
         event_type = event.get("type")
+        if event_type in {"session.delegation.created", "response.event"}:
+            state.control_revision += 1
         if event_type == "session.output_audio.delta" and not state.first_audio_seen:
             state.first_audio_seen = True
             self._queue_latency(call_id, LatencyStage.FIRST_OPENAI_AUDIO_DELTA, LatencyMark.now())
@@ -1271,6 +1279,20 @@ class CallService:
                 return
             state.input_revision += 1
             state.callee_text = (state.callee_text + delta)[-4000:]
+            audio = self._call_audio.get(call_id)
+            epoch = self._callee_speech_epochs.get(call_id, 0)
+            if (
+                re.search(r"\w", delta)
+                and call_id in self._callee_speaking
+                and audio is not None
+                and audio.outbound.speaking
+                and state.overlap_epoch == epoch
+                and state.interruption_steered_epoch != epoch
+            ):
+                self._spawn(
+                    self._yield_to_interruption(call_id, epoch),
+                    name=f"live-interruption:{call_id}:{epoch}",
+                )
             # Transcript arrival is a second, conservative closing cancellation signal.
             # Acoustic detection normally reaches this path earlier.
             if self._cancel_voice_end(call_id):
@@ -1313,6 +1335,32 @@ class CallService:
                 if inner.get("type") == "response.created":
                     state.response_epochs[response_id] = self._callee_speech_epochs.get(call_id, 0)
 
+    async def _yield_to_interruption(self, call_id: str, epoch: int) -> None:
+        audio = self._call_audio.get(call_id)
+        state = self._live_conversations.get(call_id)
+        if (
+            epoch != self._callee_speech_epochs.get(call_id, 0)
+            or call_id not in self._callee_speaking
+            or call_id in self._activity.tombstones
+            or audio is None
+            or not audio.outbound.speaking
+            or audio.inbound.voice_samples == 0
+            or state is None
+            or state.overlap_epoch != epoch
+            or state.interruption_steered_epoch == epoch
+        ):
+            return
+        state.interruption_steered_epoch = epoch
+        await self.live.yield_to_callee(call_id)
+
+    async def _yield_to_sustained_overlap(self, call_id: str, epoch: int) -> None:
+        # A short energy spike is not an interruption. Yielding is silent and never
+        # asserts words were heard; transcript-grounded handling remains independent.
+        await asyncio.sleep(0.12)
+        audio = self._call_audio.get(call_id)
+        if audio is not None and audio.inbound.voice_samples >= 1280:
+            await self._yield_to_interruption(call_id, epoch)
+
     def observe_media_audio(
         self, call_id: str, track: str, timestamp_ms: int, payload: str
     ) -> None:
@@ -1327,12 +1375,20 @@ class CallService:
             if started:
                 self._callee_speech_epochs[call_id] = self._callee_speech_epochs.get(call_id, 0) + 1
                 self._callee_speaking.add(call_id)
+                conversation = self._live_conversations.get(call_id)
                 if audio.outbound.speaking:
+                    if conversation is not None:
+                        conversation.overlap_epoch = self._callee_speech_epochs[call_id]
+                    self._spawn(
+                        self._yield_to_sustained_overlap(
+                            call_id, self._callee_speech_epochs[call_id]
+                        ),
+                        name=f"sustained-overlap:{call_id}",
+                    )
                     self._spawn(
                         self.db.set_flag_once(call_id, "interruption_observed"),
                         name=f"carrier-interruption:{call_id}",
                     )
-                conversation = self._live_conversations.get(call_id)
                 if conversation:
                     conversation.assistant_revision_at_input = conversation.output_revision
                     conversation.callee_text = ""
@@ -1407,10 +1463,106 @@ class CallService:
         revision = state.closing_candidate_revision
         state.closing_review_running = True
         try:
+            mode = self.settings.closing_decisions_mode
+            if mode != "disabled" and state.decision_review_revision < revision:
+                state.decision_review_revision = revision
+                snapshot = (
+                    state.input_revision,
+                    state.output_revision,
+                    self._callee_speech_epochs.get(call_id, 0),
+                    state.control_revision,
+                )
+                if mode == "observe":
+                    self._spawn(
+                        self._review_closing_decision(call_id, snapshot, active=False),
+                        name=f"closing-decision:{call_id}",
+                    )
+                elif await self._review_closing_decision(call_id, snapshot, active=True):
+                    state.closing_review_revision = revision
+                    return
+                if mode == "active" and (
+                    self._live_conversations.get(call_id) is not state
+                    or snapshot
+                    != (
+                        state.input_revision,
+                        state.output_revision,
+                        self._callee_speech_epochs.get(call_id, 0),
+                        state.control_revision,
+                    )
+                    or call_id in self._activity.tombstones
+                    or call_id in self._voice_end_pending
+                ):
+                    return
             if await self.live.review_closing(call_id, assistant_text=state.assistant_text[-2000:]):
                 state.closing_review_revision = revision
         finally:
             state.closing_review_running = False
+
+    async def _review_closing_decision(
+        self, call_id: str, snapshot: tuple[int, int, int, int], *, active: bool
+    ) -> bool:
+        try:
+            # Includes snapshot reads as well as inference; fallback has a bounded delay.
+            async with asyncio.timeout(self.settings.closing_decisions_timeout_seconds):
+                return await self._evaluate_closing_decision(call_id, snapshot, active=active)
+        except Exception:
+            logger.info("closing_decision unavailable call_id=%s", call_id)
+            return False
+
+    async def _evaluate_closing_decision(
+        self, call_id: str, snapshot: tuple[int, int, int, int], *, active: bool
+    ) -> bool:
+        state = self._live_conversations.get(call_id)
+        if state is None:
+            return False
+        farewell = state.assistant_text
+        call = await self.db.get_call(call_id)
+        if call is None or self._call_activity_is_closed(call):
+            return False
+        plan = await self.db.get_plan_record(call["plan_id"])
+        if plan is None:
+            return False
+        transcript = await self.db.get_transcript(call_id)
+        # Never silently truncate evidence and then authorize a consequential action.
+        evidence = {
+            "approved_context": plan.context.model_dump(mode="json"),
+            "transcript": [{"speaker": turn.speaker, "text": turn.text} for turn in transcript],
+            "observed_assistant_text": farewell,
+            "revision": snapshot,
+        }
+        if len(json.dumps(evidence).encode()) > 64 * 1024:
+            return False
+        answer = await self.closing_decisions.review(evidence)
+        current = self._live_conversations.get(call_id)
+        stale = current is not state or snapshot != (
+            state.input_revision,
+            state.output_revision,
+            self._callee_speech_epochs.get(call_id, 0),
+            state.control_revision,
+        )
+        logger.info(
+            "closing_decision_result call_id=%s mode=%s revision=%s choice=%s stale=%s confidence=%s",
+            call_id,
+            "active" if active else "observe",
+            snapshot,
+            answer.choice if answer else "unavailable",
+            stale,
+            answer.confidence if answer else None,
+        )
+        if not active:
+            return False
+        # A superseded result must not initiate either a close or a stale fallback review.
+        if stale or call_id in self._activity.tombstones or call_id in self._voice_end_pending:
+            return True
+        if answer is None or not answer.decisive(self.settings.closing_decisions_min_confidence):
+            return False
+        if answer.choice == "uncertain":
+            return False
+        if not self.live.closing_review_available(call_id):
+            return False
+        if answer.choice == "keep_open":
+            return True
+        return self._begin_goodbye_close(call_id, farewell, f"decision:{snapshot[1]}")
 
     async def _start_media_monitor(self, call: dict[str, Any]) -> None:
         call_id = call["call_id"]
@@ -2057,6 +2209,40 @@ class CallService:
             advisory_outcome=advisory_outcome,
         )
 
+    def _begin_goodbye_close(self, call_id: str, farewell_text: str, request_id: str) -> bool:
+        """Shared application checks for Responses tools and standalone Decisions."""
+        state = self._live_conversations.get(call_id)
+        audio = self._call_audio.get(call_id)
+
+        def normalize(text: str) -> str:
+            return " ".join(re.findall(r"\w+", text.casefold()))
+
+        farewell = normalize(farewell_text)
+        if (
+            state is None
+            or call_id in self._activity.tombstones
+            or call_id in self._voice_end_pending
+            or state.output_revision <= state.assistant_revision_at_input
+            or not farewell
+            or f" {farewell} " not in f" {normalize(state.assistant_text)} "
+            or audio is None
+            or not audio.connected
+            or audio.outbound.last_voice_ms is None
+            or call_id in self._callee_speaking
+            or call_id in self._hold_state
+            or call_id in self._pending_questions
+            or self._undelivered_answers.get(call_id)
+            or call_id in self._inflight_tools
+        ):
+            return False
+        token = object()
+        self._voice_end_pending[call_id] = (request_id, None)
+        self._voice_end_reply_waits[call_id] = token
+        self._spawn(
+            self._end_after_goodbye_reply_window(call_id, token), name=f"voice-end-reply:{call_id}"
+        )
+        return True
+
     async def _tool_end_call(
         self,
         call_id: str,
@@ -2078,26 +2264,8 @@ class CallService:
                 event_key=event_key,
             )
             return
-        state = self._live_conversations.get(call_id)
-        audio = self._call_audio.get(call_id)
-
-        def normalize(text: str) -> str:
-            return " ".join(re.findall(r"\w+", text.casefold()))
-
-        farewell = normalize(request.farewell)
-        if (
-            state is None
-            or state.output_revision <= state.assistant_revision_at_input
-            or not farewell
-            or f" {farewell} " not in f" {normalize(state.assistant_text)} "
-            or audio is None
-            or not audio.connected
-            or audio.outbound.last_voice_ms is None
-            or call_id in self._callee_speaking
-            or call_id in self._hold_state
-            or call_id in self._pending_questions
-            or self._undelivered_answers.get(call_id)
-            or call_id in self._inflight_tools
+        if call_id not in self._voice_end_pending and not self._begin_goodbye_close(
+            call_id, request.farewell, tool_call_id
         ):
             await self._send_nontransfer_tool_result(
                 call_id,
@@ -2111,13 +2279,6 @@ class CallService:
                 event_key=event_key,
             )
             return
-        self._cancel_voice_end(call_id)
-        token = object()
-        self._voice_end_pending[call_id] = (tool_call_id, None)
-        self._voice_end_reply_waits[call_id] = token
-        self._spawn(
-            self._end_after_goodbye_reply_window(call_id, token), name=f"voice-end-reply:{call_id}"
-        )
         await self._send_nontransfer_tool_result(
             call_id,
             tool_call_id,

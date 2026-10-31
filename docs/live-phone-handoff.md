@@ -6,6 +6,16 @@ The [runbook](live-phone-runbook.md) covers all scenarios and provider setup; th
 
 ## What has actually passed
 
+### PR 109 isolated verification, 2026-10-28
+
+With the guarded interruption changes, `basic` run `run_2ba6cbf759a3aa1c254d6077`
+passed all 27 checks. `closing-follow-up` run `run_be4834aed6c94b98efc555a3`
+passed all 23 checks. Both had independent semantic passes and verified cleanup without
+force. This supersedes the historical statement below that basic has never passed on
+Live; it does not establish repeatability, ordinary reply latency, noisy fact coverage,
+or positive Decisions acceptance. PR 109 remains draft. See the
+[complete acceptance limits and failed attempts](decisions-live-acceptance.md).
+
 ### GPT-Live migration, 2026-09-10
 
 The current voice path is `gpt-live-1` with a `gpt-5.6-terra` backend. The isolated

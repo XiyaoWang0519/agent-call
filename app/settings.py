@@ -157,6 +157,9 @@ class Settings(BaseSettings):
     live_voice: str = "marin"
     live_backend_model: Literal["gpt-5.6-terra"] = "gpt-5.6-terra"
     live_backend_reasoning_effort: Literal["none", "low", "medium"] = "low"
+    closing_decisions_mode: Literal["disabled", "observe", "active"] = "disabled"
+    closing_decisions_timeout_seconds: float = Field(default=0.8, gt=0, le=2)
+    closing_decisions_min_confidence: float = Field(default=0.95, ge=0.9, le=1)
     live_session_close_timeout_seconds: float = Field(default=15.0, ge=1, le=60)
     openai_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_http_timeout_seconds: float = Field(default=10.0, gt=0, le=60)

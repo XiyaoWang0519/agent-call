@@ -29,7 +29,7 @@ class Config(BaseSettings):
     artifacts: Path = Path(".live-phone")
     max_suite_seconds: int = Field(default=5400, ge=60, le=7200)
     tts_model: str = "gpt-4o-mini-tts"
-    asr_model: str = "gpt-4o-mini-transcribe"
+    asr_model: str = "gpt-4o-transcribe"
     voice: str = "alloy"
 
     @model_validator(mode="after")

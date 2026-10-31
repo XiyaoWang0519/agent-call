@@ -86,6 +86,7 @@ def validate_context(packet: ContextPacket, settings: Settings) -> list[PolicyDe
     text_fields = [
         packet.objective,
         *packet.relevant_facts,
+        *packet.spoken_facts,
         *packet.preferences,
         *packet.hard_constraints,
         *packet.allowed_commitments,

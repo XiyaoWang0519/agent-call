@@ -595,22 +595,26 @@ class LiveBridge:
                 await self.send(runtime.call_id, {"type": "response.create"})
                 runtime.continued_responses.add(response_id)
 
+    def closing_review_available(self, call_id: str) -> bool:
+        runtime = self._runtime.get(call_id)
+        return runtime is not None and not (
+            runtime.closing
+            or any(
+                not required <= runtime.emitted_results
+                for required in runtime.pending_tools.values()
+            )
+            or any(
+                response_id not in runtime.completed_responses
+                for response_id in runtime.response_ids.values()
+            )
+        )
+
     async def review_closing(self, call_id: str, *, assistant_text: str = "") -> bool:
         runtime = self._runtime.get(call_id)
         if runtime is None:
             return False
         async with runtime.tool_lock:
-            if (
-                runtime.closing
-                or any(
-                    not required <= runtime.emitted_results
-                    for required in runtime.pending_tools.values()
-                )
-                or any(
-                    response_id not in runtime.completed_responses
-                    for response_id in runtime.response_ids.values()
-                )
-            ):
+            if not self.closing_review_available(call_id):
                 return False
             # Live permits response.create to initiate configured backend work.
             # The backend sees the conversation and decides whether a close is justified.
@@ -719,6 +723,21 @@ class LiveBridge:
     async def request_response(self, call_id: str, *, instructions: str | None = None) -> None:
         if instructions:
             await self.append_instructions(call_id, instructions)
+
+    async def yield_to_callee(self, call_id: str) -> None:
+        await self.send(
+            call_id,
+            {
+                "type": "session.instructions.append",
+                "delegation_id": None,
+                "content": (
+                    "Carrier audio indicates a possible interruption over your current answer. "
+                    "Pause that answer immediately and listen. This signal does not establish words "
+                    "or intent. Stay silent while they speak; do not acknowledge this signal. "
+                    "Respond only to words actually heard; if it was only noise, resume naturally."
+                ),
+            },
+        )
 
     async def notify_call_resumed(self, call_id: str) -> None:
         await self.append_instructions(
